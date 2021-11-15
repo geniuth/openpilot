@@ -112,7 +112,7 @@ class CarInterface(CarInterfaceBase):
     ret.longitudinalActuatorDelayLowerBound = 0.15
     ret.longitudinalActuatorDelayUpperBound = 0.3
     
-    ret.startAccel = -0.4
+    ret.startAccel = 1.0
     ret.stopAccel = -2.0
     ret.startingAccelRate = 2.0
     ret.stoppingDecelRate = 4.0
@@ -120,7 +120,7 @@ class CarInterface(CarInterfaceBase):
     ret.vEgoStarting = 0.5
     ret.stoppingControl = True
     
-    ret.steerLimitTimer = 1.5
+    ret.steerLimitTimer = 0.4
     ret.radarTimeStep = 0.0667  # GM radar runs at 15Hz instead of standard 20Hz
 
     return ret
