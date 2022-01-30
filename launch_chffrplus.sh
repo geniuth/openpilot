@@ -10,6 +10,17 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
 
 function two_init {
 
+  mount -o remount,rw /system
+  if [  !  -f  /ONEPLUS  ] && ! $(grep -q "letv" /proc/cmdline) ;  then
+     sed -i -e 's#/dev/input/event1#/dev/input/event2#g' ~/.bash_profile
+     touch /ONEPLUS
+  else
+     if [  !  -f /LEECO ]; then
+       touch /LEECO
+     fi
+   fi
+   mount -o remount,r /system
+
   # set IO scheduler
   setprop sys.io.scheduler noop
   for f in /sys/block/*/queue/scheduler; do
