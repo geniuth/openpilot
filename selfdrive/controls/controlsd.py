@@ -13,7 +13,7 @@ from selfdrive.config import Conversions as CV
 from selfdrive.swaglog import cloudlog
 from selfdrive.boardd.boardd import can_list_to_can_capnp
 from selfdrive.car.car_helpers import get_car, get_startup_event, get_one_can
-from selfdrive.controls.lib.lane_planner import CAMERA_OFFSET
+from selfdrive.controls.lib.lane_planner import CAMERA_OFFSET, TRAJECTORY_SIZE
 from selfdrive.controls.lib.drive_helpers import update_v_cruise, initialize_v_cruise,update_v_cruise_regen
 from selfdrive.controls.lib.drive_helpers import get_lag_adjusted_curvature
 from selfdrive.controls.lib.longcontrol import LongControl
@@ -100,7 +100,6 @@ class Controls:
     # read params
     self.is_metric = params.get_bool("IsMetric")
     self.is_ldw_enabled = params.get_bool("IsLdwEnabled")
-    community_feature_toggle = params.get_bool("CommunityFeaturesToggle")
     openpilot_enabled_toggle = params.get_bool("OpenpilotEnabledToggle")
     passive = params.get_bool("Passive") or not openpilot_enabled_toggle
 
@@ -110,11 +109,7 @@ class Controls:
     car_recognized = self.CP.carName != 'mock'
 
     controller_available = self.CI.CC is not None and not passive and not self.CP.dashcamOnly
-    community_feature = self.CP.communityFeature or \
-                        self.CP.fingerprintSource == car.CarParams.FingerprintSource.can
-    community_feature_disallowed = community_feature and (not community_feature_toggle)
-    self.read_only = not car_recognized or not controller_available or \
-                       self.CP.dashcamOnly or community_feature_disallowed
+    self.read_only = not car_recognized or not controller_available or self.CP.dashcamOnly
     if self.read_only:
       safety_config = car.CarParams.SafetyConfig.new_message()
       safety_config.safetyModel = car.CarParams.SafetyModel.noOutput
@@ -169,10 +164,7 @@ class Controls:
     self.startup_event = get_startup_event(car_recognized, controller_available, len(self.CP.carFw) > 0)
 
     if not sounds_available:
-      # self.events.add(EventName.soundsUnavailable, static=True)
-      pass
-    if community_feature_disallowed and car_recognized and not self.CP.dashcamOnly:
-      self.events.add(EventName.communityFeatureDisallowed, static=True)
+      self.events.add(EventName.soundsUnavailable, static=True)
     if not car_recognized:
       self.events.add(EventName.carUnrecognized, static=True)
       if len(self.CP.carFw) > 0:
@@ -301,9 +293,6 @@ class Controls:
       self.events.add(EventName.posenetInvalid)
     if not self.sm['liveLocationKalman'].deviceStable:
       self.events.add(EventName.deviceFalling)
-    for pandaState in self.sm['pandaStates']:
-      if log.PandaState.FaultType.relayMalfunction in pandaState.faults:
-        self.events.add(EventName.relayMalfunction)
 
     if not REPLAY:
       # Check for mismatch between openpilot and car's PCM
@@ -333,10 +322,10 @@ class Controls:
 
     # TODO: fix simulator
     if not SIMULATION:
-      if not NOSENSOR:
-        if not self.sm['liveLocationKalman'].gpsOK and (self.distance_traveled > 1000):
+      #if not NOSENSOR:
+        #if not self.sm['liveLocationKalman'].gpsOK and (self.distance_traveled > 1000):
           # Not show in first 1 km to allow for driving out of garage. This event shows after 5 minutes
-          self.events.add(EventName.noGps)
+          #self.events.add(EventName.noGps)
       if not self.sm.all_alive(self.camera_packets):
         self.events.add(EventName.cameraMalfunction)
       if self.sm['modelV2'].frameDropPerc > 20:
@@ -402,6 +391,33 @@ class Controls:
     self.distance_traveled += CS.vEgo * DT_CTRL
 
     return CS
+
+  def cal_curve_speed(self, sm, v_ego, frame):
+
+    if frame % 10 == 0:
+      md = sm['modelV2']
+      if md is not None and len(md.position.x) == TRAJECTORY_SIZE and len(md.position.y) == TRAJECTORY_SIZE:
+        x = md.position.x
+        y = md.position.y
+        dy = np.gradient(y, x)
+        d2y = np.gradient(dy, x)
+        curv = d2y / (1 + dy ** 2) ** 1.5
+        curv = curv[5:TRAJECTORY_SIZE - 10]
+        a_y_max = 2.975 - v_ego * 0.0375  # ~1.85 @ 75mph, ~2.6 @ 25mph
+        v_curvature = np.sqrt(a_y_max / np.clip(np.abs(curv), 1e-4, None))
+        model_speed = np.mean(v_curvature) * 0.70
+
+        if model_speed < v_ego:
+          self.curve_speed_ms = float(max(model_speed, 32. * CV.KPH_TO_MS))
+        else:
+          self.curve_speed_ms = 255.
+
+        if np.isnan(self.curve_speed_ms):
+          self.curve_speed_ms = 255.
+      else:
+        self.curve_speed_ms = 255.
+
+    return self.curve_speed_ms
 
   def state_transition(self, CS):
     """Compute conditional state transitions and execute actions on state transitions"""
