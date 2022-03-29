@@ -80,11 +80,11 @@ interfaces = load_interfaces(interface_names)
 
 
 # **** for use live only ****
-def fingerprint(logcan, sendcan):
+def fingerprint(logcan, sendcan, has_relay):
   fixed_fingerprint = os.environ.get('FINGERPRINT', "")
   skip_fw_query = os.environ.get('SKIP_FW_QUERY', False)
 
-  if not fixed_fingerprint and not skip_fw_query:
+  if has_relay and not fixed_fingerprint and not skip_fw_query:
     # Vin query only reliably works thorugh OBDII
     bus = 1
 
@@ -125,7 +125,7 @@ def fingerprint(logcan, sendcan):
       # The fingerprint dict is generated for all buses, this way the car interface
       # can use it to detect a (valid) multipanda setup and initialize accordingly
       if can.src < 128:
-        if can.src not in finger:
+        if can.src not in finger.keys():
           finger[can.src] = {}
         finger[can.src][can.address] = len(can.dat)
 
