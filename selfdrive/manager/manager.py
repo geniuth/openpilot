@@ -5,28 +5,28 @@ import signal
 import subprocess
 import sys
 import traceback
-from typing import List, Tuple, Union
+from multiprocessing import Process
 
 import cereal.messaging as messaging
-import selfdrive.sentry as sentry
+import selfdrive.crash as crash
 from common.basedir import BASEDIR
 from common.params import Params, ParamKeyType
 from common.text_window import TextWindow
 from selfdrive.boardd.set_time import set_time
 from selfdrive.hardware import HARDWARE, PC
 from selfdrive.manager.helpers import unblock_stdout
-from selfdrive.manager.process import ensure_running
+from selfdrive.manager.process import ensure_running, launcher
 from selfdrive.manager.process_config import managed_processes
 from selfdrive.athena.registration import register, UNREGISTERED_DONGLE_ID
 from selfdrive.swaglog import cloudlog, add_file_handler
-from selfdrive.version import is_dirty, get_commit, get_version, get_origin, get_short_branch, \
-                              terms_version, training_version
+from selfdrive.version import get_dirty, get_commit, get_version, get_origin, get_short_branch, \
+                              terms_version, training_version, get_comma_remote
 
 
 sys.path.append(os.path.join(BASEDIR, "pyextra"))
 
 
-def manager_init() -> None:
+def manager_init():
   # update system time from panda
   set_time(cloudlog)
 
@@ -36,10 +36,23 @@ def manager_init() -> None:
   params = Params()
   params.clear_all(ParamKeyType.CLEAR_ON_MANAGER_START)
 
-  default_params: List[Tuple[str, Union[str, bytes]]] = [
+  default_params = [
     ("CompletedTrainingVersion", "0"),
     ("HasAcceptedTerms", "0"),
     ("OpenpilotEnabledToggle", "1"),
+
+    ("AutoLaneChangeEnabled", "0"),
+    ("PrebuiltEnabled", "0"),
+
+    #UI things
+    ("ShowDebugUI", "0"),
+    ("ShowCpuTempUI", "0"),
+    ("ShowBattLevelUI", "0"),
+
+    #Lateral Control Selection
+    #("INDI_Selected", "0"),
+    #("LQR_Selected", "1"),
+
   ]
   if not PC:
     default_params.append(("LastUpdateTime", datetime.datetime.utcnow().isoformat().encode('utf8')))
@@ -57,7 +70,7 @@ def manager_init() -> None:
 
   # is this dashcam?
   if os.getenv("PASSIVE") is not None:
-    params.put_bool("Passive", bool(int(os.getenv("PASSIVE", "0"))))
+    params.put_bool("Passive", bool(int(os.getenv("PASSIVE"))))
 
   if params.get("Passive") is None:
     raise Exception("Passive must be set to continue")
@@ -87,21 +100,25 @@ def manager_init() -> None:
     raise Exception(f"Registration failed for device {serial}")
   os.environ['DONGLE_ID'] = dongle_id  # Needed for swaglog
 
-  if not is_dirty():
+  if not get_dirty():
     os.environ['CLEAN'] = '1'
 
-  # init logging
-  sentry.init(sentry.SentryProject.SELFDRIVE)
-  cloudlog.bind_global(dongle_id=dongle_id, version=get_version(), dirty=is_dirty(),
+  cloudlog.bind_global(dongle_id=dongle_id, version=get_version(), dirty=get_dirty(),
                        device=HARDWARE.get_device_type())
 
+  if get_comma_remote() and not (os.getenv("NOLOG") or os.getenv("NOCRASH") or PC):
+    crash.init()
+  crash.bind_user(id=dongle_id)
+  crash.bind_extra(dirty=get_dirty(), origin=get_origin(), branch=get_short_branch(), commit=get_commit(),
+                   device=HARDWARE.get_device_type())
 
-def manager_prepare() -> None:
+
+def manager_prepare():
   for p in managed_processes.values():
     p.prepare()
 
 
-def manager_cleanup() -> None:
+def manager_cleanup():
   # send signals to kill all procs
   for p in managed_processes.values():
     p.stop(block=False)
@@ -113,19 +130,21 @@ def manager_cleanup() -> None:
   cloudlog.info("everything is dead")
 
 
-def manager_thread() -> None:
-  cloudlog.bind(daemon="manager")
+def manager_thread():
   cloudlog.info("manager start")
   cloudlog.info({"environ": os.environ})
 
+  Process(name="road_speed_limiter", target=launcher, args=("selfdrive.road_speed_limiter",)).start()
+
   params = Params()
 
-  ignore: List[str] = []
-  if params.get("DongleId", encoding='utf8') in (None, UNREGISTERED_DONGLE_ID):
+  ignore = []
+  if params.get("DongleId", encoding='utf8') == UNREGISTERED_DONGLE_ID:
     ignore += ["manage_athenad", "uploader"]
   if os.getenv("NOBOARD") is not None:
     ignore.append("pandad")
-  ignore += [x for x in os.getenv("BLOCK", "").split(",") if len(x) > 0]
+  if os.getenv("BLOCK") is not None:
+    ignore += os.getenv("BLOCK").split(",")
 
   ensure_running(managed_processes.values(), started=False, not_run=ignore)
 
@@ -136,6 +155,9 @@ def manager_thread() -> None:
   while True:
     sm.update()
     not_run = ignore[:]
+
+    if sm['deviceState'].freeSpacePercent < 5:
+      not_run.append("loggerd")
 
     started = sm['deviceState'].started
     driverview = params.get_bool("IsDriverViewEnabled")
@@ -162,15 +184,14 @@ def manager_thread() -> None:
     shutdown = False
     for param in ("DoUninstall", "DoShutdown", "DoReboot"):
       if params.get_bool(param):
-        shutdown = True
-        params.put("LastManagerExitReason", param)
         cloudlog.warning(f"Shutting down manager - {param} set")
+        shutdown = True
 
     if shutdown:
       break
 
 
-def main() -> None:
+def main():
   prepare_only = os.getenv("PREPAREONLY") is not None
 
   manager_init()
@@ -191,7 +212,7 @@ def main() -> None:
     manager_thread()
   except Exception:
     traceback.print_exc()
-    sentry.capture_exception()
+    crash.capture_exception()
   finally:
     manager_cleanup()
 
@@ -215,11 +236,6 @@ if __name__ == "__main__":
   except Exception:
     add_file_handler(cloudlog)
     cloudlog.exception("Manager failed to start")
-
-    try:
-      managed_processes['ui'].stop()
-    except Exception:
-      pass
 
     # Show last 3 lines of traceback
     error = traceback.format_exc(-3)
