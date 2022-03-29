@@ -1,3 +1,4 @@
+from cereal import log
 from cereal import car
 from common.numpy_fast import clip, interp
 from common.realtime import DT_CTRL
@@ -7,10 +8,15 @@ from selfdrive.modeld.constants import T_IDXS
 
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
+STOPPING_TARGET_SPEED_OFFSET = 0.01
+REGEN_THRESHOLD = 0.02
+#BRAKE_STOPPING_TARGET = 0.5  # apply at least this amount of brake to maintain the vehicle stationary, replaced CP.stopAccel
+RATE = 100.0
 # As per ISO 15622:2018 for all speeds
 ACCEL_MIN_ISO = -3.5  # m/s^2
 ACCEL_MAX_ISO = 2.0  # m/s^2
 
+DEFAULT_LONG_LAG = 0.15
 
 def long_control_state_trans(CP, active, long_control_state, v_ego, v_target_future,
                              brake_pressed, cruise_standstill):
@@ -72,10 +78,13 @@ class LongControl():
       v_target = 0.0
       v_target_future = 0.0
       a_target = 0.0
+      
+    if a_target > 0.:
+      a_target *= interp(CS.vEgo, [0., 3.], [1.5, 1.])
 
     # TODO: This check is not complete and needs to be enforced by MPC
     a_target = clip(a_target, ACCEL_MIN_ISO, ACCEL_MAX_ISO)
-
+    
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
 
@@ -85,11 +94,19 @@ class LongControl():
                                                        v_target_future, CS.brakePressed,
                                                        CS.cruiseState.standstill)
 
-    if self.long_control_state == LongCtrlState.off or CS.gasPressed:
+    if self.long_control_state == LongCtrlState.off or not CS.adaptiveCruise or CS.gasPressed:
       self.reset(CS.vEgo)
       output_accel = 0.
 
-    # tracking objects and driving
+#    elif CS.regenPressed:
+#      self.reset(CS.vEgo)
+#      output_accel = REGEN_THRESHOLD
+
+#    elif CS.gasPressed:
+#      self.reset(CS.vEgo)
+#      output_accel = REGEN_THRESHOLD
+      
+# tracking objects and driving
     elif self.long_control_state == LongCtrlState.pid:
       self.v_pid = v_target
 
