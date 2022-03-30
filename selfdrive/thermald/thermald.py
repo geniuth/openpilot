@@ -156,6 +156,48 @@ def set_offroad_alert_if_changed(offroad_alert: str, show_alert: bool, extra_tex
   prev_offroad_states[offroad_alert] = (show_alert, extra_text)
   set_offroad_alert(offroad_alert, show_alert, extra_text)
 
+
+def hw_state_thread(end_event, hw_queue):
+  """Handles non critical hardware state, and sends over queue"""
+  count = 0
+  registered_count = 0
+
+  while not end_event.is_set():
+    # these are expensive calls. update every 10s
+    if (count % int(10. / DT_TRML)) == 0:
+      try:
+        network_type = HARDWARE.get_network_type()
+
+        hw_state = HardwareState(
+          network_type=network_type,
+          network_strength=HARDWARE.get_network_strength(network_type),
+          network_info=HARDWARE.get_network_info(),
+          nvme_temps=HARDWARE.get_nvme_temperatures(),
+          modem_temps=HARDWARE.get_modem_temperatures(),
+        )
+
+        try:
+          hw_queue.put_nowait(hw_state)
+        except queue.Full:
+          pass
+
+        if TICI and (hw_state.network_info is not None) and (hw_state.network_info.get('state', None) == "REGISTERED"):
+          registered_count += 1
+        else:
+          registered_count = 0
+
+        if registered_count > 10:
+          cloudlog.warning(f"Modem stuck in registered state {hw_state.network_info}. nmcli conn up lte")
+          os.system("nmcli conn up lte")
+          registered_count = 0
+
+      except Exception:
+        cloudlog.exception("Error getting network status")
+
+    count += 1
+    time.sleep(DT_TRML)
+
+
 def thermald_thread(end_event, hw_queue):
   pm = messaging.PubMaster(['deviceState'])
   sm = messaging.SubMaster(["peripheralState", "gpsLocationExternal", "controlsState", "pandaStates"], poll=["pandaStates"])
