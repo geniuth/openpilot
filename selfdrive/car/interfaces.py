@@ -23,7 +23,7 @@ ACCEL_MIN = -3.5
 # generic car and radar interfaces
 
 
-class CarInterfaceBase(ABC):
+class CarInterfaceBase():
   def __init__(self, CP, CarController, CarState):
     self.CP = CP
     self.VM = VehicleModel(CP)
@@ -32,6 +32,12 @@ class CarInterfaceBase(ABC):
     self.steering_unpressed = 0
     self.low_speed_alert = False
     self.silent_steer_warning = True
+
+    ####added by jc01rho
+    self.flag_pcmEnable_able =True
+    self.flag_pcmEnable_initialSet = False
+
+    self.initial_pcmEnable_counter = 0
 
     if CarState is not None:
       self.CS = CarState(CP)
@@ -43,6 +49,7 @@ class CarInterfaceBase(ABC):
     self.CC = None
     if CarController is not None:
       self.CC = CarController(self.cp.dbc_name, CP, self.VM)
+
 
   @staticmethod
   def get_pid_accel_limits(CP, current_speed, cruise_speed):
