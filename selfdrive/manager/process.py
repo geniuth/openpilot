@@ -23,7 +23,7 @@ WATCHDOG_FN = "/dev/shm/wd_"
 ENABLE_WATCHDOG = os.getenv("NO_WATCHDOG") is None
 
 
-def launcher(proc: str, name: str) -> None:
+def launcher(proc):
   try:
     # import the process
     mod = importlib.import_module(proc)
@@ -34,20 +34,15 @@ def launcher(proc: str, name: str) -> None:
     # create new context since we forked
     messaging.context = messaging.Context()
 
-    # add daemon name tag to logs
-    cloudlog.bind(daemon=name)
-    sentry.set_tag("daemon", name)
-
     # exec the process
-    getattr(mod, 'main')()
+    mod.main()
   except KeyboardInterrupt:
-    cloudlog.warning(f"child {proc} got SIGINT")
+    cloudlog.warning("child %s got SIGINT" % proc)
   except Exception:
     # can't install the crash handler because sys.excepthook doesn't play nice
     # with threads, so catch it here.
-    sentry.capture_exception()
+    crash.capture_exception()
     raise
-
 
 def nativelauncher(pargs: List[str], cwd: str, name: str) -> None:
   os.environ['MANAGER_DAEMON'] = name
