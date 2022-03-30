@@ -10,6 +10,8 @@ import cereal.messaging as messaging
 from selfdrive.car import gen_empty_fingerprint
 
 from cereal import car
+from selfdrive.car.gm.values import CAR
+
 EventName = car.CarEvent.EventName
 
 
