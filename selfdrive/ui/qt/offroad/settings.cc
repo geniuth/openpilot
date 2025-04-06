@@ -44,6 +44,14 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
       "../assets/offroad/icon_disengage_on_accelerator.svg",
     },
     {
+      "EnableDisturbanceCorrection",
+      tr("Enable Disturbance Correction"),
+      tr("Correct external disturbances such as gusts of wind. (distinguishable short term events)<br><br>"
+         "Switching has no effect while onroad.<br>"
+         "Disabling this, Roll Compensation and Curvature Correction enables steering through raw curvature."),
+      "../assets/img_chffr_wheel.png",
+    },
+    {
       "DarkMode",
       tr("Dark Mode"),
       tr("Force brightness to a minimal value."),
