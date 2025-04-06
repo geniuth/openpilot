@@ -1,6 +1,7 @@
 import numpy as np
 import math
 
+from openpilot.common.pid import PIDController
 from openpilot.common.realtime import DT_CTRL
 
 ALPHA_MIN = 0.004
