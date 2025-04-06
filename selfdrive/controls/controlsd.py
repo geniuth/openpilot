@@ -53,6 +53,7 @@ class Controls:
     self.desired_curvature = 0.0
     self.roll = 0.0
 
+    self.enable_disturbance_correction = self.params.get_bool("EnableDisturbanceCorrection")
     self.disturbance_controller = DisturbanceController()
 
     self.pose_calibrator = PoseCalibrator()
@@ -138,7 +139,7 @@ class Controls:
     # Steering PID loop and lateral MPC
     # Reset desired curvature to current to avoid violating the limits on engage
     new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
-    current_disturbance = self.disturbance_controller.compute_disturbance(new_desired_curvature, self.curvature_3dof)
+    current_disturbance = self.disturbance_controller.compute_disturbance(new_desired_curvature, self.curvature_3dof) if self.enable_disturbance_correction else 0
     new_desired_curvature = new_desired_curvature - current_disturbance
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
