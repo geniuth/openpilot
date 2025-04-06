@@ -47,8 +47,7 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
       "EnableDisturbanceCorrection",
       tr("Enable Disturbance Correction"),
       tr("Correct external disturbances such as gusts of wind. (distinguishable short term events)<br><br>"
-         "Switching has no effect while onroad.<br>"
-         "Disabling this, Roll Compensation and Curvature Correction enables steering through raw curvature."),
+         "Switching has no effect while onroad.<br>"),
       "../assets/img_chffr_wheel.png",
     },
     {
