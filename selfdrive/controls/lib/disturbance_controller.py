@@ -11,6 +11,7 @@ class DisturbanceController:
     self.lowpass_filtered = 0.0
     self.alpha_prev = ALPHA_MIN
     self.desired_curvature_prev = 0.0
+    self.pid = PIDController(1, 1, k_f=0, pos_limit=0.2, neg_limit=-0.2)
 
   def compute_dynamic_alpha(self, desired_curvature, dt=DT_CTRL, A=0.02, n=2.0, beta=3.0, k=2.0):
     d_desired = abs(desired_curvature - self.desired_curvature_prev) / dt
@@ -32,8 +33,12 @@ class DisturbanceController:
   def highpass_filter(self, current_value, lowpass_value):
     return current_value - lowpass_value
 
-  def compute_disturbance(self, desired_curvature, actual_curvature):
+  def compensate(self, desired_curvature, actual_curvature):
     alpha = self.compute_dynamic_alpha(desired_curvature)
     reaction = self.lowpass_filter(actual_curvature, alpha)
     disturbance = self.highpass_filter(actual_curvature, reaction)
-    return disturbance
+
+    error = desired_curvature - disturbance
+    output_curvature = self.pid.update(error, feedforward=desired_curvature, speed=CS.vEgo)
+    
+    return output_curvature
