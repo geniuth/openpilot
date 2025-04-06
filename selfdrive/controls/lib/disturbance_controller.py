@@ -12,7 +12,7 @@ class DisturbanceController:
     self.lowpass_filtered = 0.0
     self.alpha_prev = ALPHA_MIN
     self.desired_curvature_prev = 0.0
-    self.pid = PIDController(1, 1, k_f=0, pos_limit=0.2, neg_limit=-0.2)
+    self.pid = PIDController(1, 0, k_f=0, pos_limit=0.2, neg_limit=-0.2)
 
   def reset(self):
     self.lowpass_filtered = 0.0
