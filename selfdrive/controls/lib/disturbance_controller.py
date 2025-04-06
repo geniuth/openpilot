@@ -40,7 +40,7 @@ class DisturbanceController:
   def highpass_filter(self, current_value, lowpass_value):
     return current_value - lowpass_value
 
-  def compensate(self, desired_curvature, actual_curvature):
+  def compensate(self, CS, desired_curvature, actual_curvature):
     alpha = self.compute_dynamic_alpha(desired_curvature)
     reaction = self.lowpass_filter(actual_curvature, alpha)
     disturbance = self.highpass_filter(actual_curvature, reaction)
