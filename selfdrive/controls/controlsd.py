@@ -49,7 +49,6 @@ class Controls:
 
     self.steer_limited_by_controls = False
     self.curvature = 0.0
-    self.curvature_3dof = 0.0
     self.desired_curvature = 0.0
     self.roll = 0.0
 
@@ -88,11 +87,6 @@ class Controls:
 
     steer_angle_without_offset = math.radians(CS.steeringAngleDeg - lp.angleOffsetDeg)
     self.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, 0)
-    if self.calibrated_pose is not None:
-      self.curvature_3dof = -self.VM.calc_curvature_3dof(self.calibrated_pose.acceleration.y, self.calibrated_pose.acceleration.x, self.calibrated_pose.angular_velocity.yaw,
-                                                         CS.vEgo, steer_angle_without_offset, 0)
-    else:
-      self.curvature_3dof = self.curvature
 
     # Update Torque Params
     if self.CP.lateralTuning.which() == 'torque':
@@ -144,7 +138,7 @@ class Controls:
     # Reset desired curvature to current to avoid violating the limits on engage
     new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
     if self.enable_disturbance_correction:
-      new_desired_curvature = self.disturbance_controller.compensate(CS, new_desired_curvature, self.curvature_3dof)
+      new_desired_curvature = self.disturbance_controller.compensate(CS, self.VM, lp, self.calibrated_pose, new_desired_curvature)
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
     actuators.curvature = self.desired_curvature
