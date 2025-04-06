@@ -40,12 +40,18 @@ class DisturbanceController:
   def highpass_filter(self, current_value, lowpass_value):
     return current_value - lowpass_value
 
-  def compensate(self, CS, desired_curvature, actual_curvature):
+  def compensate(self, CS, VM, params, calibrated_pose, desired_curvature):
+    actual_curvature_vm = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, 0.)
+    assert calibrated_pose is not None
+    actual_curvature_3dof = -VM.calc_curvature_3dof(calibrated_pose.acceleration.y, calibrated_pose.acceleration.x, calibrated_pose.angular_velocity.yaw,
+                                                    CS.vEgo, math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), 0.)
+    actual_curvature = np.interp(CS.vEgo, [2.0, 5.0], [actual_curvature_vm, actual_curvature_3dof])
+                      
     alpha = self.compute_dynamic_alpha(desired_curvature)
     reaction = self.lowpass_filter(actual_curvature, alpha)
     disturbance = self.highpass_filter(actual_curvature, reaction)
 
-    error = disturbance
+    error = desired_curvature - disturbance
     output_curvature = self.pid.update(error, feedforward=desired_curvature, speed=CS.vEgo)
     
-    return output_curvature
+    return float(output_curvature)
