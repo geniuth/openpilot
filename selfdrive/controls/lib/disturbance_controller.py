@@ -45,7 +45,7 @@ class DisturbanceController:
     reaction = self.lowpass_filter(actual_curvature, alpha)
     disturbance = self.highpass_filter(actual_curvature, reaction)
 
-    error = desired_curvature - disturbance
+    error = -disturbance
     output_curvature = self.pid.update(error, feedforward=desired_curvature, speed=CS.vEgo)
     
     return output_curvature
