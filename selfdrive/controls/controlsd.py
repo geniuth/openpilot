@@ -132,6 +132,7 @@ class Controls:
 
     if not CC.latActive:
       self.LaC.reset()
+      self.disturbance_controller.reset()
     if not CC.longActive:
       self.LoC.reset()
 
