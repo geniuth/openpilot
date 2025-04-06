@@ -88,8 +88,11 @@ class Controls:
 
     steer_angle_without_offset = math.radians(CS.steeringAngleDeg - lp.angleOffsetDeg)
     self.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, 0)
-    self.curvature_3dof = -self.VM.calc_curvature_3dof(self.calibrated_pose.acceleration.y, self.calibrated_pose.acceleration.x, self.calibrated_pose.angular_velocity.yaw,
-                                                       CS.vEgo, steer_angle_without_offset, 0)
+    if self.calibrated_pose is not None:
+      self.curvature_3dof = -self.VM.calc_curvature_3dof(self.calibrated_pose.acceleration.y, self.calibrated_pose.acceleration.x, self.calibrated_pose.angular_velocity.yaw,
+                                                         CS.vEgo, steer_angle_without_offset, 0)
+    else:
+      self.curvature_3dof = self.curvature
 
     # Update Torque Params
     if self.CP.lateralTuning.which() == 'torque':
