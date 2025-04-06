@@ -142,8 +142,8 @@ class Controls:
     # Steering PID loop and lateral MPC
     # Reset desired curvature to current to avoid violating the limits on engage
     new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
-    current_disturbance = self.disturbance_controller.compute_disturbance(new_desired_curvature, self.curvature_3dof) if self.enable_disturbance_correction else 0
-    new_desired_curvature = new_desired_curvature - current_disturbance
+    if self.enable_disturbance_correction:
+      new_desired_curvature = self.disturbance_controller.compensate(new_desired_curvature, self.curvature_3dof)
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
     actuators.curvature = self.desired_curvature
