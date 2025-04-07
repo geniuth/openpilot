@@ -41,7 +41,7 @@ class DisturbanceController:
   def highpass_filter(self, current_value, lowpass_value):
     return current_value - lowpass_value
 
-  def get_correction(self, CS, VM, params, calibrated_pose, desired_curvature):
+  def compensate(self, CS, VM, params, calibrated_pose, desired_curvature):
     if calibrated_pose is None:
       return desired_curvature
 
