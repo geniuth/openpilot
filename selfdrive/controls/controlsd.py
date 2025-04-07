@@ -139,7 +139,8 @@ class Controls:
     # Reset desired curvature to current to avoid violating the limits on engage
     new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
     if self.enable_disturbance_correction:
-      new_desired_curvature = self.disturbance_controller.compensate(CS, self.VM, lp, self.calibrated_pose, new_desired_curvature)
+      disturbance_correction = self.disturbance_controller.get_correction(CS, self.VM, lp, self.calibrated_pose, new_desired_curvature)
+      new_desired_curvature -= disturbance_correction
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
     actuators.curvature = self.desired_curvature
