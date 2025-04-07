@@ -3,6 +3,7 @@ import math
 
 from openpilot.common.pid import PIDController
 from openpilot.common.realtime import DT_CTRL
+from openpilot.selfdrive.controls.lib.drive_helpers import MAX_CURVATURE
 
 ALPHA_MIN = 0.004
 ALPHA_MAX = 0.4
@@ -12,7 +13,7 @@ class DisturbanceController:
     self.lowpass_filtered = 0.0
     self.alpha_prev = ALPHA_MIN
     self.desired_curvature_prev = 0.0
-    self.pid = PIDController(1, 0, k_f=0, pos_limit=0.2, neg_limit=-0.2)
+    self.pid = PIDController(1, 0, k_f=0, pos_limit=MAX_CURVATURE, neg_limit=-MAX_CURVATURE)
 
   def reset(self):
     self.lowpass_filtered = 0.0
