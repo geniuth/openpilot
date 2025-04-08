@@ -53,7 +53,7 @@ class Controls:
     self.roll = 0.0
 
     self.enable_disturbance_correction = self.params.get_bool("EnableDisturbanceCorrection")
-    self.disturbance_controller = DisturbanceController()
+    self.disturbance_controller = DisturbanceController(self.CP)
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
