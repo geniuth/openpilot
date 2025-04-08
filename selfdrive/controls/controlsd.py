@@ -19,7 +19,6 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_T_FOLLOW
-from selfdrive.controls.lib.disturbance_controller import DisturbanceController
 
 State = log.SelfdriveState.OpenpilotState
 LaneChangeState = log.LaneChangeState
@@ -52,9 +51,6 @@ class Controls:
     self.desired_curvature = 0.0
     self.roll = 0.0
 
-    self.enable_disturbance_correction = self.params.get_bool("EnableDisturbanceCorrection")
-    self.disturbance_controller = DisturbanceController(self.CP)
-
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
 
@@ -86,7 +82,7 @@ class Controls:
     self.VM.update_params(x, sr)
 
     steer_angle_without_offset = math.radians(CS.steeringAngleDeg - lp.angleOffsetDeg)
-    self.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, 0)
+    self.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, lp.roll)
     self.roll = lp.roll
 
     # Update Torque Params
@@ -127,7 +123,6 @@ class Controls:
 
     if not CC.latActive:
       self.LaC.reset()
-      self.disturbance_controller.reset()
     if not CC.longActive:
       self.LoC.reset()
 
@@ -138,8 +133,6 @@ class Controls:
     # Steering PID loop and lateral MPC
     # Reset desired curvature to current to avoid violating the limits on engage
     new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
-    if self.enable_disturbance_correction:
-      new_desired_curvature = self.disturbance_controller.compensate(CS, self.VM, lp, self.calibrated_pose, new_desired_curvature)
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
     actuators.curvature = self.desired_curvature
