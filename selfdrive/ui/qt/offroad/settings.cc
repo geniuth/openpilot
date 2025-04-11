@@ -52,7 +52,7 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
     },
     {
       "EnableSmoothSteer",
-      tr("Enable Steer Smoothin"),
+      tr("Enable Steer Smoothing"),
       tr("Enables S-curving on lateral control for smoother steering<br><br>"
          "Switching has no effect while onroad.<br>"),
       "../assets/img_chffr_wheel.png",
