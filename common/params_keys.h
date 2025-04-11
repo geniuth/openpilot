@@ -38,6 +38,7 @@ inline static std::unordered_map<std::string, uint32_t> keys = {
     {"DoUninstall", CLEAR_ON_MANAGER_START},
     {"EnableDisturbanceCorrection", PERSISTENT},
     {"EnableScreenEvent", CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION},
+    {"EnableSmoothSteer", PERSISTENT},
     {"ExperimentalLongitudinalEnabled", PERSISTENT | DEVELOPMENT_ONLY | BACKUP},
     {"ExperimentalMode", PERSISTENT | BACKUP},
     {"ExperimentalModeConfirmed", PERSISTENT | BACKUP},
