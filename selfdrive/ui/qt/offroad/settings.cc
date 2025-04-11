@@ -46,15 +46,13 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
     {
       "EnableDisturbanceCorrection",
       tr("Enable Disturbance Correction"),
-      tr("Correct external disturbances such as gusts of wind. (distinguishable short term events)<br><br>"
-         "Switching has no effect while onroad.<br>"),
+      tr("Correct external disturbances such as gusts of wind. (distinguishable short term events)<br>"),
       "../assets/img_chffr_wheel.png",
     },
     {
       "EnableSmoothSteer",
       tr("Enable Steer Smoothing"),
-      tr("Enables S-curving on lateral control for smoother steering<br><br>"
-         "Switching has no effect while onroad.<br>"),
+      tr("Enables S-curving on lateral control for smoother steering<br>"),
       "../assets/img_chffr_wheel.png",
     },
     {
