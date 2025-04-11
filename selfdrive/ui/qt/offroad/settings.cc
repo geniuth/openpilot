@@ -51,6 +51,13 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
       "../assets/img_chffr_wheel.png",
     },
     {
+      "EnableSmoothSteer",
+      tr("Enable Steer Smoothin"),
+      tr("Enables S-curving on lateral control for smoother steering<br><br>"
+         "Switching has no effect while onroad.<br>"),
+      "../assets/img_chffr_wheel.png",
+    },
+    {
       "DarkMode",
       tr("Dark Mode"),
       tr("Force brightness to a minimal value."),
