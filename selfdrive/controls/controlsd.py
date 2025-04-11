@@ -33,6 +33,7 @@ ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
 class Controls:
   def __init__(self) -> None:
     self.params = Params()
+    self.param_counter = 0
     cloudlog.info("controlsd is waiting for CarParams")
     self.CP = messaging.log_from_bytes(self.params.get("CarParams", block=True), car.CarParams)
     cloudlog.info("controlsd got CarParams")
@@ -80,6 +81,12 @@ class Controls:
       device_pose = Pose.from_live_pose(self.sm['livePose'])
       self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_pose)
 
+    self.param_counter += 1
+    if self.param_counter >= 100:
+      self.param_counter = 0
+      self.enable_disturbance_correction = self.params.get_bool("EnableDisturbanceCorrection")
+      self.enable_smooth_steer = self.params.get_bool("EnableSmoothSteer")
+  
   def state_control(self):
     CS = self.sm['carState']
 
