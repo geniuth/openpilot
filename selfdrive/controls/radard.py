@@ -38,9 +38,6 @@ V_EGO_STATIONARY = 4.   # no stationary object flag below this speed
 RADAR_TO_CENTER = 2.7   # (deprecated) RADAR is ~ 2.7m ahead from center of car
 RADAR_TO_CAMERA = 1.52  # RADAR is ~ 1.5m ahead from center of mesh frame
 
-_prev_aLeadK = 0.0
-_prev_ts     = time.monotonic()
-
 
 class KalmanParams:
   def __init__(self, dt: float):
@@ -94,9 +91,9 @@ class Track:
     # Learn if constant acceleration
     # adaptive aLeadTau
     if abs(self.aLeadK) < 0.5:
-      self.aLeadTau = min(max(self.aLeadTau, 0.05)*TAU_GROW, _LEAD_ACCEL_TAU)
+      self.aLeadTau = min(max(self.aLeadTau, 0.05) * TAU_GROW, _LEAD_ACCEL_TAU)
     else:
-      self.aLeadTau = max(self.aLeadTau*TAU_SHRINK, TAU_MIN)
+      self.aLeadTau = max(self.aLeadTau * TAU_SHRINK, TAU_MIN)
 
     self.cnt += 1
 
@@ -159,44 +156,47 @@ def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks
 
 
 def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: float, model_v_ego: float):
-  global _prev_aLeadK, _prev_ts
+  # Persistent states
+  prev_ts     = getattr(get_RadarState_from_vision, "prev_ts",  time.monotonic())
+  prev_aLeadK = getattr(get_RadarState_from_vision, "prev_aLeadK", 0.0)
+  last_d      = getattr(get_RadarState_from_vision, "last_d", None)
+
+  # Timing
   now = time.monotonic()
-  dt  = now - _prev_ts
-  _prev_ts = now
+  dt  = now - prev_ts if now > prev_ts else 0.0
+  get_RadarState_from_vision.prev_ts = now
 
   # Baseline model values
   d_rel     = lead_msg.x[0] - RADAR_TO_CAMERA
   v_rel_mod = lead_msg.v[0] - model_v_ego
-  a_mod     = (lead_msg.a[0] if len(lead_msg.a) else 0.0)
+  a_mod     = lead_msg.a[0] if len(lead_msg.a) else 0.0
 
   # Derivative‑based vRel
   v_rel_der = None
-  if dt > 1e-3:
-    v_rel_der = (d_rel - getattr(get_RadarState_from_vision, 'last_d', d_rel)) / dt
-    get_RadarState_from_vision.last_d = d_rel
+  if dt > 1e-3 and last_d is not None:
+    v_rel_der = (d_rel - last_d) / dt
+  get_RadarState_from_vision.last_d = d_rel
 
   # Blend derivative with model (saturate if None)
-  if v_rel_der is not None:
-    v_rel_pred = (1.0 - BLEND_VREL_DERIV)*v_rel_mod + BLEND_VREL_DERIV*v_rel_der
-  else:
-    v_rel_pred = v_rel_mod
+  v_rel_pred = (v_rel_mod if v_rel_der is None else
+                (1.0 - BLEND_VREL_DERIV) * v_rel_mod + BLEND_VREL_DERIV * v_rel_der)
 
   # aLeadK blending / smoothing
-  a_blend = (1.0 - BLEND_KF)*a_mod + BLEND_KF*_prev_aLeadK
-  _prev_aLeadK = a_blend
+  aLeadK_blend = (1.0 - BLEND_KF) * a_mod + BLEND_KF * prev_aLeadK
+  get_RadarState_from_vision.prev_aLeadK = aLeadK_blend
 
   return {
-    "dRel"    : float(d_rel),
-    "yRel"    : float(-lead_msg.y[0]),
-    "vRel"    : float(v_rel_pred),
-    "vLead"   : float(v_ego + v_rel_pred),
-    "vLeadK"  : float(v_ego + v_rel_pred),
-    "aLeadK"  : float(a_blend),
+    "dRel":     float(d_rel),
+    "yRel":     float(-lead_msg.y[0]),
+    "vRel":     float(v_rel_pred),
+    "vLead":    float(v_ego + v_rel_pred),
+    "vLeadK":   float(v_ego + v_rel_pred),
+    "aLeadK":   float(aLeadK_blend),
     "aLeadTau": 0.3,
-    "fcw"     : False,
+    "fcw":      False,
     "modelProb": float(lead_msg.prob),
-    "status"  : True,
-    "radar"   : False,
+    "status":   True,
+    "radar":    False,
     "radarTrackId": -1,
   }
 
