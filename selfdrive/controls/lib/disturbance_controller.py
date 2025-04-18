@@ -27,7 +27,7 @@ PID_KF = 0.0
 class DisturbanceController:
   """Wind‑disturbance compensator using
   * 3DoF curvature estimate
-  * 1st‑order Disturbance‑Observer (Fy_hat)
+  * 1st order Disturbance Observer (Fy_hat)
   * adaptive LP/HP separation with band pass energy
   """
   
