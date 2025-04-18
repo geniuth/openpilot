@@ -10,7 +10,7 @@ ALPHA_MIN = 0.004  # baseline LP rate
 ALPHA_MAX = 0.4    # fastest LP rate
 
 # Disturbance Observer (wind lateral force)
-OBS_TAU = 0.20     # [s] filter constant (1st border LP on Fy_hat)
+OBS_TAU = 0.20     # [s] filter constant (1st order LP on Fy_hat)
 OBS_K   = 7.0      # observer gain (>> 1) – higher -> faster -> noisier
 
 # Band pass (≈ 0.5 ... 15 Hz) for dynamic alpha
@@ -26,9 +26,9 @@ PID_KF = 0.0
 
 class DisturbanceController:
   """Wind‑disturbance compensator using
-  * 3‑DoF curvature estimate
+  * 3DoF curvature estimate
   * 1st‑order Disturbance‑Observer (Fy_hat)
-  * adaptive LP/HP separation with band‑pass energy
+  * adaptive LP/HP separation with band pass energy
   """
   
   def __init__(self, CP):
@@ -38,7 +38,7 @@ class DisturbanceController:
     self.pid = PIDController(PID_KP, PID_KI, k_f=PID_KF, pos_limit=MAX_CURVATURE, neg_limit=-MAX_CURVATURE)
     self.reaction_hist = deque([0.0], maxlen=int(round(CP.steerActuatorDelay / DT_CTRL)) + 1) # Actuator delay compensation
     self.Fy_hat = 0.0  # Disturbance observer state: estimated lateral wind force [N]
-    self.ay_hp  = 0.0  # Band pass filter states (simple 1st‑order HP + LP energy)
+    self.ay_hp  = 0.0  # Band pass filter states (simple 1st order HP + LP energy)
     self.ay_prev = 0.0
 
   def reset(self):
