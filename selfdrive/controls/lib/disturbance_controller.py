@@ -25,7 +25,7 @@ PID_KI = 0.05  # small I to cancel steady wind offset
 PID_KF = 0.0
 
 class DisturbanceController:
-  """Wind‑disturbance compensator using
+  """Wind disturbance compensator using
   * 3DoF curvature estimate
   * 1st order Disturbance Observer (Fy_hat)
   * adaptive LP/HP separation with band pass energy
@@ -53,7 +53,7 @@ class DisturbanceController:
     self.ay_prev = 0.0
 
   def _update_bandpass_energy(self, ay_meas):
-    """High‑pass filter to isolate wind‑böe frequency content (≥ 0.5 Hz)."""
+    """High pass filter to isolate wind böe frequency content (≥ 0.5 Hz)."""
     # 1st order HP: y[n] = alpha*(y[n_1] + x[n] - x[n_1])
     self.ay_hp = BP_ALPHA_HP * (self.ay_hp + ay_meas - self.ay_prev)
     self.ay_prev = ay_meas
