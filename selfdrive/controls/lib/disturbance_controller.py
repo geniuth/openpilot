@@ -49,11 +49,13 @@ class DisturbanceController:
     if calibrated_pose is None or CS.vEgo < 0.1:
       return desired_curvature
 
-    steering_angle_without_offset = math.radians(CS.steeringAngleDeg - params.angleOffsetDeg)
-    actual_curvature = -VM.calc_curvature_3dof(calibrated_pose.acceleration.y, calibrated_pose.acceleration.x,
-                                               calibrated_pose.angular_velocity.yaw, CS.vEgo, steering_angle_without_offset,
-                                               0.)
-                      
+    #steering_angle_without_offset = math.radians(CS.steeringAngleDeg - params.angleOffsetDeg)
+    #actual_curvature = -VM.calc_curvature_3dof(calibrated_pose.acceleration.y, calibrated_pose.acceleration.x,
+    #                                           calibrated_pose.angular_velocity.yaw, CS.vEgo, steering_angle_without_offset,
+    #                                           0.)
+    
+    actual_curvature = calibrated_pose.acceleration.y / (CS.vEgo ** 2)
+    
     alpha = self.compute_dynamic_alpha(desired_curvature)
     reaction = self.lowpass_filter(actual_curvature, alpha)
     self.reaction_hist.append(reaction)
