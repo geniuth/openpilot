@@ -21,7 +21,7 @@ KE_ENERGY  = 0.25   # scaling from |ay_bp| to alpha boost
 
 # PID gains
 PID_KP = 1.0
-PID_KI = 0.05  # small I to cancel steady wind offset
+PID_KI = 0.0 #0.05  # small I to cancel steady wind offset
 PID_KF = 0.0
 
 class DisturbanceController:
