@@ -24,6 +24,8 @@ PID_KP = 1.0
 PID_KI = 0.0 #0.05  # small I to cancel steady wind offset
 PID_KF = 0.0
 
+FF_GAIN = 0.2
+
 class DisturbanceController:
   """Wind disturbance compensator using
   * 3DoF curvature estimate
@@ -109,7 +111,7 @@ class DisturbanceController:
     ay_wind_est = self.Fy_hat / m
 
     # immediate feed forward curvature correction
-    curv_ff = -ay_wind_est / (v_ego * v_ego + 1e-3)
+    curv_ff = -ay_wind_est / (v_ego * v_ego + 1e-3) * FF_GAIN
     desired_curvature_ff = desired_curvature + curv_ff
 
     # LP/HP separation with adaptive alpha (band pass energy)
