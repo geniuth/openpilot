@@ -8,7 +8,6 @@ from openpilot.selfdrive.controls.lib.drive_helpers import MAX_CURVATURE
 
 ALPHA_MIN = 0.004
 ALPHA_MAX = 0.4
-FF_GAIN = 0.05
 
 class DisturbanceController:
   def __init__(self, CP):
@@ -52,15 +51,8 @@ class DisturbanceController:
 
     steering_angle_without_offset = math.radians(CS.steeringAngleDeg - params.angleOffsetDeg)
     actual_curvature = -VM.calc_curvature_3dof(calibrated_pose.acceleration.y, calibrated_pose.acceleration.x,
-                                                    calibrated_pose.angular_velocity.yaw, CS.vEgo, steering_angle_without_offset,
-                                                    0.)
-
-    ay_meas = calibrated_pose.acceleration.y
-    ay_cmd  = desired_curvature * CS.vEgo * CS.vEgo
-    ay_wind = ay_meas - ay_cmd
-    raw_ff  = -ay_wind / (CS.vEgo * CS.vEgo + 1e-3)
-    curv_ff = raw_ff * FF_GAIN
-    desired_ff = desired_curvature + curv_ff
+                                               calibrated_pose.angular_velocity.yaw, CS.vEgo, steering_angle_without_offset,
+                                               0.)
                       
     alpha = self.compute_dynamic_alpha(desired_curvature)
     reaction = self.lowpass_filter(actual_curvature, alpha)
@@ -68,8 +60,8 @@ class DisturbanceController:
     disturbance = self.highpass_filter(actual_curvature, reaction)
 
     reaction_delayed = self.reaction_hist[0]
-    error = desired_ff - (reaction_delayed + disturbance)
+    error = desired_curvature - (reaction_delayed + disturbance)
 
-    output_curvature = self.pid.update(error, feedforward=desired_ff, speed=CS.vEgo)
+    output_curvature = self.pid.update(error, feedforward=desired_curvature, speed=CS.vEgo)
     
     return float(output_curvature)
