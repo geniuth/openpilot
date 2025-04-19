@@ -53,10 +53,10 @@ class Track:
     self.kf = KF1D([[v_lead], [0.0]], kalman_params.A, kalman_params.C, kalman_params.K)
 
   def update(self, d_rel, y_rel, v_rel, v_lead, measured):
-    self.dRel = d_rel
-    self.yRel = y_rel
-    self.vRel = v_rel
-    self.vLead = v_lead
+    self.dRel = float(d_rel)
+    self.yRel = float(y_rel)
+    self.vRel = float(v_rel)
+    self.vLead = float(v_lead)
     self.measured = measured
     if self.cnt > 0:
       self.kf.update(self.vLead)
@@ -67,16 +67,16 @@ class Track:
 
   def get_RadarState(self, model_prob=0.0):
     return {
-      "dRel": self.dRel,
-      "yRel": self.yRel,
-      "vRel": self.vRel,
-      "vLead": self.vLead,
-      "vLeadK": self.vLeadK,
-      "aLeadK": self.aLeadK,
-      "aLeadTau": self.aLeadTau,
+      "dRel": float(self.dRel),
+      "yRel": float(self.yRel),
+      "vRel": float(self.vRel),
+      "vLead": float(self.vLead),
+      "vLeadK": float(self.vLeadK),
+      "aLeadK": float(self.aLeadK),
+      "aLeadTau": float(self.aLeadTau),
       "status": True,
       "fcw": model_prob > .9,
-      "modelProb": model_prob,
+      "modelProb": float(model_prob),
       "radar": True,
       "radarTrackId": self.identifier,
     }
@@ -104,24 +104,25 @@ def get_RadarState_from_vision(lead_msg, v_ego, model_v_ego):
   now = time.monotonic()
   dt = now - getattr(get_RadarState_from_vision, "prev_ts", now)
   get_RadarState_from_vision.prev_ts = now
-  d_rel = lead_msg.x[0] - RADAR_TO_CAMERA
-  v_rel = lead_msg.v[0] - model_v_ego
+  d_rel = float(lead_msg.x[0] - RADAR_TO_CAMERA)
+  v_rel = float(lead_msg.v[0] - model_v_ego)
   v_rel_deriv = (d_rel - getattr(get_RadarState_from_vision, "last_d", d_rel)) / dt if dt > 1e-3 else None
   get_RadarState_from_vision.last_d = d_rel
   v_rel_pred = (1.0 - BLEND_VREL_DERIV) * v_rel + BLEND_VREL_DERIV * v_rel_deriv if v_rel_deriv else v_rel
   prev_a = getattr(get_RadarState_from_vision, "prev_aLeadK", 0.0)
-  a_blend = (1.0 - BLEND_KF) * (lead_msg.a[0] if len(lead_msg.a) else 0.0) + BLEND_KF * prev_a
+  a_raw = lead_msg.a[0] if len(lead_msg.a) else 0.0
+  a_blend = (1.0 - BLEND_KF) * float(a_raw) + BLEND_KF * prev_a
   get_RadarState_from_vision.prev_aLeadK = a_blend
   return {
     "dRel": d_rel,
-    "yRel": -lead_msg.y[0],
-    "vRel": v_rel_pred,
-    "vLead": v_ego + v_rel_pred,
-    "vLeadK": v_ego + v_rel_pred,
-    "aLeadK": a_blend,
+    "yRel": float(-lead_msg.y[0]),
+    "vRel": float(v_rel_pred),
+    "vLead": float(v_ego + v_rel_pred),
+    "vLeadK": float(v_ego + v_rel_pred),
+    "aLeadK": float(a_blend),
     "aLeadTau": 0.3,
     "fcw": False,
-    "modelProb": lead_msg.prob,
+    "modelProb": float(lead_msg.prob),
     "status": True,
     "radar": False,
     "radarTrackId": -1,
