@@ -12,6 +12,8 @@ import urllib.parse
 import warnings
 import zstandard as zstd
 
+os.environ["CEREAL_INCLUDE_DEPRECATED"] = "1"
+
 from collections.abc import Callable, Iterable, Iterator
 from urllib.parse import parse_qs, urlparse
 
