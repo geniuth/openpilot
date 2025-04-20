@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import math
+import math, time
 import numpy as np
 from collections import deque
 from typing import Any
@@ -145,7 +145,6 @@ def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks
 
 
 def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: float, model_v_ego: float):
-  import time
   now = time.monotonic()
   dt = now - getattr(get_RadarState_from_vision, "prev_ts", now)
   get_RadarState_from_vision.prev_ts = now
