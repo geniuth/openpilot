@@ -52,6 +52,7 @@ class Controls:
 
     self.steer_limited_by_controls = False
     self.curvature = 0.0
+    self.curvature_3dof = 0.0
     self.desired_curvature = 0.0
     self.roll = 0.0
 
@@ -98,6 +99,9 @@ class Controls:
 
     steer_angle_without_offset = math.radians(CS.steeringAngleDeg - lp.angleOffsetDeg)
     self.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, lp.roll)
+    self.curvature_3dof = -self.VM.calc_curvature_3dof(self.calibrated_pose.acceleration.y, self.calibrated_pose.acceleration.x,
+                                                       self.calibrated_pose.angular_velocity.yaw, CS.vEgo, steer_angle_without_offset,
+                                                       lp.roll)
     self.roll = lp.roll
 
     # Update Torque Params
@@ -181,6 +185,7 @@ class Controls:
     CS = self.sm['carState']
 
     CC.currentCurvature = self.curvature
+    CC.actuatorsOutputDEPRECATED = self.curvature_3dof
     CC.rollDEPRECATED = self.roll
 
     # Orientation and angle rates can be useful for carcontroller
