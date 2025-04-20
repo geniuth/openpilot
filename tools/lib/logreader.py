@@ -12,7 +12,6 @@ import urllib.parse
 import warnings
 import zstandard as zstd
 
-
 from collections.abc import Callable, Iterable, Iterator
 from urllib.parse import parse_qs, urlparse
 
