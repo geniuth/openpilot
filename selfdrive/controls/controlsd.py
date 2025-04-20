@@ -186,7 +186,7 @@ class Controls:
     CS = self.sm['carState']
 
     CC.currentCurvature = self.curvature
-    CC.pitchDEPRECATED = self.curvature_3dof
+    CC.pitchDEPRECATED = float(self.curvature_3dof)
     CC.rollDEPRECATED = self.roll
 
     # Orientation and angle rates can be useful for carcontroller
