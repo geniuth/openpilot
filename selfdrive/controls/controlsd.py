@@ -186,8 +186,8 @@ class Controls:
     CS = self.sm['carState']
 
     CC.currentCurvature = self.curvature
-    CC.pitchDEPRECATED = float(self.curvature_3dof)
-    CC.rollDEPRECATED = self.roll
+    CC.pitch = float(self.curvature_3dof) # debugging purposes
+    CC.roll = self.roll # for lateral iso limit calculation
 
     # Orientation and angle rates can be useful for carcontroller
     # Only calibrated (car) frame is relevant for the carcontroller
