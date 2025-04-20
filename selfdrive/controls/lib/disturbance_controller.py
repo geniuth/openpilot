@@ -1,6 +1,7 @@
 import numpy as np
 import math
 
+from collections import deque
 from openpilot.common.pid import PIDController
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import MAX_CURVATURE
@@ -14,12 +15,15 @@ class DisturbanceController:
     self.alpha_prev = ALPHA_MIN
     self.desired_curvature_prev = 0.0
     self.pid = PIDController(1, 0, k_f=0, pos_limit=MAX_CURVATURE, neg_limit=-MAX_CURVATURE)
+    self.reaction_hist = deque([0.0], maxlen=int(round(CP.steerActuatorDelay / DT_CTRL)) + 1)
 
   def reset(self):
     self.lowpass_filtered = 0.0
     self.alpha_prev = ALPHA_MIN
     self.desired_curvature_prev = 0.0
     self.pid.reset()
+    self.reaction_hist.clear()
+    self.reaction_hist.append(0.0)
 
   def compute_dynamic_alpha(self, desired_curvature, dt=DT_CTRL, A=0.02, n=2.0, beta=3.0, k=2.0):
     d_desired = abs(desired_curvature - self.desired_curvature_prev) / dt
@@ -52,9 +56,11 @@ class DisturbanceController:
     
     alpha = self.compute_dynamic_alpha(desired_curvature)
     reaction = self.lowpass_filter(actual_curvature, alpha)
+    self.reaction_hist.append(reaction)
+    reaction_delayed = self.reaction_hist[0]
     disturbance = self.highpass_filter(actual_curvature, reaction)
 
-    error = desired_curvature - disturbance
+    error = desired_curvature - (reaction_delayed + disturbance)
     output_curvature = self.pid.update(error, feedforward=desired_curvature, speed=CS.vEgo)
     
     return float(output_curvature)
