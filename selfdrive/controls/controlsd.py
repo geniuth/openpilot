@@ -52,12 +52,9 @@ class Controls:
 
     self.steer_limited_by_controls = False
     self.curvature = 0.0
-    self.curvature_3dof = 0.0
     self.desired_curvature = 0.0
     self.roll = 0.0
 
-    self.enable_disturbance_correction = self.params.get_bool("EnableDisturbanceCorrection")
-    self.disturbance_controller = DisturbanceController(self.CP)
     self.enable_smooth_steer = self.params.get_bool("EnableSmoothSteer")
     self.smooth_steer = PT2Filter(46.0, 1.0, DT_CTRL)
 
@@ -85,7 +82,6 @@ class Controls:
     self.param_counter += 1
     if self.param_counter >= 100:
       self.param_counter = 0
-      self.enable_disturbance_correction = self.params.get_bool("EnableDisturbanceCorrection")
       self.enable_smooth_steer = self.params.get_bool("EnableSmoothSteer")
   
   def state_control(self):
@@ -99,10 +95,6 @@ class Controls:
 
     steer_angle_without_offset = math.radians(CS.steeringAngleDeg - lp.angleOffsetDeg)
     self.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, lp.roll)
-    if self.calibrated_pose is not None:
-      self.curvature_3dof = -self.VM.calc_curvature_3dof(self.calibrated_pose.acceleration.y, self.calibrated_pose.acceleration.x,
-                                                         self.calibrated_pose.angular_velocity.yaw, CS.vEgo, steer_angle_without_offset,
-                                                         lp.roll)
     self.roll = lp.roll
 
     # Update Torque Params
@@ -157,8 +149,6 @@ class Controls:
     new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
     if self.enable_smooth_steer:
       new_desired_curvature = self.smooth_steer.update(new_desired_curvature)
-    if self.enable_disturbance_correction:
-      new_desired_curvature = self.disturbance_controller.compensate(CS, self.VM, lp, self.calibrated_pose, new_desired_curvature, self.curvature_3dof)
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
     actuators.curvature = self.desired_curvature
@@ -186,8 +176,7 @@ class Controls:
     CS = self.sm['carState']
 
     CC.currentCurvature = self.curvature
-    CC.pitch = float(self.curvature_3dof) # debugging purposes
-    CC.roll = self.roll # for lateral iso limit calculation
+    CC.rollDEPRECATED = self.roll # for lateral iso limit calculation
 
     # Orientation and angle rates can be useful for carcontroller
     # Only calibrated (car) frame is relevant for the carcontroller
