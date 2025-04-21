@@ -72,7 +72,7 @@ def get_accel_from_plan(speeds, accels, action_t=DT_MDL, vEgoStopping=0.05):
     a_target = 0.0
   should_stop = (v_target < vEgoStopping and
                  v_target_1sec < vEgoStopping)
-  return a_target, should_stop
+  return a_target, should_stop, v_target
 
 
 class LongitudinalPlanner(LongitudinalPlannerSP):
@@ -90,6 +90,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.v_model_error = 0.0
     self.output_a_target = 0.0
     self.output_should_stop = False
+    self.output_v_target = 0.0
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
     self.a_desired_trajectory = np.zeros(CONTROL_N)
@@ -190,13 +191,14 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.a_desired + a_prev) / 2.0
 
     action_t =  self.CP.longitudinalActuatorDelay + DT_MDL
-    output_a_target, self.output_should_stop = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory,
-                                                                        action_t=action_t, vEgoStopping=self.CP.vEgoStopping)
+    output_a_target, self.output_should_stop, output_v_target = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory,
+                                                                                    action_t=action_t, vEgoStopping=self.CP.vEgoStopping)
 
     for idx in range(2):
       accel_clip[idx] = np.clip(accel_clip[idx], self.prev_accel_clip[idx] - 0.05, self.prev_accel_clip[idx] + 0.05)
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
     self.prev_accel_clip = accel_clip
+    self.output_v_target = output_v_target
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')
@@ -219,6 +221,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
 
     longitudinalPlan.aTarget = float(self.output_a_target)
     longitudinalPlan.shouldStop = bool(self.output_should_stop)
+    longitudinalPlan.vTarget = float(self.output_v_target)
     longitudinalPlan.allowBrake = True
     longitudinalPlan.allowThrottle = bool(self.allow_throttle)
 
