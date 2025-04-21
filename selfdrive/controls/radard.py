@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import math, time
+import math
 import numpy as np
 from collections import deque
 from typing import Any
@@ -18,12 +18,7 @@ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 
 
 # Default lead acceleration decay set to 50% at 1s
-_LEAD_ACCEL_TAU = 1.0
-TAU_GROW = 1.05
-TAU_SHRINK = 0.90
-TAU_MIN = 0.4
-BLEND_KF = 0.2
-BLEND_VREL_DERIV = 0.3
+_LEAD_ACCEL_TAU = 1.5
 
 # radar tracks
 SPEED, ACCEL = 0, 1     # Kalman filter states enum
@@ -61,7 +56,7 @@ class Track:
   def __init__(self, identifier: int, v_lead: float, kalman_params: KalmanParams):
     self.identifier = identifier
     self.cnt = 0
-    self.aLeadTau = _LEAD_ACCEL_TAU
+    self.aLeadTau = FirstOrderFilter(_LEAD_ACCEL_TAU, 0.45, DT_MDL)
     self.K_A = kalman_params.A
     self.K_C = kalman_params.C
     self.K_K = kalman_params.K
@@ -83,7 +78,10 @@ class Track:
     self.aLeadK = float(self.kf.x[ACCEL][0])
 
     # Learn if constant acceleration
-    self.aLeadTau = min(max(self.aLeadTau, 0.05) * TAU_GROW, _LEAD_ACCEL_TAU) if abs(self.aLeadK) < 0.5 else max(self.aLeadTau * TAU_SHRINK, TAU_MIN)
+    if abs(self.aLeadK) < 0.5:
+      self.aLeadTau.x = _LEAD_ACCEL_TAU
+    else:
+      self.aLeadTau.update(0.0)
 
     self.cnt += 1
 
@@ -95,7 +93,7 @@ class Track:
       "vLead": float(self.vLead),
       "vLeadK": float(self.vLeadK),
       "aLeadK": float(self.aLeadK),
-      "aLeadTau": float(self.aLeadTau),
+      "aLeadTau": float(self.aLeadTau.x),
       "status": True,
       "fcw": self.is_potential_fcw(model_prob),
       "modelProb": model_prob,
@@ -145,29 +143,14 @@ def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks
 
 
 def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: float, model_v_ego: float):
-  now = time.monotonic()
-  dt = now - getattr(get_RadarState_from_vision, "prev_ts", now)
-  get_RadarState_from_vision.prev_ts = now
-
-  d_rel = float(lead_msg.x[0] - RADAR_TO_CAMERA)
-  v_rel = float(lead_msg.v[0] - model_v_ego)
-
-  v_rel_deriv = (d_rel - getattr(get_RadarState_from_vision, "last_d", d_rel)) / dt if dt > 1e-3 else None
-  get_RadarState_from_vision.last_d = d_rel
-  v_rel_pred = (1.0 - BLEND_VREL_DERIV) * v_rel + BLEND_VREL_DERIV * v_rel_deriv if v_rel_deriv is not None else v_rel
-
-  prev_a = getattr(get_RadarState_from_vision, "prev_aLeadK", 0.0)
-  a_raw = lead_msg.a[0] if len(lead_msg.a) else 0.0
-  a_blend = (1.0 - BLEND_KF) * float(a_raw) + BLEND_KF * prev_a
-  get_RadarState_from_vision.prev_aLeadK = a_blend
-
+  lead_v_rel_pred = lead_msg.v[0] - model_v_ego
   return {
-    "dRel": d_rel,
+    "dRel": float(lead_msg.x[0] - RADAR_TO_CAMERA),
     "yRel": float(-lead_msg.y[0]),
-    "vRel": float(v_rel_pred),
-    "vLead": float(v_ego + v_rel_pred),
-    "vLeadK": float(v_ego + v_rel_pred),
-    "aLeadK": float(a_blend),
+    "vRel": float(lead_v_rel_pred),
+    "vLead": float(v_ego + lead_v_rel_pred),
+    "vLeadK": float(v_ego + lead_v_rel_pred),
+    "aLeadK": float(lead_msg.a[0]),
     "aLeadTau": 0.3,
     "fcw": False,
     "modelProb": float(lead_msg.prob),
@@ -179,24 +162,26 @@ def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: floa
 
 def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capnp._DynamicStructReader,
              model_v_ego: float, CP: structs.CarParams, CP_SP: structs.CarParamsSP, low_speed_override: bool = True) -> dict[str, Any]:
-  track = match_vision_to_track(v_ego, lead_msg, tracks) if len(tracks) > 0 and ready and lead_msg.prob > 0.5 else None
+  # Determine leads, this is where the essential logic happens
+  if len(tracks) > 0 and ready and lead_msg.prob > .5:
+    track = match_vision_to_track(v_ego, lead_msg, tracks)
+  else:
+    track = None
 
+  lead_dict = {'status': False}
   if track is not None:
     lead_dict = track.get_RadarState(lead_msg.prob)
     lead_dict = get_custom_yrel(CP, CP_SP, lead_dict, lead_msg)
-  elif ready and lead_msg.prob > 0.5:
+  elif (track is None) and ready and (lead_msg.prob > .5):
     lead_dict = get_RadarState_from_vision(lead_msg, v_ego, model_v_ego)
-  else:
-    lead_dict = {"status": False}
-
-  if track is not None and abs(track.dRel - (lead_msg.x[0] - RADAR_TO_CAMERA)) > 3.0:
-    lead_dict = get_custom_yrel(CP, CP_SP, track.get_RadarState(lead_msg.prob), lead_msg)
 
   if low_speed_override:
     low_speed_tracks = [c for c in tracks.values() if c.potential_low_speed_lead(v_ego)]
     if len(low_speed_tracks) > 0:
       closest_track = min(low_speed_tracks, key=lambda c: c.dRel)
-      if (not lead_dict["status"]) or (closest_track.dRel < lead_dict["dRel"]):
+
+      # Only choose new track if it is actually closer than the previous one
+      if (not lead_dict['status']) or (closest_track.dRel < lead_dict['dRel']):
         lead_dict = closest_track.get_RadarState()
 
   return lead_dict
