@@ -61,7 +61,7 @@ class DisturbanceController:
     reaction_delayed = self.reaction_hist[0]
     disturbance = self.highpass_filter(actual_curvature, reaction)
 
-    error = desired_curvature + (reaction_delayed + disturbance)
+    error = desired_curvature + disturbance
     output_curvature = self.pid.update(error, feedforward=desired_curvature, speed=CS.vEgo)
     
     return float(output_curvature)
