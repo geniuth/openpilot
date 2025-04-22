@@ -12,24 +12,24 @@ ALPHA_MAX = 0.4
 class DisturbanceController:
   def __init__(self, CP):
     self.lowpass_filtered_prev = 0.0
-    self.alpha_prev = ALPHA_MIN
+    self.alpha_prev = ALPHA_MAX
     self.pid = PIDController(1, 0, k_f=0, pos_limit=MAX_CURVATURE, neg_limit=-MAX_CURVATURE)
     self.length_des_curv_hist = int(round(CP.steerActuatorDelay / DT_CTRL)) + 1
     self.desired_curvature_hist = deque([0.0], maxlen=self.length_des_curv_hist)
 
   def reset(self):
     self.lowpass_filtered_prev = 0.0
-    self.alpha_prev = ALPHA_MIN
+    self.alpha_prev = ALPHA_MAX
     self.pid.reset()
     self.desired_curvature_hist.clear()
     self.desired_curvature_hist.append(0.0)
 
-  def compute_dynamic_alpha(self, desired_curvature_hist, dt=DT_CTRL, A=0.02, n=2.0, beta=3.0, k=2.0):
+  def compute_dynamic_alpha(self, desired_curvature_hist, alpha_prev, dt=DT_CTRL, A=0.02, n=2.0, beta=3.0, k=2.0):
     if len(desired_curvature_hist) < self.length_des_curv_hist:
       return ALPHA_MAX
     d_desired = abs(desired_curvature_hist[0] - desired_curvature_hist[1]) / dt
     alpha_reactive = d_desired**n / (k * A) if A > 0 else 0.0
-    alpha = np.clip(self.alpha_prev * np.exp(-beta * dt) + alpha_reactive, ALPHA_MIN, ALPHA_MAX)
+    alpha = np.clip(alpha_prev * np.exp(-beta * dt) + alpha_reactive, ALPHA_MIN, ALPHA_MAX)
     return alpha
 
   def lowpass_filter(self, current_value, lowpass_filtered_prev, alpha):
@@ -52,7 +52,7 @@ class DisturbanceController:
     actual_curvature = -VM.calc_curvature_3dof(calibrated_pose.acceleration.y, calibrated_pose.acceleration.x,
                                                calibrated_pose.angular_velocity.yaw, CS.vEgo, steering_angle_without_offset, 0.)
     
-    alpha = self.compute_dynamic_alpha(self.desired_curvature_hist)
+    alpha = self.compute_dynamic_alpha(self.desired_curvature_hist, self.alpha_prev)
     reaction = self.lowpass_filter(actual_curvature, self.lowpass_filtered_prev, alpha)
     disturbance = self.highpass_filter(actual_curvature, reaction)
 
