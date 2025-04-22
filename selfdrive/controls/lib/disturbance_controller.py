@@ -13,7 +13,7 @@ class DisturbanceController:
   def __init__(self, CP):
     self.lowpass_filtered_prev = 0.0
     self.alpha_prev = ALPHA_MAX
-    self.pid = PIDController(1, 0, k_f=0, pos_limit=MAX_CURVATURE, neg_limit=-MAX_CURVATURE)
+    self.pid = PIDController(1, 0, k_f=1, pos_limit=MAX_CURVATURE, neg_limit=-MAX_CURVATURE)
     self.length_des_curv_hist = int(round(CP.steerActuatorDelay / DT_CTRL)) + 1
     self.desired_curvature_hist = deque([0.0], maxlen=self.length_des_curv_hist)
 
@@ -56,7 +56,7 @@ class DisturbanceController:
     reaction = self.lowpass_filter(actual_curvature, self.lowpass_filtered_prev, alpha)
     disturbance = self.highpass_filter(actual_curvature, reaction)
 
-    error = 0 #disturbance
+    error = disturbance
     output_curvature = self.pid.update(error, feedforward=desired_curvature, speed=CS.vEgo)
 
     self.desired_curvature_hist.append(desired_curvature)
