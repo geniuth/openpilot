@@ -36,10 +36,10 @@ class DisturbanceController:
     alpha = min(alpha, ALPHA_MAX)
     if alpha >= ALPHA_MAX * 0.9:
       reset_factor = (alpha - ALPHA_MIN) / (ALPHA_MAX - ALPHA_MIN)
-      lowpass_filtered_prev = (1 - reset_factor) * lowpass_filtered_prev + reset_factor * current_value
+      lowpass_filtered = (1 - reset_factor) * lowpass_filtered_prev + reset_factor * current_value
     else:
-      lowpass_filtered_prev = (1 - alpha) * lowpass_filtered_prev + alpha * current_value
-    return lowpass_filtered_prev
+      lowpass_filtered = (1 - alpha) * lowpass_filtered_prev + alpha * current_value
+    return lowpass_filtered
 
   def highpass_filter(self, current_value, lowpass_value):
     return current_value - lowpass_value
