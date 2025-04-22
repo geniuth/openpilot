@@ -36,6 +36,7 @@ inline static std::unordered_map<std::string, uint32_t> keys = {
     {"DoReboot", CLEAR_ON_MANAGER_START},
     {"DoShutdown", CLEAR_ON_MANAGER_START},
     {"DoUninstall", CLEAR_ON_MANAGER_START},
+    {"EnableDisturbanceCorrection", PERSISTENT},
     {"EnableScreenEvent", CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION},
     {"EnableSmoothSteer", PERSISTENT},
     {"ExperimentalLongitudinalEnabled", PERSISTENT | DEVELOPMENT_ONLY | BACKUP},
