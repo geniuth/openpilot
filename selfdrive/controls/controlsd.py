@@ -135,7 +135,6 @@ class Controls:
     if not CC.latActive:
       self.LaC.reset()
       self.smooth_steer.reset()
-      
     if not CC.longActive:
       self.LoC.reset()
 
