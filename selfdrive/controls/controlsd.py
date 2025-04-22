@@ -19,7 +19,6 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_T_FOLLOW
-from selfdrive.controls.lib.disturbance_controller import DisturbanceController
 from openpilot.common.pt2 import PT2Filter
 from openpilot.common.realtime import DT_CTRL
 
@@ -55,8 +54,6 @@ class Controls:
     self.desired_curvature = 0.0
     self.roll = 0.0
 
-    self.enable_disturbance_correction = self.params.get_bool("EnableDisturbanceCorrection")
-    self.disturbance_controller = DisturbanceController(self.CP)
     self.enable_smooth_steer = self.params.get_bool("EnableSmoothSteer")
     self.smooth_steer = PT2Filter(46.0, 1.0, DT_CTRL)
 
@@ -84,7 +81,6 @@ class Controls:
     self.param_counter += 1
     if self.param_counter >= 100:
       self.param_counter = 0
-      self.enable_disturbance_correction = self.params.get_bool("EnableDisturbanceCorrection")
       self.enable_smooth_steer = self.params.get_bool("EnableSmoothSteer")
   
   def state_control(self):
@@ -138,7 +134,6 @@ class Controls:
 
     if not CC.latActive:
       self.LaC.reset()
-      self.disturbance_controller.reset()
       self.smooth_steer.reset()
     if not CC.longActive:
       self.LoC.reset()
@@ -153,8 +148,6 @@ class Controls:
     new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
     if self.enable_smooth_steer:
       new_desired_curvature = self.smooth_steer.update(new_desired_curvature)
-    if self.enable_disturbance_correction:
-      new_desired_curvature = self.disturbance_controller.compensate(CS, self.VM, lp, self.calibrated_pose, new_desired_curvature)
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
     actuators.curvature = self.desired_curvature
