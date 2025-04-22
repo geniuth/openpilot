@@ -19,6 +19,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_T_FOLLOW
+from selfdrive.controls.lib.disturbance_controller import DisturbanceController
 from openpilot.common.pt2 import PT2Filter
 from openpilot.common.realtime import DT_CTRL
 
@@ -134,6 +135,7 @@ class Controls:
 
     if not CC.latActive:
       self.LaC.reset()
+      self.disturbance_controller.reset()
       self.smooth_steer.reset()
     if not CC.longActive:
       self.LoC.reset()
