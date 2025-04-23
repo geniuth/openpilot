@@ -22,6 +22,16 @@ void HudRenderer::updateState(const UIState &s) {
 
   const auto &controls_state = sm["controlsState"].getControlsState();
   const auto &car_state = sm["carState"].getCarState();
+  const auto &battery_data = car_state.getBatteryDetails();
+
+  battery_details.capacity = battery_data.getCapacity();
+  battery_details.charge = battery_data.getCharge();
+  battery_details.soc = battery_data.getSoc();
+  battery_details.temperature = battery_data.getTemperature();
+  battery_details.heaterActive = battery_data.getHeaterActive();
+  battery_details.voltage = battery_data.getVoltage();
+  battery_details.current = battery_data.getCurrent();
+  battery_details.power = battery_data.getPower();
 
   // Handle older routes where vCruiseCluster is not set
   set_speed = car_state.getVCruiseCluster() == 0.0 ? controls_state.getVCruiseDEPRECATED() : car_state.getVCruiseCluster();
@@ -52,6 +62,12 @@ void HudRenderer::draw(QPainter &p, const QRect &surface_rect) {
     drawSetSpeed(p, surface_rect);
   }
   drawCurrentSpeed(p, surface_rect);
+
+  auto params = Params();
+  bool display_battery_details = params.getBool("BatteryDetails");
+  if (display_battery_details) {
+    drawBatteryDetailsPanel(p, surface_rect);
+  }
 
   p.restore();
 }
@@ -109,4 +125,66 @@ void HudRenderer::drawText(QPainter &p, int x, int y, const QString &text, int a
 
   p.setPen(QColor(0xff, 0xff, 0xff, alpha));
   p.drawText(real_rect.x(), real_rect.bottom(), text);
+}
+
+void HudRenderer::drawBatteryDetailsPanel(QPainter &p, const QRect &surface_rect) {
+  const float scale_factor = 1.1;       // Skalierung um 20 % kleiner gemacht
+  const int panel_width = surface_rect.width() * 0.7;  // 70 % der Breite von rechts aus
+  const int panel_margin = 30;          // Abstand vom rechten Rand
+  const int line_height = 48;           // Zeilenhöhe
+  const int text_margin = 25;           // Abstand zwischen Bezeichner und Wert
+  const int column_spacing = panel_width / 2 - 20;  // Abstand zwischen den Spalten
+  const int label_width = 265;          // Breite für Labels
+  const int value_width = column_spacing - label_width - text_margin; // Breite für Werte
+
+  // Panel position (unterer Rand)
+  int x_start = surface_rect.width() - panel_width - panel_margin; // Verschiebung nach links
+  int y_start = surface_rect.height() - panel_margin - static_cast<int>(line_height * 4 * scale_factor); // 4 Zeilen hoch
+
+  // Hintergrund zeichnen (für das gesamte Panel)
+  QRect panel_rect(x_start, y_start, panel_width, static_cast<int>(line_height * 4 * scale_factor));
+  p.save();
+  p.setBrush(QColor(0, 0, 0, 128)); // Schwarzer Hintergrund mit 50% Transparenz
+  p.setPen(Qt::NoPen);
+  p.drawRoundedRect(panel_rect, 10, 10);
+  p.restore();
+
+  // Text styling
+  p.setPen(Qt::white);
+  p.setFont(InterFont(40, QFont::Normal));
+
+  // Labels und Werte
+  QStringList labels = {
+    "Capacity:", "Charge:", "SoC:", "Temperature:",
+    "Heater Active:", "Voltage:", "Current:", "Power:"
+  };
+
+  QStringList values = {
+    QString::number(battery_details.capacity, 'f', 2) + " Wh",
+    QString::number(battery_details.charge, 'f', 2) + " Wh",
+    QString::number(battery_details.soc, 'f', 2) + " %",
+    QString::number(battery_details.temperature, 'f', 2) + " °C",
+    battery_details.heaterActive ? "True" : "False",
+    QString::number(battery_details.voltage, 'f', 2) + " V",
+    QString::number(battery_details.current, 'f', 2) + " A",
+    QString::number(battery_details.power, 'f', 2) + " kW",
+  };
+
+  // Zeichne die Werte in zwei Spalten
+  for (int i = 0; i < labels.size(); ++i) {
+    int column = i / 4; // Spalte: 0 für links, 1 für rechts
+    int row = i % 4;    // Zeile innerhalb der Spalte
+
+    // Position für die aktuelle Spalte und Zeile berechnen
+    int text_x = x_start + column * column_spacing;
+    int text_y = y_start + static_cast<int>(row * line_height * scale_factor);
+
+    // Label zeichnen (links)
+    QRect label_rect(text_x, text_y, label_width, static_cast<int>(line_height * scale_factor));
+    p.drawText(label_rect, Qt::AlignLeft | Qt::AlignVCenter, labels[i]);
+
+    // Wert zeichnen (links neben dem Label)
+    QRect value_rect(text_x + label_width + text_margin, text_y, value_width, static_cast<int>(line_height * scale_factor));
+    p.drawText(value_rect, Qt::AlignLeft | Qt::AlignVCenter, values[i]);
+  }
 }
