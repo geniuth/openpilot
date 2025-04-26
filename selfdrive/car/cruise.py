@@ -72,7 +72,7 @@ class VCruiseHelper:
 
     speed_limit = CS.cruiseState.speedLimit * CV.MS_TO_KPH
     if speed_limit != self.v_speed_limit_kph:
-      if speed_limit != 0
+      if speed_limit != 0:
         self.v_cruise_kph = speed_limit
         self.v_cruise_kph = np.clip(round(self.v_cruise_kph, 1), V_CRUISE_MIN, V_CRUISE_MAX)
       self.v_speed_limit_kph = speed_limit 
