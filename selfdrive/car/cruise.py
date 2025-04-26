@@ -42,13 +42,14 @@ class VCruiseHelper:
   def v_cruise_initialized(self):
     return self.v_cruise_kph != V_CRUISE_UNSET
 
-  def update_v_cruise(self, CS, enabled, is_metric):
+  def update_v_cruise(self, CS, enabled, is_metric, speed_limit_control=False):
     self.v_cruise_kph_last = self.v_cruise_kph
 
     if CS.cruiseState.available:
       if not self.CP.pcmCruise:
         # if stock cruise is completely disabled, then we can use our own set speed logic
-        self._update_v_speed_limit(CS, enabled)
+        
+        self._update_v_speed_limit(CS, enabled, speed_limit_control)
         self._update_v_cruise_non_pcm(CS, enabled, is_metric)
         self.v_cruise_cluster_kph = self.v_cruise_kph
         self.update_button_timers(CS, enabled)
@@ -65,12 +66,13 @@ class VCruiseHelper:
       self.v_cruise_kph = V_CRUISE_UNSET
       self.v_cruise_cluster_kph = V_CRUISE_UNSET
 
-  def _update_v_speed_limit(self, CS, enabled):
-    if not enabled:
+  def _update_v_speed_limit(self, CS, enabled, speed_limit_control):
+    if not enabled or not speed_limit_control:
       return
 
     speed_limit = CS.cruiseState.speedLimit * CV.MS_TO_KPH
     if speed_limit != self.v_speed_limit_kph and speed_limit != 0:
+      self.v_speed_limit_kph = speed_limit 
       self.v_cruise_kph = speed_limit
       self.v_cruise_kph = np.clip(round(self.v_cruise_kph, 1), V_CRUISE_MIN, V_CRUISE_MAX)
 
