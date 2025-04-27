@@ -67,7 +67,7 @@ class VCruiseHelper:
       self.v_cruise_cluster_kph = V_CRUISE_UNSET
 
   def _update_v_speed_limit(self, CS, enabled, speed_limit_control):
-    if not enabled or not speed_limit_control:
+    if not speed_limit_control: # or not enabled # always set speed limit
       return
 
     speed_limit = CS.cruiseState.speedLimit * CV.MS_TO_KPH
