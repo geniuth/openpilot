@@ -176,7 +176,6 @@ class Controls:
   def publish(self, CC, CC_SP, lac_log):
     CS = self.sm['carState']
 
-    CC.currentCurvature = self.curvature
     CC.rollDEPRECATED = self.roll # for lateral iso limit calculation
 
     # Orientation and angle rates can be useful for carcontroller
