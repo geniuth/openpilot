@@ -14,11 +14,11 @@
 #include "selfdrive/ui/sunnypilot/qt/offroad/settings/settings.h"
 #include "selfdrive/ui/sunnypilot/qt/widgets/controls.h"
 
-class HyundaiSettings : public BrandSettingsInterface {
+class NissanSettings : public BrandSettingsInterface {
   Q_OBJECT
 
 public:
-  explicit HyundaiSettings(QWidget *parent = nullptr);
+  explicit NissanSettings(QWidget *parent = nullptr);
   void updatePanel(bool _offroad);
   void updateSettings();
 
