@@ -50,6 +50,12 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
       "../assets/img_chffr_wheel.png",
     },
     {
+      "EnableSpeedLimitPredicative",
+      tr("Enable Predicative Speed Limit"),
+      tr("Enables setting predicative speed limit<br>"),
+      "../assets/icons/speed_limit.png",
+    },
+    {
       "EnableSmoothSteer",
       tr("Enable Steer Smoothing"),
       tr("Enables S-curving on lateral control for smoother steering<br>"),
