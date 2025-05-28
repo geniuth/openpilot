@@ -58,6 +58,7 @@ class Controls(ControlsExt):
     self.roll = 0.0
 
     self.enable_speed_limit_control = self.params.get_bool("EnableSpeedLimitControl")
+    self.enable_speed_limit_predicative = self.params.get_bool("EnableSpeedLimitPredicative")
     self.enable_smooth_steer = self.params.get_bool("EnableSmoothSteer")
     self.smooth_steer = PT2Filter(46.0, 1.0, DT_CTRL)
 
@@ -87,6 +88,7 @@ class Controls(ControlsExt):
       self.param_counter = 0
       self.enable_smooth_steer = self.params.get_bool("EnableSmoothSteer")
       self.enable_speed_limit_control = self.params.get_bool("EnableSpeedLimitControl")
+      self.enable_speed_limit_predicative = self.params.get_bool("EnableSpeedLimitPredicative")
   
   def state_control(self):
     CS = self.sm['carState']
@@ -185,6 +187,7 @@ class Controls(ControlsExt):
     CC.cruiseControl.override = CC.enabled and not CC.longActive and self.CP.openpilotLongitudinalControl
     CC.cruiseControl.cancel = CS.cruiseState.enabled and (not CC.enabled or not self.CP.pcmCruise)
     CC.cruiseControl.speedLimit = self.enable_speed_limit_control
+    CC.cruiseControl.speedLimitPredicative = self.enable_speed_limit_predicative
 
     speeds = self.sm['longitudinalPlan'].speeds
     if len(speeds):
