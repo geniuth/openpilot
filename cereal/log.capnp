@@ -2285,6 +2285,11 @@ struct LiveTorqueParametersData {
   useParams @12 :Bool;
 }
 
+struct LiveCurvatureParametersData {
+  factors @1 :List(List(Float32));
+  version @0 :Int32;
+}
+
 struct LiveDelayData {
   lateralDelay @0 :Float32;
   validBlocks @1 :Int32;
@@ -2531,6 +2536,7 @@ struct Event {
     gnssMeasurements @91 :GnssMeasurements;
     liveParameters @61 :LiveParametersData;
     liveTorqueParameters @94 :LiveTorqueParametersData;
+    liveCurvatureParameters @146 :LiveCurvatureParametersData;
     liveDelay @146 : LiveDelayData;
     cameraOdometry @63 :CameraOdometry;
     thumbnail @66: Thumbnail;
