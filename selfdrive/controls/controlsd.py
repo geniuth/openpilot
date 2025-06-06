@@ -18,6 +18,7 @@ from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
+from openpilot.selfdrive.controls.lib.latcontrol_curvature import LatControlCurvature
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_T_FOLLOW
@@ -70,6 +71,8 @@ class Controls(ControlsExt):
     self.LaC: LatControl
     if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
       self.LaC = LatControlAngle(self.CP, self.CP_SP, self.CI)
+    elif self.CP.steerControlType == car.CarParams.SteerControlType.curvatureDEPRECATED:
+      self.LaC = LatControlCurvature(self.CP, self.CP_SP, self.CI)
     elif self.CP.lateralTuning.which() == 'pid':
       self.LaC = LatControlPID(self.CP, self.CP_SP, self.CI)
     elif self.CP.lateralTuning.which() == 'torque':
@@ -154,10 +157,10 @@ class Controls(ControlsExt):
       new_desired_curvature = self.smooth_steer.update(new_desired_curvature)
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
-    actuators.curvature = self.desired_curvature
-    steer, steeringAngleDeg, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
-                                                       self.steer_limited_by_controls, self.desired_curvature,
-                                                       self.calibrated_pose, curvature_limited)  # TODO what if not available
+    steer, steeringAngleDeg, curvature, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
+                                                                  self.steer_limited_by_controls, self.desired_curvature,
+                                                                  self.calibrated_pose, curvature_limited)  # TODO what if not available
+    actuators.curvature = float(curvature)
     actuators.torque = float(steer)
     actuators.steeringAngleDeg = float(steeringAngleDeg)
     # Ensure no NaNs/Infs
@@ -214,6 +217,8 @@ class Controls(ControlsExt):
       if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
         self.steer_limited_by_controls = abs(CC.actuators.steeringAngleDeg - CO.actuatorsOutput.steeringAngleDeg) > \
                                               STEER_ANGLE_SATURATION_THRESHOLD
+      elif self.CP.steerControlType == car.CarParams.SteerControlType.curvatureDEPRECATED:
+        self.steer_limited_by_controls = abs(CC.actuators.curvature - CO.actuatorsOutput.curvature) > 1e-5
       else:
         self.steer_limited_by_controls = abs(CC.actuators.torque - CO.actuatorsOutput.torque) > 1e-2
 
