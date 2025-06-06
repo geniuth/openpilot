@@ -20,12 +20,11 @@ class LatControlCurvature(LatControl):
       pid_log.active = False
     else:
       actual_curvature_vm = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
-      roll_compensation = -VM.roll_compensation(params.roll, CS.vEgo)
-
       assert calibrated_pose is not None
       actual_curvature_pose = calibrated_pose.angular_velocity.yaw / CS.vEgo
       actual_curvature = np.interp(CS.vEgo, [2.0, 5.0], [actual_curvature_vm, actual_curvature_pose])
-      
+
+      roll_compensation = -VM.roll_compensation(params.roll, CS.vEgo)
       gravitiy_adjusted_curvature = desired_curvature - roll_compensation
       
       pid_log.error = float(gravitiy_adjusted_curvature - actual_curvature)
