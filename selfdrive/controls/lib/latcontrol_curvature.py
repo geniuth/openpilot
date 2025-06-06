@@ -25,11 +25,13 @@ class LatControlCurvature(LatControl):
       assert calibrated_pose is not None
       actual_curvature_pose = calibrated_pose.angular_velocity.yaw / CS.vEgo
       actual_curvature = np.interp(CS.vEgo, [2.0, 5.0], [actual_curvature_vm, actual_curvature_pose])
-
-      pid_log.error = float(desired_curvature - (actual_curvature + roll_compensation))
-
+      
+      gravitiy_adjusted_curvature = desired_curvature - roll_compensation
+      
+      pid_log.error = float(gravitiy_adjusted_curvature - actual_curvature)
       freeze_integrator = steer_limited_by_controls or CS.steeringPressed or CS.vEgo < 5
-      output_curvature = self.pid.update(pid_log.error, feedforward=desired_curvature, speed=CS.vEgo, freeze_integrator=freeze_integrator)
+      
+      output_curvature = self.pid.update(pid_log.error, feedforward=gravitiy_adjusted_curvature, speed=CS.vEgo, freeze_integrator=freeze_integrator)
 
       pid_log.active = True
       pid_log.p = float(self.pid.p)
