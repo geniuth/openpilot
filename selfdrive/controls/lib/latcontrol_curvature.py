@@ -25,12 +25,12 @@ class LatControlCurvature(LatControl):
       actual_curvature = np.interp(CS.vEgo, [2.0, 5.0], [actual_curvature_vm, actual_curvature_pose])
 
       roll_compensation = -VM.roll_compensation(params.roll, CS.vEgo)
-      gravitiy_adjusted_curvature = desired_curvature - roll_compensation
+      gravity_adjusted_curvature = desired_curvature - roll_compensation
       
-      pid_log.error = float(gravitiy_adjusted_curvature - actual_curvature)
+      pid_log.error = float(gravity_adjusted_curvature - actual_curvature)
       freeze_integrator = steer_limited_by_controls or CS.steeringPressed or CS.vEgo < 5
       
-      output_curvature = self.pid.update(pid_log.error, feedforward=gravitiy_adjusted_curvature, speed=CS.vEgo, freeze_integrator=freeze_integrator)
+      output_curvature = self.pid.update(pid_log.error, feedforward=gravity_adjusted_curvature, speed=CS.vEgo, freeze_integrator=freeze_integrator)
 
       pid_log.active = True
       pid_log.p = float(self.pid.p)
@@ -38,7 +38,7 @@ class LatControlCurvature(LatControl):
       pid_log.f = float(self.pid.f)
       pid_log.output = float(output_curvature)
       pid_log.actualCurvature = float(actual_curvature)
-      pid_log.desiredCurvature = float(desired_curvature)
+      pid_log.desiredCurvature = float(gravity_adjusted_curvature)
       pid_log.saturated = bool(self._check_saturation(self.curvature_max - abs(output_curvature) < 1e-5, CS, steer_limited_by_controls, curvature_limited))
 
     return 0.0, 0.0, output_curvature, pid_log
