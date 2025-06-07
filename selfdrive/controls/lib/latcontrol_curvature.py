@@ -7,8 +7,8 @@ from openpilot.common.pid import PIDController
 
 
 class LatControlCurvature(LatControl):
-  def __init__(self, CP, CI):
-    super().__init__(CP, CI)
+  def __init__(self, CP, CP_SP, CI):
+    super().__init__(CP, CP_SP, CI)
     self.pid = PIDController((CP.lateralTuning.pid.kpBP, CP.lateralTuning.pid.kpV),
                              (CP.lateralTuning.pid.kiBP, CP.lateralTuning.pid.kiV),
                              k_f=CP.lateralTuning.pid.kf, pos_limit=self.curvature_max, neg_limit=-self.curvature_max)
@@ -20,16 +20,17 @@ class LatControlCurvature(LatControl):
       pid_log.active = False
     else:
       actual_curvature_vm = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
-      roll_compensation = -VM.roll_compensation(params.roll, CS.vEgo)
-
       assert calibrated_pose is not None
       actual_curvature_pose = calibrated_pose.angular_velocity.yaw / CS.vEgo
       actual_curvature = np.interp(CS.vEgo, [2.0, 5.0], [actual_curvature_vm, actual_curvature_pose])
 
-      pid_log.error = float(desired_curvature - (actual_curvature + roll_compensation))
-
+      roll_compensation = -VM.roll_compensation(params.roll, CS.vEgo)
+      gravity_adjusted_curvature = desired_curvature - roll_compensation
+      
+      pid_log.error = float(desired_curvature - actual_curvature)
       freeze_integrator = steer_limited_by_controls or CS.steeringPressed or CS.vEgo < 5
-      output_curvature = self.pid.update(pid_log.error, feedforward=desired_curvature, speed=CS.vEgo, freeze_integrator=freeze_integrator)
+      
+      output_curvature = self.pid.update(pid_log.error, feedforward=gravity_adjusted_curvature, speed=CS.vEgo, freeze_integrator=freeze_integrator)
 
       pid_log.active = True
       pid_log.p = float(self.pid.p)
