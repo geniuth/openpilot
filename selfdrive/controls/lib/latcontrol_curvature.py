@@ -5,6 +5,8 @@ from cereal import log
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.common.pid import PIDController
 
+CURVATURE_SATURATION_THRESHOLD = 0.005
+
 
 class LatControlCurvature(LatControl):
   def __init__(self, CP, CP_SP, CI):
@@ -39,6 +41,6 @@ class LatControlCurvature(LatControl):
       pid_log.output = float(output_curvature)
       pid_log.actualCurvature = float(actual_curvature)
       pid_log.desiredCurvature = float(desired_curvature)
-      pid_log.saturated = bool(self._check_saturation(self.curvature_max - abs(output_curvature) < 1e-5, CS, steer_limited_by_controls, curvature_limited))
+      pid_log.saturated = bool(self._check_saturation(self.curvature_max - abs(output_curvature) < CURVATURE_SATURATION_THRESHOLD, CS, steer_limited_by_controls, curvature_limited))
 
     return 0.0, 0.0, output_curvature, pid_log
