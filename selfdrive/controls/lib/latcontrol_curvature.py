@@ -5,7 +5,7 @@ from cereal import log
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.common.pid import PIDController
 
-CURVATURE_SATURATION_THRESHOLD = 0.005
+CURVATURE_SATURATION_THRESHOLD = 0.4e-5 # rad/m
 
 
 class LatControlCurvature(LatControl):
