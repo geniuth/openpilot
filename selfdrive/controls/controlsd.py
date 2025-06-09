@@ -58,6 +58,7 @@ class Controls(ControlsExt):
     self.desired_curvature = 0.0
     self.roll = 0.0
 
+    self.enable_curvature_controller = self.params.get_bool("EnableCurvatureController")
     self.enable_speed_limit_control = self.params.get_bool("EnableSpeedLimitControl")
     self.enable_speed_limit_predicative = self.params.get_bool("EnableSpeedLimitPredicative")
     self.enable_smooth_steer = self.params.get_bool("EnableSmoothSteer")
@@ -89,6 +90,7 @@ class Controls(ControlsExt):
     self.param_counter += 1
     if self.param_counter >= 100:
       self.param_counter = 0
+      self.enable_curvature_controller = self.params.get_bool("EnableCurvatureController")
       self.enable_smooth_steer = self.params.get_bool("EnableSmoothSteer")
       self.enable_speed_limit_control = self.params.get_bool("EnableSpeedLimitControl")
       self.enable_speed_limit_predicative = self.params.get_bool("EnableSpeedLimitPredicative")
@@ -160,7 +162,7 @@ class Controls(ControlsExt):
     steer, steeringAngleDeg, curvature, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
                                                                   self.steer_limited_by_controls, self.desired_curvature,
                                                                   self.calibrated_pose, curvature_limited)  # TODO what if not available
-    actuators.curvature = float(curvature)
+    actuators.curvature = float(curvature) if self.enable_curvature_controller else self.desired_curvature
     actuators.torque = float(steer)
     actuators.steeringAngleDeg = float(steeringAngleDeg)
     # Ensure no NaNs/Infs
