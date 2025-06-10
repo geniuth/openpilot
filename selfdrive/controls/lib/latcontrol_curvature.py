@@ -20,6 +20,7 @@ class LatControlCurvature(LatControl):
     if not active:
       output_curvature = 0.0
       pid_log.active = False
+      self.pid.reset()
     else:
       actual_curvature_vm = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
       assert calibrated_pose is not None
