@@ -36,8 +36,6 @@ class LatControlCurvature(LatControl):
       
       pid_log.error = float(desired_curvature - actual_curvature)
       freeze_integrator = steer_limited_by_controls or CS.steeringPressed or CS.vEgo < 5
-      if CS.steeringPressed:
-        self.pid.i *= 0.8 # soft decay
       
       output_curvature = self.pid.update(pid_log.error, feedforward=gravity_adjusted_curvature, speed=CS.vEgo, freeze_integrator=freeze_integrator)
 
