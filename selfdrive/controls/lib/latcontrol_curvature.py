@@ -15,6 +15,10 @@ class LatControlCurvature(LatControl):
                              (CP.lateralTuning.pid.kiBP, CP.lateralTuning.pid.kiV),
                              k_f=CP.lateralTuning.pid.kf, pos_limit=self.curvature_max, neg_limit=-self.curvature_max)
 
+  def reset(self):
+    super().reset()
+    self.pid.reset()
+  
   def update(self, active, CS, VM, params, steer_limited_by_controls, desired_curvature, calibrated_pose, curvature_limited):
     pid_log = log.ControlsState.LateralCurvatureState.new_message()
     if not active:
