@@ -47,6 +47,12 @@ def get_speed_error(modelV2: log.ModelDataV2, v_ego: float) -> float:
     return float(vel_err)
   return 0.0
 
+def get_speed_from_plan(speeds, t_idxs, action_t=DT_MDL):
+  if len(speeds) == len(t_idxs):
+    v_target = np.interp(action_t, t_idxs, speeds)
+  else:
+    v_target = 0.0
+  return v_target
 
 def get_accel_from_plan(speeds, accels, t_idxs, action_t=DT_MDL, vEgoStopping=0.05):
   if len(speeds) == len(t_idxs):
@@ -61,7 +67,7 @@ def get_accel_from_plan(speeds, accels, t_idxs, action_t=DT_MDL, vEgoStopping=0.
     a_target = 0.0
   should_stop = (v_target < vEgoStopping and
                  v_target_1sec < vEgoStopping)
-  return a_target, should_stop, v_target
+  return a_target, should_stop
 
 def curv_from_psis(psi_target, psi_rate, vego, action_t):
   vego = np.clip(vego, MIN_SPEED, np.inf)
