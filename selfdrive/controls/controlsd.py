@@ -181,6 +181,7 @@ class Controls(ControlsExt):
   def publish(self, CC, lac_log):
     CS = self.sm['carState']
 
+    CC.curvatureControllerActive = self.enable_curvature_controller # for car controller curvature correction activation
     CC.rollDEPRECATED = self.roll # for lateral iso limit calculation
 
     # Orientation and angle rates can be useful for carcontroller
