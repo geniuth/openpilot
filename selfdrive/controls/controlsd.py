@@ -55,6 +55,7 @@ class Controls(ControlsExt):
 
     self.steer_limited_by_controls = False
     self.curvature = 0.0
+    self.curvature_no_roll = 0.0
     self.desired_curvature = 0.0
     self.roll = 0.0
 
@@ -106,6 +107,7 @@ class Controls(ControlsExt):
 
     steer_angle_without_offset = math.radians(CS.steeringAngleDeg - lp.angleOffsetDeg)
     self.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, lp.roll)
+    self.curvature_no_roll = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, 0.0)
     self.roll = lp.roll
 
     # Update Torque Params
@@ -182,6 +184,7 @@ class Controls(ControlsExt):
     CS = self.sm['carState']
 
     CC.curvatureControllerActive = self.enable_curvature_controller # for car controller curvature correction activation
+    CC.currentCurvatureNoRoll = self.curvature_no_roll
     CC.rollDEPRECATED = self.roll # for lateral iso limit calculation
 
     # Orientation and angle rates can be useful for carcontroller
