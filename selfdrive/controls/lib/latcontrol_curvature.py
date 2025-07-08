@@ -31,7 +31,7 @@ class LatControlCurvature(LatControl):
       actual_curvature_pose = calibrated_pose.angular_velocity.yaw / CS.vEgo
       actual_curvature = np.interp(CS.vEgo, [2.0, 5.0], [actual_curvature_vm, actual_curvature_pose])
 
-      roll_compensation = -VM.roll_compensation(params.roll, CS.vEgo)
+      roll_compensation = VM.roll_compensation(params.roll, CS.vEgo)
       gravity_adjusted_curvature = desired_curvature - roll_compensation
       
       pid_log.error = float(desired_curvature - actual_curvature)
