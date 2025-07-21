@@ -14,6 +14,7 @@ class LatControlCurvature(LatControl):
     self.pid = PIDController((CP.lateralTuning.pid.kpBP, CP.lateralTuning.pid.kpV),
                              (CP.lateralTuning.pid.kiBP, CP.lateralTuning.pid.kiV),
                              k_f=CP.lateralTuning.pid.kf, pos_limit=self.curvature_max, neg_limit=-self.curvature_max)
+    self.useCarCurvature = CP.lateralTuning.pid.carCurvatureCorrection
 
   def reset(self):
     super().reset()
@@ -25,19 +26,23 @@ class LatControlCurvature(LatControl):
       output_curvature = 0.0
       pid_log.active = False
       self.pid.reset()
-    else:
+    else:      
       actual_curvature_vm = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
       assert calibrated_pose is not None
       actual_curvature_pose = calibrated_pose.angular_velocity.yaw / CS.vEgo
       actual_curvature = np.interp(CS.vEgo, [2.0, 5.0], [actual_curvature_vm, actual_curvature_pose])
+
+      curvature_correction = CS.curvature - actual_curvature if self.useCarCurvature else 0.
+      roll_compensation = -VM.roll_compensation(params.roll, CS.vEgo)
+      correction = curvature_correction - roll_compensation
+
+      desired_curvature_corr = desired_curvature + correction
+      actual_curvature_corr = actual_curvature + correction
       
-      pid_log.error = float(desired_curvature - actual_curvature)
+      pid_log.error = float(desired_curvature_corr - actual_curvature_corr)
       freeze_integrator = steer_limited_by_controls or CS.steeringPressed or CS.vEgo < 5
       
-      corrected_curvature = self.pid.update(pid_log.error, feedforward=desired_curvature, speed=CS.vEgo, freeze_integrator=freeze_integrator)
-
-      roll_compensation = -VM.roll_compensation(params.roll, CS.vEgo)
-      output_curvature = corrected_curvature - roll_compensation
+      output_curvature = self.pid.update(pid_log.error, feedforward=desired_curvature_corr, speed=CS.vEgo, freeze_integrator=freeze_integrator)
 
       pid_log.active = True
       pid_log.p = float(self.pid.p)
