@@ -32,7 +32,7 @@ class LatControlCurvature(LatControl):
       actual_curvature_pose = calibrated_pose.angular_velocity.yaw / CS.vEgo
       actual_curvature = np.interp(CS.vEgo, [2.0, 5.0], [actual_curvature_vm, actual_curvature_pose])
 
-      curvature_car_correction = CS.curvature - desired_curvature if self.useCarCurvature else 0.
+      curvature_car_correction = CS.curvature - actual_curvature if self.useCarCurvature else 0.
       roll_compensation = -VM.roll_compensation(params.roll, CS.vEgo)
       desired_curvature_corr = desired_curvature + curvature_car_correction - roll_compensation
       
