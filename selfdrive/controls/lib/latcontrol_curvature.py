@@ -3,7 +3,7 @@ import numpy as np
 
 from cereal import log
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
-from openpilot.common.pid import PIDController
+from openpilot.common.pid_mu import MultiplicativeUnwindPID
 
 CURVATURE_SATURATION_THRESHOLD = 5e-4 # rad/m
 
@@ -12,9 +12,9 @@ class LatControlCurvature(LatControl):
   def __init__(self, CP, CP_SP, CI):
     super().__init__(CP, CP_SP, CI)
     self.useCarCurvature = CP.lateralTuning.pid.carCurvatureCorrection
-    self.pid = PIDController((CP.lateralTuning.pid.kpBP, CP.lateralTuning.pid.kpV),
-                             (CP.lateralTuning.pid.kiBP, CP.lateralTuning.pid.kiV),
-                             k_f=CP.lateralTuning.pid.kf, pos_limit=self.curvature_max, neg_limit=-self.curvature_max)
+    self.pid = MultiplicativeUnwindPID((CP.lateralTuning.pid.kpBP, CP.lateralTuning.pid.kpV),
+                                       (CP.lateralTuning.pid.kiBP, CP.lateralTuning.pid.kiV),
+                                       k_f=CP.lateralTuning.pid.kf, pos_limit=self.curvature_max, neg_limit=-self.curvature_max)
 
   def reset(self):
     super().reset()
@@ -40,7 +40,7 @@ class LatControlCurvature(LatControl):
       freeze_integrator = steer_limited_by_controls or CS.vEgo < 5 or CS.steeringPressed
       
       pid_curvature = self.pid.update(pid_log.error, feedforward=desired_curvature_corr, speed=CS.vEgo,
-                                      freeze_integrator=freeze_integrator) #, override=CS.steeringPressed)
+                                      freeze_integrator=freeze_integrator, override=CS.steeringPressed)
 
       output_curvature = pid_curvature + (CS.curvature - actual_curvature_vm_no_roll) if self.useCarCurvature else pid_curvature
 
