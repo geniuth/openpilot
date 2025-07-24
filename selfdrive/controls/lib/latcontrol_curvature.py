@@ -11,7 +11,6 @@ CURVATURE_SATURATION_THRESHOLD = 5e-4 # rad/m
 class LatControlCurvature(LatControl):
   def __init__(self, CP, CP_SP, CI):
     super().__init__(CP, CP_SP, CI)
-    self.useCarCurvature = CP.lateralTuning.pid.carCurvatureCorrection
     self.pid = PIDController((CP.lateralTuning.pid.kpBP, CP.lateralTuning.pid.kpV),
                              (CP.lateralTuning.pid.kiBP, CP.lateralTuning.pid.kiV),
                              k_f=CP.lateralTuning.pid.kf, pos_limit=self.curvature_max, neg_limit=-self.curvature_max)
@@ -27,13 +26,12 @@ class LatControlCurvature(LatControl):
       pid_log.active = False
       self.pid.reset()
     else:
-      roll_compensation = -VM.roll_compensation(params.roll, CS.vEgo)
-      actual_curvature_vm_no_roll = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, 0.)
-      actual_curvature_vm = actual_curvature_vm_no_roll - roll_compensation
+      actual_curvature_vm = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
       assert calibrated_pose is not None
       actual_curvature_pose = calibrated_pose.angular_velocity.yaw / CS.vEgo
       actual_curvature = np.interp(CS.vEgo, [2.0, 5.0], [actual_curvature_vm, actual_curvature_pose])
 
+      roll_compensation = -VM.roll_compensation(params.roll, CS.vEgo)
       desired_curvature_corr = desired_curvature - roll_compensation
       
       error = desired_curvature_corr - actual_curvature
@@ -41,8 +39,6 @@ class LatControlCurvature(LatControl):
       
       pid_curvature = self.pid.update(error, feedforward=desired_curvature_corr, speed=CS.vEgo,
                                       freeze_integrator=freeze_integrator, override=CS.steeringPressed)
-
-      output_curvature = pid_curvature + (CS.curvature - actual_curvature_vm_no_roll) if self.useCarCurvature else pid_curvature
 
       pid_log.active = True
       pid_log.p = float(self.pid.p)
