@@ -40,7 +40,7 @@ class LatControlCurvature(LatControl):
       freeze_integrator = steer_limited_by_controls or CS.vEgo < 5
       
       pid_curvature = self.pid.update(pid_log.error, feedforward=desired_curvature_corr, speed=CS.vEgo,
-                                      freeze_integrator=freeze_integrator, override=CS.steeringPressed)
+                                      freeze_integrator=freeze_integrator) #, override=CS.steeringPressed)
 
       output_curvature = pid_curvature + (CS.curvature - actual_curvature_vm_no_roll) if self.useCarCurvature else pid_curvature
 
