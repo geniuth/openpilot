@@ -14,7 +14,6 @@ class LatControlCurvature(LatControl):
     self.pid = PIDController((CP.lateralTuning.pid.kpBP, CP.lateralTuning.pid.kpV),
                              (CP.lateralTuning.pid.kiBP, CP.lateralTuning.pid.kiV),
                              k_f=CP.lateralTuning.pid.kf, pos_limit=self.curvature_max, neg_limit=-self.curvature_max)
-    self.useCarCurvature = CP.lateralTuning.pid.carCurvatureCorrection
 
   def reset(self):
     super().reset()
@@ -36,9 +35,10 @@ class LatControlCurvature(LatControl):
       desired_curvature_corr = desired_curvature - roll_compensation
       
       pid_log.error = float(desired_curvature_corr - actual_curvature)
-      freeze_integrator = steer_limited_by_controls or CS.steeringPressed or CS.vEgo < 5
+      freeze_integrator = steer_limited_by_controls or CS.vEgo < 5
       
-      output_curvature = self.pid.update(pid_log.error, feedforward=desired_curvature_corr, speed=CS.vEgo, freeze_integrator=freeze_integrator)
+      output_curvature = self.pid.update(pid_log.error, feedforward=desired_curvature_corr, speed=CS.vEgo,
+                                         freeze_integrator=freeze_integrator, override=CS.steeringPressed)
 
       pid_log.active = True
       pid_log.p = float(self.pid.p)
