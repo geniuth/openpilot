@@ -1,4 +1,4 @@
-from pid import PIDController
+from openpilot.common.pid import PIDController
 import numpy as np
 
 class MultiplicativeUnwindPID(PIDController):
