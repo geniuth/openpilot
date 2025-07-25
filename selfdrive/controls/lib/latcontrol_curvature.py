@@ -42,7 +42,7 @@ class LatControlCurvature(LatControl):
       pid_curvature = self.pid.update(pid_log.error, feedforward=desired_curvature_corr, speed=CS.vEgo,
                                       freeze_integrator=freeze_integrator, override=CS.steeringPressed)
 
-      output_curvature = pid_curvature + (CS.curvature - actual_curvature_vm_no_roll) if self.useCarCurvature else pid_curvature
+      output_curvature = pid_curvature + (CS.steeringCurvature - actual_curvature_vm_no_roll) if self.useCarCurvature else pid_curvature
 
       pid_log.active = True
       pid_log.p = float(self.pid.p)
