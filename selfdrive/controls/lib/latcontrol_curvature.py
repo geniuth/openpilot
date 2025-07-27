@@ -36,7 +36,7 @@ class LatControlCurvature(LatControl):
 
       desired_curvature_corr = desired_curvature - roll_compensation
       
-      pid_log.error = float(desired_curvature_corr - actual_curvature)
+      pid_log.error = float(desired_curvature - actual_curvature)
       freeze_integrator = steer_limited_by_controls or CS.vEgo < 5 or CS.steeringPressed
       
       pid_curvature = self.pid.update(pid_log.error, feedforward=desired_curvature_corr, speed=CS.vEgo,
