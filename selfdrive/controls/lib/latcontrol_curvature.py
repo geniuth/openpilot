@@ -11,7 +11,7 @@ CURVATURE_SATURATION_THRESHOLD = 5e-4 # rad/m
 class LatControlCurvature(LatControl):
   def __init__(self, CP, CP_SP, CI):
     super().__init__(CP, CP_SP, CI)
-    self.useCarCurvature = CP.lateralTuning.pid.carCurvatureCorrection
+    self.useCarSteerCurvature = CP.ret.useCarSteerCurvature
     self.pid = MultiplicativeUnwindPID((CP.lateralTuning.pid.kpBP, CP.lateralTuning.pid.kpV),
                                        (CP.lateralTuning.pid.kiBP, CP.lateralTuning.pid.kiV),
                                        k_f=CP.lateralTuning.pid.kf, pos_limit=self.curvature_max, neg_limit=-self.curvature_max)
@@ -42,7 +42,7 @@ class LatControlCurvature(LatControl):
       pid_curvature = self.pid.update(pid_log.error, feedforward=desired_curvature_corr, speed=CS.vEgo,
                                       freeze_integrator=freeze_integrator, override=CS.steeringPressed)
 
-      output_curvature = pid_curvature + (CS.steeringCurvature - actual_curvature_vm_no_roll) if self.useCarCurvature else pid_curvature
+      output_curvature = pid_curvature + (CS.steeringCurvature - actual_curvature_vm_no_roll) if self.useCarSteerCurvature else pid_curvature
 
       pid_log.active = True
       pid_log.p = float(self.pid.p)
