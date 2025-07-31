@@ -11,7 +11,7 @@ CURVATURE_SATURATION_THRESHOLD = 5e-4 # rad/m
 class LatControlCurvature(LatControl):
   def __init__(self, CP, CP_SP, CI):
     super().__init__(CP, CP_SP, CI)
-    self.useCarSteerCurvature = CP.ret.useCarSteerCurvature
+    self.useCarSteerCurvature = CP.useCarSteerCurvature
     self.pid = MultiplicativeUnwindPID((CP.lateralTuning.pid.kpBP, CP.lateralTuning.pid.kpV),
                                        (CP.lateralTuning.pid.kiBP, CP.lateralTuning.pid.kiV),
                                        k_f=CP.lateralTuning.pid.kf, pos_limit=self.curvature_max, neg_limit=-self.curvature_max)
