@@ -77,7 +77,7 @@ class LongControl:
 
     elif self.long_control_state == LongCtrlState.starting:
       if self.CP.useCarBrakeHoldState:
-        if CS.brakeHoldActive:
+        if CS.brakeHoldConfirmation:
           output_accel = self.CP.startAccel
           self.reset()
         else:
