@@ -2,11 +2,11 @@
 import math
 import threading
 import time
-from typing import SupportsFloat
+from numbers import Number
 
 from cereal import car, log
 import cereal.messaging as messaging
-from openpilot.common.conversions import Conversions as CV
+from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.common.realtime import config_realtime_process, Priority, Ratekeeper
 from openpilot.common.swaglog import cloudlog
@@ -25,6 +25,8 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_T
 from openpilot.common.pt2 import PT2Filter
 from openpilot.common.realtime import DT_CTRL
 
+from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
+from openpilot.sunnypilot.modeld.modeld_base import ModelStateBase
 from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
 
 State = log.SelfdriveState.OpenpilotState
@@ -34,7 +36,7 @@ LaneChangeDirection = log.LaneChangeDirection
 ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
 
 
-class Controls(ControlsExt):
+class Controls(ControlsExt, ModelStateBase):
   def __init__(self) -> None:
     self.params = Params()
     self.param_counter = 0
@@ -42,8 +44,9 @@ class Controls(ControlsExt):
     self.CP = messaging.log_from_bytes(self.params.get("CarParams", block=True), car.CarParams)
     cloudlog.info("controlsd got CarParams")
 
-    # Initialize sunnypilot controlsd extension
+    # Initialize sunnypilot controlsd extension and base model state
     ControlsExt.__init__(self, self.CP, self.params)
+    ModelStateBase.__init__(self)
 
     self.CI = interfaces[self.CP.carFingerprint](self.CP, self.CP_SP)
 
@@ -53,7 +56,7 @@ class Controls(ControlsExt):
                                   poll='selfdriveState')
     self.pm = messaging.PubMaster(['carControl', 'controlsState'] + self.pm_services_ext)
 
-    self.steer_limited_by_controls = False
+    self.steer_limited_by_safety = False
     self.curvature = 0.0
     self.curvature_no_roll = 0.0
     self.desired_curvature = 0.0
@@ -118,8 +121,9 @@ class Controls(ControlsExt):
                                            torque_params.frictionCoefficientFiltered)
 
       self.LaC.extension.update_model_v2(self.sm['modelV2'])
-      calculated_lag = self.LaC.extension.lagd_torqued_main(self.CP, self.sm['liveDelay'])
-      self.LaC.extension.update_lateral_lag(calculated_lag)
+
+      self.lat_delay = get_lat_delay(self.params, self.sm["liveDelay"].lateralDelay)
+      self.LaC.extension.update_lateral_lag(self.lat_delay)
 
     long_plan = self.sm['longitudinalPlan']
     model_v2 = self.sm['modelV2']
@@ -164,7 +168,7 @@ class Controls(ControlsExt):
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
     steer, steeringAngleDeg, curvature, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
-                                                                  self.steer_limited_by_controls, self.desired_curvature,
+                                                                  self.steer_limited_by_safety, self.desired_curvature,
                                                                   self.calibrated_pose, curvature_limited)  # TODO what if not available
     actuators.curvature = float(curvature) if self.enable_curvature_controller else self.desired_curvature
     actuators.torque = float(steer)
@@ -172,7 +176,7 @@ class Controls(ControlsExt):
     # Ensure no NaNs/Infs
     for p in ACTUATOR_FIELDS:
       attr = getattr(actuators, p)
-      if not isinstance(attr, SupportsFloat):
+      if not isinstance(attr, Number):
         continue
 
       if not math.isfinite(attr):
@@ -220,12 +224,12 @@ class Controls(ControlsExt):
     if self.sm['selfdriveState'].active:
       CO = self.sm['carOutput']
       if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
-        self.steer_limited_by_controls = abs(CC.actuators.steeringAngleDeg - CO.actuatorsOutput.steeringAngleDeg) > \
+        self.steer_limited_by_safety = abs(CC.actuators.steeringAngleDeg - CO.actuatorsOutput.steeringAngleDeg) > \
                                               STEER_ANGLE_SATURATION_THRESHOLD
       elif self.CP.steerControlType == car.CarParams.SteerControlType.curvatureDEPRECATED:
-        self.steer_limited_by_controls = abs(CC.actuators.curvature - CO.actuatorsOutput.curvature) > CURVATURE_SATURATION_THRESHOLD
+        self.steer_limited_by_safety = abs(CC.actuators.curvature - CO.actuatorsOutput.curvature) > CURVATURE_SATURATION_THRESHOLD
       else:
-        self.steer_limited_by_controls = abs(CC.actuators.torque - CO.actuatorsOutput.torque) > 1e-2
+        self.steer_limited_by_safety = abs(CC.actuators.torque - CO.actuatorsOutput.torque) > 1e-2
 
     # TODO: both controlsState and carControl valids should be set by
     #       sm.all_checks(), but this creates a circular dependency
