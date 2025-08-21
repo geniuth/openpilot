@@ -3,7 +3,8 @@
   url = https://github.com/infiniteCable2/panda.git
 [submodule "opendbc"]
   path = opendbc_repo
-	url = https://github.com/geniuth/opendbc.git
+  url = https://github.com/geniuth/opendbc
+  branch = master
 [submodule "msgq"]
   path = msgq_repo
   url = https://github.com/sunnypilot/msgq.git
