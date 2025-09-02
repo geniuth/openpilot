@@ -193,6 +193,7 @@ class Controls(ControlsExt, ModelStateBase):
     CC.curvatureControllerActive = self.enable_curvature_controller # for car controller curvature correction activation
     CC.currentCurvatureNoRoll = self.curvature_no_roll
     CC.rollDEPRECATED = self.roll # for lateral iso limit calculation
+    CC.steerLimited = self.steer_limited_by_safety
 
     # Orientation and angle rates can be useful for carcontroller
     # Only calibrated (car) frame is relevant for the carcontroller
