@@ -584,7 +584,7 @@ SettingsWindow::SettingsWindow(QWidget *parent) : QFrame(parent) {
   QList<QPair<QString, QWidget *>> panels = {
     {tr("Device"), device},
     {tr("Network"), networking},
-    {tr("infinitCable Toggles"), ictoggles},
+    {tr("infiniteCable Toggles"), ictoggles},
     {tr("Toggles"), toggles},
     {tr("Software"), new SoftwarePanel(this)},
     {tr("Firehose"), new FirehosePanel(this)},
