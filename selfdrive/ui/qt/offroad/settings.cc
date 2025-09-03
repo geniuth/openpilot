@@ -16,37 +16,8 @@
 #include "selfdrive/ui/qt/offroad/developer_panel.h"
 #include "selfdrive/ui/qt/offroad/firehose.h"
 
-TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
-  // param, title, desc, icon, restart needed
+InfiniteCableTogglesPanel::InfiniteCableTogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
   std::vector<std::tuple<QString, QString, QString, QString, bool>> toggle_defs{
-    {
-      "OpenpilotEnabledToggle",
-      tr("Enable sunnypilot"),
-      tr("Use the sunnypilot system for adaptive cruise control and lane keep driver assistance. Your attention is required at all times to use this feature."),
-      "../assets/icons/chffr_wheel.png",
-      true,
-    },
-    {
-      "ExperimentalMode",
-      tr("Experimental Mode"),
-      "",
-      "../assets/icons/experimental_white.svg",
-      false,
-    },
-    {
-      "DynamicExperimentalControl",
-      tr("Enable Dynamic Experimental Control"),
-      tr("Enable toggle to allow the model to determine when to use sunnypilot ACC or sunnypilot End to End Longitudinal."),
-      "../assets/offroad/icon_blank.png",
-      false,
-    },
-    {
-      "DisengageOnAccelerator",
-      tr("Disengage on Accelerator Pedal"),
-      tr("When enabled, pressing the accelerator pedal will disengage sunnypilot."),
-      "../assets/icons/disengage_on_accelerator.svg",
-      false,
-    },
     {
       "EnableCurvatureController",
       tr("Enable Curvature Controller"),
@@ -94,6 +65,75 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
       tr("Display Battery Details"),
       tr("Enable battery details panel."),
       "../assets/icons/capslock-fill.png",
+      false,
+    },
+  };
+
+  for (auto &[param, title, desc, icon, needs_restart] : toggle_defs) {
+    auto toggle = new ParamControl(param, title, desc, icon, this);
+
+    bool locked = params.getBool((param + "Lock").toStdString());
+    toggle->setEnabled(!locked);
+
+    if (needs_restart && !locked) {
+      toggle->setDescription(toggle->getDescription() + tr(" Changing this setting will restart openpilot if the car is powered on."));
+
+      QObject::connect(uiState(), &UIState::engagedChanged, [toggle](bool engaged) {
+        toggle->setEnabled(!engaged);
+      });
+
+      QObject::connect(toggle, &ParamControl::toggleFlipped, [=](bool state) {
+        params.putBool("OnroadCycleRequested", true);
+      });
+    }
+
+    addItem(toggle);
+    toggles[param.toStdString()] = toggle;
+  }
+}
+
+void InfiniteCableTogglesPanel::expandToggleDescription(const QString &param) {
+  toggles[param.toStdString()]->showDescription();
+}
+
+void InfiniteCableTogglesPanel::scrollToToggle(const QString &param) {
+  if (auto it = toggles.find(param.toStdString()); it != toggles.end()) {
+    auto scroll_area = qobject_cast<QScrollArea*>(parent()->parent());
+    if (scroll_area) {
+      scroll_area->ensureWidgetVisible(it->second);
+    }
+  }
+}
+
+TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
+  // param, title, desc, icon, restart needed
+  std::vector<std::tuple<QString, QString, QString, QString, bool>> toggle_defs{
+    {
+      "OpenpilotEnabledToggle",
+      tr("Enable sunnypilot"),
+      tr("Use the sunnypilot system for adaptive cruise control and lane keep driver assistance. Your attention is required at all times to use this feature."),
+      "../assets/icons/chffr_wheel.png",
+      true,
+    },
+    {
+      "ExperimentalMode",
+      tr("Experimental Mode"),
+      "",
+      "../assets/icons/experimental_white.svg",
+      false,
+    },
+    {
+      "DynamicExperimentalControl",
+      tr("Enable Dynamic Experimental Control"),
+      tr("Enable toggle to allow the model to determine when to use sunnypilot ACC or sunnypilot End to End Longitudinal."),
+      "../assets/offroad/icon_blank.png",
+      false,
+    },
+    {
+      "DisengageOnAccelerator",
+      tr("Disengage on Accelerator Pedal"),
+      tr("When enabled, pressing the accelerator pedal will disengage sunnypilot."),
+      "../assets/icons/disengage_on_accelerator.svg",
       false,
     },
     {
@@ -529,6 +569,10 @@ SettingsWindow::SettingsWindow(QWidget *parent) : QFrame(parent) {
   DevicePanel *device = new DevicePanel(this);
   QObject::connect(device, &DevicePanel::reviewTrainingGuide, this, &SettingsWindow::reviewTrainingGuide);
   QObject::connect(device, &DevicePanel::showDriverView, this, &SettingsWindow::showDriverView);
+
+  InfiniteCableTogglesPanel *ictoggles = new InfiniteCableTogglesPanel(this);
+  QObject::connect(this, &SettingsWindow::expandToggleDescription, ictoggles, &InfiniteCableTogglesPanel::expandToggleDescription);
+  QObject::connect(this, &SettingsWindow::scrollToToggle, ictoggles, &InfiniteCableTogglesPanel::scrollToToggle);
 
   TogglesPanel *toggles = new TogglesPanel(this);
   QObject::connect(this, &SettingsWindow::expandToggleDescription, toggles, &TogglesPanel::expandToggleDescription);
