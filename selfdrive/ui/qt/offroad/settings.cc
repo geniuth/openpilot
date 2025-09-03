@@ -20,21 +20,21 @@ InfiniteCableTogglesPanel::InfiniteCableTogglesPanel(SettingsWindow *parent) : L
   std::vector<std::tuple<QString, QString, QString, QString, bool>> toggle_defs{
     {
       "EnableCurvatureController",
-      tr("VW MEB: Curvature Correction"),
+      tr("VW MEB: Lateral Correction (Recommended)"),
       tr("Enables curvature PID post-processing additionally to QFK curvature offset<br>"),
       "../assets/icons/chffr_wheel.png",
       false,
     },
     {
       "EnableSpeedLimitControl",
-      tr("VW MEB: Enable Speed Limit Control"),
+      tr("VW MEB: Speed Limit Control"),
       tr("Enables setting maximum speed by speed limit detection<br>"),
       "../assets/icons/speed_limit.png",
       false,
     },
     {
       "EnableSpeedLimitPredicative",
-      tr("VW MEB: Enable Predicative Speed Limit"),
+      tr("VW MEB: Predicative Speed Limit"),
       tr("Enables setting predicative speed limit<br>"),
       "../assets/icons/speed_limit.png",
       false,
@@ -42,13 +42,13 @@ InfiniteCableTogglesPanel::InfiniteCableTogglesPanel(SettingsWindow *parent) : L
     {
       "BatteryDetails",
       tr("VW MEB: Display Battery Details"),
-      tr("Enable battery details panel."),
+      tr("Display battery detail panel"),
       "../assets/icons/capslock-fill.png",
       false,
     },
     {
       "EnableSmoothSteer",
-      tr("Enable Steer Smoothing"),
+      tr("Steer Smoothing"),
       tr("Enables S-curving on lateral control for smoother steering<br>"),
       "../assets/icons/chffr_wheel.png",
       false,
@@ -56,14 +56,14 @@ InfiniteCableTogglesPanel::InfiniteCableTogglesPanel(SettingsWindow *parent) : L
     {
       "DarkMode",
       tr("Dark Mode"),
-      tr("Force brightness to a minimal value."),
+      tr("Force brightness to a minimal value"),
       "../assets/icons/eye_closed.png",
       false,
     },
     {
       "DisableScreenTimer",
-      tr("Onroad screen timeout"),
-      tr("the onroad screen is turned of after 10 seconds. It will be temporarily enabled on alerts."),
+      tr("Onroad Screen Timeout"),
+      tr("the onroad screen is turned of after 10 seconds. It will be temporarily enabled on alerts"),
       "../assets/icons/eye_closed.png",
       false,
     },
