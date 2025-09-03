@@ -57,7 +57,7 @@ class SettingsLayout(Widget):
     self._panels = {
       PanelType.DEVICE: PanelInfo("Device", DeviceLayout()),
       PanelType.NETWORK: PanelInfo("Network", NetworkLayout()),
-      PanelType.ICTOGGLES: PanelInfo("infiniteCable Toggles", TogglesLayout()),
+      PanelType.ICTOGGLES: PanelInfo("infiniteCableCustom", TogglesLayout()),
       PanelType.TOGGLES: PanelInfo("Toggles", TogglesLayout()),
       PanelType.SOFTWARE: PanelInfo("Software", SoftwareLayout()),
       PanelType.FIREHOSE: PanelInfo("Firehose", FirehoseLayout()),
