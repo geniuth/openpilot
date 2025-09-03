@@ -20,23 +20,30 @@ InfiniteCableTogglesPanel::InfiniteCableTogglesPanel(SettingsWindow *parent) : L
   std::vector<std::tuple<QString, QString, QString, QString, bool>> toggle_defs{
     {
       "EnableCurvatureController",
-      tr("Enable Curvature Controller"),
-      tr("Enables curvature post-processing<br>"),
+      tr("VW MEB: Curvature Correction"),
+      tr("Enables curvature PID post-processing additionally to QFK curvature offset<br>"),
       "../assets/icons/chffr_wheel.png",
       false,
     },
     {
       "EnableSpeedLimitControl",
-      tr("Enable Speed Limit Control"),
+      tr("VW MEB: Enable Speed Limit Control"),
       tr("Enables setting maximum speed by speed limit detection<br>"),
       "../assets/icons/speed_limit.png",
       false,
     },
     {
       "EnableSpeedLimitPredicative",
-      tr("Enable Predicative Speed Limit"),
+      tr("VW MEB: Enable Predicative Speed Limit"),
       tr("Enables setting predicative speed limit<br>"),
       "../assets/icons/speed_limit.png",
+      false,
+    },
+    {
+      "BatteryDetails",
+      tr("VW MEB: Display Battery Details"),
+      tr("Enable battery details panel."),
+      "../assets/icons/capslock-fill.png",
       false,
     },
     {
@@ -55,16 +62,9 @@ InfiniteCableTogglesPanel::InfiniteCableTogglesPanel(SettingsWindow *parent) : L
     },
     {
       "DisableScreenTimer",
-      tr("Turn onroad screen off after 10 seconds"),
+      tr("Onroad screen timeout"),
       tr("the onroad screen is turned of after 10 seconds. It will be temporarily enabled on alerts."),
       "../assets/icons/eye_closed.png",
-      false,
-    },
-    {
-      "BatteryDetails",
-      tr("Display Battery Details"),
-      tr("Enable battery details panel."),
-      "../assets/icons/capslock-fill.png",
       false,
     },
   };
@@ -584,6 +584,7 @@ SettingsWindow::SettingsWindow(QWidget *parent) : QFrame(parent) {
   QList<QPair<QString, QWidget *>> panels = {
     {tr("Device"), device},
     {tr("Network"), networking},
+    {tr("infinitCable Toggles"), ictoggles},
     {tr("Toggles"), toggles},
     {tr("Software"), new SoftwarePanel(this)},
     {tr("Firehose"), new FirehosePanel(this)},
