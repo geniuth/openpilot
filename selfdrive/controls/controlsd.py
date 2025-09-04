@@ -172,7 +172,7 @@ class Controls(ControlsExt, ModelStateBase):
     steer, steeringAngleDeg, curvature, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
                                                                   self.steer_limited_by_safety, self.desired_curvature,
                                                                   self.calibrated_pose, curvature_limited)  # TODO what if not available
-    actuators.curvature = float(curvature) if self.enable_curvature_controller else self.desired_curvature
+    actuators.curvature = float(curvature)
     actuators.torque = float(steer)
     actuators.steeringAngleDeg = float(steeringAngleDeg)
     # Ensure no NaNs/Infs
@@ -193,6 +193,7 @@ class Controls(ControlsExt, ModelStateBase):
     CC.curvatureControllerActive = self.enable_curvature_controller # for car controller curvature correction activation
     CC.currentCurvatureNoRoll = self.curvature_no_roll
     CC.rollDEPRECATED = self.roll # for lateral iso limit calculation
+    CC.steerLimited = self.steer_limited_by_safety
 
     # Orientation and angle rates can be useful for carcontroller
     # Only calibrated (car) frame is relevant for the carcontroller
