@@ -16,6 +16,8 @@ Useful options:
 
 ```bash
 python selfdrive/carrot/cluster_run.py --output window --width 1920 --height 480
+python selfdrive/carrot/cluster_run.py --input navi --output window --width 1920 --height 480 --fps 30
+python selfdrive/carrot/cluster_run.py --input route --route /path/to/route --navi-overlay --screen-mode navi --output both --width 1920 --height 480 --fps 30
 python selfdrive/carrot/cluster_run.py --output usb --live-no-can
 python selfdrive/carrot/cluster_run.py --output usb --usb-codec jpeg --usb-jpeg-quality 68
 python selfdrive/carrot/cluster_run.py --output usb --input route --route /data/media/0/realdata/0000012e--f190807d64--36 --route-overlay compact --usb-codec h264 --usb-h264-fps 30 --profile-render
@@ -24,6 +26,44 @@ python selfdrive/carrot/cluster_run.py --output usb --usb-codec h264 --usb-h264-
 python selfdrive/carrot/cluster_run.py --output usb --fps 10 --usb-jpeg-quality 55 --route-overlay off
 python selfdrive/carrot/cluster_run.py --output usb --profile-render --profile-interval 2
 ```
+
+`--input navi` is the standalone Windows/live-device navigation screen. It
+binds the Carrot WebSocket v2 receiver on TCP 7714, broadcasts its address on
+UDP 7705, decodes MAP MAIN H.264 in-process, and displays all current JSON/PNG
+surfaces in a dedicated 1920x480 layout. Use `--navi-advertise-ip 127.0.0.1`
+with `adb reverse tcp:7714 tcp:7714`, or omit it for automatic LAN discovery.
+Only one receiver can own TCP 7714 at a time.
+
+Navigation map rendering requests `--navi-map-theme dark` by default. Use
+`auto` or `light` to request another theme from the smartphone renderer. The
+control WebSocket heartbeat is 5 seconds, and a `map_main` stream that stops
+for more than 3 seconds is replaced by `MAP STREAM STALLED` instead of leaving
+the last map frame frozen on screen.
+
+`--navi-overlay` keeps the selected vehicle source and adds the live Carrot
+navigation receiver. This is intended for editing the production navigation
+layout on a PC: use `--input route` for recorded vehicle data and `--output
+both` to render the same state to the PC window and a connected TURZX display.
+The replay wrapper selects the full navigation screen automatically:
+
+```bash
+python selfdrive/carrot/cluster_replay_usb.py /path/to/route --navi-overlay --output both --fps 30
+```
+
+The replay wrapper opens camera/debug data and seek controls in a separate
+`Carrot Cluster Replay Tools` window. The 1920x480 cluster window and USB frame
+remain clean and use the same renderer output. Use `--route-tools overlay` for
+the previous in-frame controls or `--route-tools off` to disable replay tools.
+The maintained cut-in route regression set and expected results are documented
+in [CUTIN_VALIDATION.md](CUTIN_VALIDATION.md); its 16 current-code checks can
+be run together with `validate_cutin_routes.py` and reviewed sequentially with
+`review_cutin_routes.py`.
+
+Pass `--screen-mode default` to inspect the normal HUD with its navigation
+panel instead. When the managed cluster HUD is enabled on a device, the cluster
+owns TCP 7714 and merges the embedded receiver snapshot directly. Managed
+autorun does not publish and subscribe the same state through `carrotNavi`;
+explicit standalone/CLI cereal publication remains available.
 
 `--usb-jpeg-encoder auto` tries optional `turbojpeg` first and falls back to
 Pillow. Route replay defaults to `--route-overlay compact`, which shows the
@@ -34,7 +74,14 @@ should match live rendering cost more closely.
 `system/loggerd/encoder` or the ffmpeg/libx264 comparison path. Native H264
 renders directly into the Qualcomm/Venus-aligned NV12 layout before submit, so
 the cluster hardware path no longer depends on libyuv or a CPU RGBA-to-NV12
-conversion. H264 defaults to the same exact portrait upload geometry used by
+conversion. On TICI with the current native bridge, the pipeline leases a cached
+ION/V4L2 input buffer and GLES reads the packed framebuffer directly into it;
+VIDC then queues the same buffer. This removes the per-frame raylib CPU image and
+C++ NV12 memcpy. It is direct handoff, not full zero-copy, because `glReadPixels`
+still performs a synchronous GPU readback. Missing symbols, an incompatible
+layout, or a first-use GL error retains/re-enters the staged compatibility path;
+set `CLUSTER_DIRECT_NV12_READBACK=0` to force that path for device A/B tests.
+H264 defaults to the same exact portrait upload geometry used by
 the working JPEG/PNG and earlier ffmpeg H264 paths. For a 9.2-inch panel that
 means a 462x1920 H264 stream, with no 16-pixel render-size padding unless
 `--usb-h264-align 16` is passed explicitly. Native hardware encoding pads only
@@ -92,7 +139,7 @@ native callback flags/timestamps/keyframe state, raw and patched NAL summaries,
 packetization results, TURZX chunk sizes, and a shutdown summary.
 `--usb-h264-diagnose-interval N` prints a compact periodic summary that is less
 noisy than debug mode: H264 unit count/keyframes, unit byte rate, chunks per
-unit, NAL sizes, native sender queue depth, and USB send latency. Use it on both
+unit, NAL sizes, native access-unit queue depth/drop count, and USB send latency. Use it on both
 native and ffmpeg runs when deciding whether artifacts line up with encoder
 output size/cadence or with USB transport stalls.
 Keep `--usb-h264-debug` and `--usb-h264-dump` off for FPS/CPU measurements;
@@ -216,16 +263,21 @@ debug UI before navi data has arrived. When output is gated off,
 remain visible.
 The autorun watcher normalizes locale before this dim-only USB path too, so
 vendor USB initialization does not fail before the renderer is launched.
-Manager autostart sets `CLUSTER_REALTIME=1` by default unless the environment
-already overrides it. With realtime enabled, `cluster_autorun.py` uses
-`ClusterHudCoreMode=0` by default, which maps to cores `1,2,3,4`; mode `1` maps
-to all initially allowed CPU cores.
+Manager autostart sets `CLUSTER_REALTIME=0` by default and explicitly restores
+`SCHED_OTHER`. CPU affinity remains enabled: `ClusterHudCoreMode=0` maps to cores
+`1,2,3,4`, while mode `1` maps to all initially allowed CPU cores. Set
+`CLUSTER_REALTIME=1` only for an explicit diagnostic override; in that mode,
 `ClusterHudPriority` controls the common openpilot realtime helper priority with
 range `1..99`, default `10`.
 Changing either param makes the running HUD exit so `cluster_autorun` can
-relaunch it with the new affinity/priority, without a whole system restart.
+relaunch it with the new affinity/scheduler settings, without a whole system restart.
 Explicit `CLUSTER_REALTIME`, `CLUSTER_REALTIME_CORES`, or
 `CLUSTER_REALTIME_PRIORITY` environment values still win.
+On TICI, the HUD reads the local Git branch directly but does not start remote
+`ls-remote` or `fetch` work. PC/window runs retain the periodic remote status.
+Native H.264 callback output is queued as complete access units. The bounded
+queue retains the latest codec config, keyframe, and frame without waiting for
+USB; stale access units are dropped and reported instead of failing the run.
 When `--usb-brightness` is omitted, USB launches follow `ClusterHudBrightness`:
 `0` auto follows live `wideRoadCameraState.exposureValPercent` after samples are
 available, falling back to `deviceState.screenBrightnessPercent`; `1` through
@@ -291,11 +343,15 @@ A/B run without the overlay.
 `ClusterHudEncoder` controls the encoder used by manager autostart and by
 direct USB CLI runs when `--usb-codec` is omitted: `0` auto tries
 native hardware H264 first, then ffmpeg/libx264 software H264, then JPEG when
-launched by `cluster_autorun`. Direct CLI auto uses native hardware H264 as the
+launched by `cluster_autorun`. Autorun advances that sequence only when pipeline
+initialization fails; renderer, source, encoder-runtime, and USB errors exit the
+run for supervisor retry without silently changing codec. Direct CLI auto uses native hardware H264 as the
 first encoder choice. `1` forces JPEG, `2` forces native hardware H264, and `3`
 forces ffmpeg/libx264 software H264.
-Native hardware H264 always uses the direct GPU NV12 render/submit path. If
-backend `auto` falls back to ffmpeg, the run uses the software RGBA pipe.
+Native hardware H264 always uses GPU NV12 packing. Supported TICI builds report
+`direct_ion=on` and submit the leased encoder input without an intermediate copy;
+otherwise they report `direct_ion=off` and use staged NV12 readback. If backend
+`auto` falls back to ffmpeg, the run uses the software RGBA pipe.
 Changing this setting while the HUD is running makes the current HUD process
 exit so `cluster_autorun` can relaunch it with the new encoder choice.
 `ClusterHudScreenMode` controls optional debug views: `0` default, `1` shows
@@ -400,6 +456,13 @@ The renderer prefers
 `/data/openpilot/selfdrive/assets/fonts/KaiGenGothicKR-Bold.ttf` for HUD text.
 It falls back to the bundled/addon KaiGen copy, then JetBrainsMono and
 system/platform fonts if KaiGen is not present.
+Latin/numeric text uses the 160-pixel primary font. The complete Korean glyph
+set uses a separate 32-pixel base atlas with bilinear filtering and no mip chain;
+a host resource smoke produced `8192x4096` rather than the former `8192x8192`.
+Incoming Navi H.264 is decoded on a bounded worker. If it falls behind, dependent
+frames are discarded until the next keyframe, and stale completed frames cannot
+replace a newer requested sequence. RGBA texture upload reuses the immutable
+frame buffer through CFFI rather than making another full-frame copy.
 
 USB frame upload runs in no-ACK mode by default because some TURZX panels accept
 image data but never return a frame-upload response. Use `--usb-wait-frame-ack`

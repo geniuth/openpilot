@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gc
 import ipaddress
+import os
 from dataclasses import replace
 import signal
 import socket
@@ -29,9 +30,11 @@ from cluster_config import (
     CLUSTER_RADAR_DISPLAY_PARAM,
     CLUSTER_RADAR_INFO_PARAM,
     CLUSTER_RADAR_SOURCE_COLOR_PARAM,
+    CLUSTER_SCREEN_MODE_DEFAULT,
     CLUSTER_SCREEN_MODE_DEBUG,
     CLUSTER_SCREEN_MODE_DEBUG_GRAPH,
     CLUSTER_SCREEN_MODE_DEBUG_GRAPH_RIGHT,
+    CLUSTER_SCREEN_MODE_NAVI,
     CLUSTER_SCREEN_MODE_NAVI_DEBUG,
     CLUSTER_SCREEN_MODE_PARAM,
     CLUSTER_THEME_PARAM,
@@ -51,6 +54,7 @@ from cluster_config import (
 )
 from cluster_gamepad import DualSenseSimulator
 from cluster_git_status import GitBranchStatusProvider
+from cluster_gles_readback import DirectNv12ReadbackError
 from cluster_h264_pipeline import (
     DEFAULT_H264_DEVICE,
     DEFAULT_H264_ENCODER_ALIGN,
@@ -64,9 +68,15 @@ from cluster_h264_pipeline import (
 )
 from cluster_live import OpenpilotLiveSource
 from cluster_models import RouteOverlay, SimulatorInput
+from cluster_navi_overlay import merge_navi_overlay_state
 from cluster_profile import GcProfileHook, ProfileReporter, freeze_gc_after_init
 from cluster_renderer import ClusterUiRenderer
-from cluster_route_replay import RouteReplaySource
+from cluster_route_replay import (
+    ROUTE_FRONT_RADAR_ONLY_ENV,
+    ROUTE_SHOW_RECORDED_CUTINS_ENV,
+    RouteReplaySource,
+    adjacent_route_log_path,
+)
 from cluster_simulator import ClusterSimulator, RandomInputSource
 from cluster_system_monitor import ClusterProcessCoreUsageSampler
 from cluster_usb_display import TuringUsbDisplay, find_supported_usb_product, product_id_for_hud_mode
@@ -87,6 +97,7 @@ SCREEN_MODE_PARAM_POLL_SECONDS = 1.0
 CAMERA_VIEW_PARAM_POLL_SECONDS = 1.0
 RADAR_PARAM_POLL_SECONDS = 1.0
 HUD_MODE_PARAM_POLL_SECONDS = 1.0
+HUD_MIRROR_PARAM_POLL_SECONDS = 1.0
 NETWORK_ADDRESS_POLL_SECONDS = 2.0
 
 try:
@@ -195,6 +206,41 @@ def resolved_h264_encoder_fps(target_fps: float, h264_fps: int) -> int:
 
 def option_present(argv: list[str], option: str) -> bool:
     return any(arg == option or arg.startswith(f"{option}=") for arg in argv)
+
+
+def route_log_kind_for_path(path: Path, fallback: str) -> str:
+    name = path.name.lower()
+    if name.startswith("qlog."):
+        return "qlog"
+    if name.startswith("rlog."):
+        return "rlog"
+    return fallback
+
+
+def route_state_has_cutin(state: object) -> bool:
+    detected_vehicles = getattr(state, "detected_vehicles", ()) or ()
+    if any(bool(getattr(vehicle, "cut_in", False)) for vehicle in detected_vehicles):
+        return True
+    overlay = getattr(state, "route_overlay", None)
+    cutin_status = str(getattr(overlay, "cutin_status", "") or "").upper()
+    return "CUTIN" in cutin_status and ": YES" in cutin_status
+
+
+def play_cutin_alert() -> None:
+    def play() -> None:
+        if sys.platform == "win32":
+            try:
+                import winsound
+
+                # Beep does not depend on the user's Windows sound theme.
+                winsound.Beep(1400, 140)
+                winsound.Beep(1900, 180)
+                return
+            except (ImportError, RuntimeError):
+                pass
+        print("\a", end="", flush=True)
+
+    threading.Thread(target=play, name="cutin-alert", daemon=True).start()
 
 
 def apply_cluster_encoder_param(args: argparse.Namespace) -> str:
@@ -567,6 +613,13 @@ def run_demo(
     target_fps: float,
     live_fps_param_reader: ClusterLiveFpsParamReader | None,
     input_mode: str,
+    navi_host: str,
+    navi_port: int,
+    navi_advertise_ip: str | None,
+    navi_beacon_enabled: bool,
+    navi_map_theme: str,
+    navi_overlay_enabled: bool,
+    navi_publish_cereal: bool,
     output_mode: str,
     controller_index: int,
     width: int | None,
@@ -611,9 +664,12 @@ def run_demo(
     route_path: Path,
     route_log: str,
     route_overlay_mode: str,
+    route_tools_mode: str,
     camera_view_mode: int | None,
     route_loop: bool,
+    route_pause_on_cutin: bool,
     route_replay_speed: float,
+    route_start_time_s: float,
     route_start_segment: int | None,
     route_max_segments: int | None,
     live_include_can: bool,
@@ -624,6 +680,7 @@ def run_demo(
     profile_interval_s: float,
     gc_freeze_init: bool,
     theme_mode: str | None,
+    screen_mode: str | None,
     hud_mode_watch: int | None,
     hud_encoder_watch: int | None,
     hud_core_mode_watch: int | None,
@@ -719,8 +776,20 @@ def run_demo(
     theme_override = normalize_cluster_theme_mode(theme_mode) if theme_mode is not None else None
     theme_param_reader = ClusterThemeParamReader() if theme_override is None else None
     active_theme_mode = theme_override or (theme_param_reader.read() if theme_param_reader is not None else "auto")
-    screen_mode_param_reader = ClusterScreenModeParamReader()
-    active_screen_mode = screen_mode_param_reader.read()
+    screen_mode_override = normalize_cluster_screen_mode(screen_mode) if screen_mode is not None else None
+    screen_mode_param_reader = (
+        ClusterScreenModeParamReader()
+        if input_mode != "navi" and screen_mode_override is None
+        else None
+    )
+    if input_mode == "navi":
+        active_screen_mode = CLUSTER_SCREEN_MODE_NAVI
+    elif screen_mode_override is not None:
+        active_screen_mode = screen_mode_override
+    elif screen_mode_param_reader is not None:
+        active_screen_mode = screen_mode_param_reader.read()
+    else:
+        active_screen_mode = CLUSTER_SCREEN_MODE_DEFAULT
     camera_view_override = (
         normalize_cluster_camera_view_mode(camera_view_mode)
         if camera_view_mode is not None
@@ -761,7 +830,10 @@ def run_demo(
         flush=True,
     )
     renderer.set_profile_enabled(profile_render)
-    git_status_provider = GitBranchStatusProvider(Path(__file__).resolve().parent)
+    git_status_provider = GitBranchStatusProvider(
+        Path(__file__).resolve().parent,
+        remote_enabled=not TICI,
+    )
     network_address_provider = NetworkAddressProvider()
     cluster_core_usage_sampler = (
         ClusterProcessCoreUsageSampler(debug=cluster_core_usage_debug)
@@ -772,6 +844,18 @@ def run_demo(
     controller = DualSenseSimulator(controller_index) if input_mode == "gamepad" else None
     random_input = RandomInputSource() if input_mode == "random" else None
     live_source = OpenpilotLiveSource(include_can=live_include_can, timeout_ms=live_timeout_ms) if input_mode == "live" else None
+    navi_source = None
+    if input_mode == "navi" or navi_overlay_enabled:
+        from cluster_navi_source import NaviSimulatorSource
+
+        navi_source = NaviSimulatorSource(
+            host=navi_host,
+            port=navi_port,
+            advertise_ip=navi_advertise_ip,
+            beacon_enabled=navi_beacon_enabled,
+            publish_cereal=navi_publish_cereal,
+            map_theme=navi_map_theme,
+        )
     if live_source is not None:
         live_source.set_profile_enabled(profile_render)
         live_source.set_hud_debug_mode(active_hud_debug_mode)
@@ -783,15 +867,22 @@ def run_demo(
     route_source = None
     if input_mode == "route":
         profile_stage = time.perf_counter()
-        route_source = RouteReplaySource.load(
-            route_path,
-            route_log,
-            route_start_segment,
-            route_max_segments,
-            0.0,
-            "live",
-            0.0,
-        )
+        try:
+            route_source = RouteReplaySource.load(
+                route_path,
+                route_log,
+                route_start_segment,
+                route_max_segments,
+                0.0,
+                "live",
+                0.0,
+            )
+        except Exception:
+            if navi_source is not None:
+                navi_source.close()
+            if live_source is not None:
+                live_source.close()
+            raise
         profile.add_elapsed("source.route_load_initial", profile_stage)
     if route_source is not None:
         print(
@@ -799,12 +890,26 @@ def run_demo(
             f"{route_source.duration:.1f}s from "
             f"{route_source.loaded_file_count}/{len(route_source.source_files)} {route_log} files"
         )
+    route_tools_window = None
     start_time = time.perf_counter()
     route_wall_base_time = start_time
-    route_playback_base_s = 0.0
+    route_playback_base_s = min(max(0.0, route_start_time_s), route_source.duration) if route_source is not None else 0.0
     route_paused = False
     route_pause_toggled_down = False
     route_active_corner_lateral_offset_m = 0.0
+    active_route_log_kind = route_log
+    active_route_overlay_mode = route_overlay_mode
+    route_next_retry_time = 0.0
+    route_end_waiting = False
+    route_cutin_active = False
+    route_options = {
+        "show_recorded_cutins": os.environ.get(ROUTE_SHOW_RECORDED_CUTINS_ENV) == "1",
+        "front_radar_only": os.environ.get(ROUTE_FRONT_RADAR_ONLY_ENV) == "1",
+        "route_loop": route_loop,
+        "pause_on_cutin": route_pause_on_cutin,
+        "show_route_overlay": active_route_overlay_mode != "off",
+        "road_camera": active_camera_view_mode == CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA,
+    }
     last_frame_time = start_time
     last_report_time = start_time
     next_theme_param_read = start_time
@@ -814,6 +919,7 @@ def run_demo(
     next_camera_view_param_read = start_time
     next_radar_param_read = start_time
     next_hud_mode_param_read = start_time
+    next_hud_mirror_param_read = start_time + HUD_MIRROR_PARAM_POLL_SECONDS
     report_frames = 0
     display_actual_fps: float | None = None
     frame_interval = 1.0 / target_fps if target_fps > 0 else 0.0
@@ -821,6 +927,53 @@ def run_demo(
     h264_test_pattern_nv12: bytearray | None = None
     h264_render_nv12_buffer: bytearray | None = None
     h264_render_nv12_layout: tuple[int, int, int, int, int, int, bool] | None = None
+    h264_direct_nv12_input = False
+
+    def switch_route_source(
+        new_path: Path,
+        switch_time: float,
+        resume_s: float = 0.0,
+        paused: bool = False,
+    ) -> bool:
+        nonlocal route_source
+        nonlocal route_path, active_route_log_kind
+        nonlocal route_playback_base_s, route_wall_base_time, route_paused
+        nonlocal route_next_retry_time, route_end_waiting, route_cutin_active
+
+        new_path = new_path.resolve()
+        new_log_kind = route_log_kind_for_path(new_path, active_route_log_kind)
+        try:
+            new_source = RouteReplaySource.load(
+                new_path,
+                new_log_kind,
+                None,
+                1,
+                0.0,
+                "live",
+                route_active_corner_lateral_offset_m,
+            )
+        except Exception as exc:
+            print(f"Failed to open replay log {new_path}: {exc}", flush=True)
+            return False
+
+        old_source = route_source
+        route_source = new_source
+        route_path = new_path
+        active_route_log_kind = new_log_kind
+        route_playback_base_s = min(max(0.0, resume_s), new_source.duration)
+        route_wall_base_time = switch_time
+        route_paused = paused
+        route_next_retry_time = 0.0
+        route_end_waiting = False
+        route_cutin_active = False
+        if old_source is not None:
+            old_source.close()
+        print(
+            f"Playing replay log: {new_source.source_files[0].parent} "
+            f"({new_source.duration:.1f}s)",
+            flush=True,
+        )
+        return True
 
     if hud_output_gate_param_reader is not None and not hud_output_gate_param_reader.allowed():
         print(
@@ -831,6 +984,10 @@ def run_demo(
         return
 
     try:
+        if route_source is not None and route_tools_mode == "separate":
+            from cluster_replay_tools import RouteReplayToolsWindow
+
+            route_tools_window = RouteReplayToolsWindow()
         renderer.open(hidden=output_mode == "usb")
         profile.add_samples(renderer.profile_samples())
         renderer.clear_profile_samples()
@@ -868,12 +1025,17 @@ def run_demo(
             if h264_pipeline.backend_name == "native":
                 h264_render_nv12_layout = h264_pipeline.native_nv12_render_layout()
                 stride, y_scanlines, uv_scanlines, uv_offset, input_bytes, render_bytes, active_submit = h264_render_nv12_layout
+                h264_direct_nv12_input = (
+                    h264_pipeline.native_direct_input_available()
+                    and renderer.direct_nv12_readback_available()
+                )
                 print(
                     f"Using H264 native NV12 render path: "
                     f"{h264_pipeline.encoder_width}x{h264_pipeline.encoder_height} "
                     f"stride={stride} scanlines={y_scanlines}/{uv_scanlines} "
                     f"uv_offset={uv_offset} bytes={input_bytes} render_bytes={render_bytes} "
-                    f"active_submit={'on' if active_submit else 'off'} flip_x=on",
+                    f"active_submit={'on' if active_submit else 'off'} "
+                    f"direct_ion={'on' if h264_direct_nv12_input else 'off'} flip_x=on",
                     flush=True,
                 )
             if usb_h264_test_pattern:
@@ -922,21 +1084,23 @@ def run_demo(
 
             now = time.perf_counter()
 
-            next_hud_mirror_mode = hud_mirror_param_reader.read()
-            if next_hud_mirror_mode != active_hud_mirror_mode:
-                print(
-                    f"{CLUSTER_HUD_MIRROR_PARAM} updated: "
-                    f"{active_hud_mirror_mode} -> {next_hud_mirror_mode}",
-                    flush=True,
-                )
-                active_hud_mirror_mode = next_hud_mirror_mode
+            if now >= next_hud_mirror_param_read:
+                next_hud_mirror_mode = hud_mirror_param_reader.read()
+                if next_hud_mirror_mode != active_hud_mirror_mode:
+                    print(
+                        f"{CLUSTER_HUD_MIRROR_PARAM} updated: "
+                        f"{active_hud_mirror_mode} -> {next_hud_mirror_mode}",
+                        flush=True,
+                    )
+                    active_hud_mirror_mode = next_hud_mirror_mode
+                next_hud_mirror_param_read = now + HUD_MIRROR_PARAM_POLL_SECONDS
 
             if theme_override is None and now >= next_theme_param_read:
                 next_theme_mode = theme_param_reader.read() if theme_param_reader is not None else "auto"
                 if next_theme_mode != renderer.theme_mode:
                     renderer.set_theme_mode(next_theme_mode)
                 next_theme_param_read = now + THEME_PARAM_POLL_SECONDS
-            if now >= next_screen_mode_param_read:
+            if screen_mode_param_reader is not None and now >= next_screen_mode_param_read:
                 next_screen_mode = screen_mode_param_reader.read()
                 if next_screen_mode != renderer.screen_mode:
                     print(
@@ -1094,6 +1258,11 @@ def run_demo(
                 center_clock_text = time.strftime("%H:%M:%S")
                 profile.add_samples(live_source.profile_samples())
                 profile.add_elapsed("source.live_update", profile_stage)
+            elif input_mode == "navi" and navi_source is not None:
+                profile_stage = time.perf_counter()
+                state = navi_source.update()
+                source_status = navi_source.status_text()
+                profile.add_elapsed("source.navi_update", profile_stage)
             elif route_source is not None:
                 profile_stage = time.perf_counter()
                 playback_seconds = (
@@ -1101,7 +1270,78 @@ def run_demo(
                     if route_paused
                     else route_playback_base_s + (now - route_wall_base_time) * route_replay_speed
                 )
-                if output_mode in ("window", "both"):
+                action = None
+                if route_tools_window is not None:
+                    action = route_tools_window.poll()
+                    if action is not None:
+                        reload_parser_options = False
+                        for option_name, option_value in action.option_updates:
+                            if option_name not in route_options:
+                                continue
+                            route_options[option_name] = option_value
+                            if option_name == "show_recorded_cutins":
+                                os.environ[ROUTE_SHOW_RECORDED_CUTINS_ENV] = "1" if option_value else "0"
+                                reload_parser_options = True
+                            elif option_name == "front_radar_only":
+                                os.environ[ROUTE_FRONT_RADAR_ONLY_ENV] = "1" if option_value else "0"
+                                reload_parser_options = True
+                            elif option_name == "route_loop":
+                                route_loop = option_value
+                                if route_loop and route_end_waiting:
+                                    route_end_waiting = False
+                                    route_paused = False
+                                    route_playback_base_s = 0.0
+                                    route_wall_base_time = now
+                                    playback_seconds = 0.0
+                            elif option_name == "pause_on_cutin":
+                                if not option_value:
+                                    route_cutin_active = False
+                            elif option_name == "show_route_overlay":
+                                active_route_overlay_mode = "compact" if option_value else "off"
+                            elif option_name == "road_camera":
+                                active_camera_view_mode = CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA if option_value else 0
+
+                        if action.toggle_pause:
+                            route_paused = not route_paused
+                            route_playback_base_s = playback_seconds
+                            route_wall_base_time = now
+                        if action.seek_s is not None:
+                            route_playback_base_s = action.seek_s
+                            route_wall_base_time = now
+                            playback_seconds = action.seek_s
+                            route_paused = True
+                            route_end_waiting = False
+                            route_cutin_active = False
+
+                        requested_path = Path(action.open_path) if action.open_path is not None else None
+                        if requested_path is None and (action.previous_log or action.next_log):
+                            direction = -1 if action.previous_log else 1
+                            requested_path = adjacent_route_log_path(
+                                route_source.log_path_at(playback_seconds),
+                                direction,
+                                active_route_log_kind,
+                            )
+                            if requested_path is None:
+                                direction_name = "previous" if direction < 0 else "next"
+                                print(f"No {direction_name} numbered replay log found", flush=True)
+
+                        if requested_path is not None:
+                            if switch_route_source(requested_path, now):
+                                playback_seconds = 0.0
+                        elif reload_parser_options:
+                            current_path = route_source.log_path_at(playback_seconds)
+                            current_offset = route_source.log_offset_at(playback_seconds)
+                            if switch_route_source(current_path, now, current_offset, route_paused):
+                                playback_seconds = route_playback_base_s
+
+                        if action.closed:
+                            route_tools_window.close()
+                            route_tools_window = None
+                    elif not route_tools_window.is_alive:
+                        route_tools_window.close()
+                        route_tools_window = None
+
+                if route_tools_mode == "overlay" and output_mode in ("window", "both"):
                     seek_s, next_corner_lateral_offset_m, _control_active = renderer.route_replay_control_input(
                         playback_seconds,
                         route_source.duration,
@@ -1118,30 +1358,86 @@ def run_demo(
                         route_wall_base_time = now
                         playback_seconds = seek_s
                         route_paused = True
+                        route_end_waiting = False
+                        route_cutin_active = False
                     if next_corner_lateral_offset_m != route_active_corner_lateral_offset_m:
                         route_active_corner_lateral_offset_m = next_corner_lateral_offset_m
                         route_source.corner_lateral_offset_m = route_active_corner_lateral_offset_m
                         route_paused = True
                         route_playback_base_s = playback_seconds
                         route_wall_base_time = now
-                if route_source.is_finished(playback_seconds, route_loop):
-                    break
+                elif output_mode in ("window", "both"):
+                    mouse_down = renderer.route_replay_mouse_down()
+                    if mouse_down and not route_pause_toggled_down:
+                        route_paused = not route_paused
+                        route_playback_base_s = playback_seconds
+                        route_wall_base_time = now
+                    route_pause_toggled_down = mouse_down
+
+                if route_end_waiting or route_source.is_finished(playback_seconds, route_loop):
+                    route_paused = True
+                    route_playback_base_s = route_source.duration
+                    route_wall_base_time = now
+                    playback_seconds = route_source.duration
+                    route_end_waiting = True
+                    if now >= route_next_retry_time:
+                        route_next_retry_time = now + 1.0
+                        next_path = adjacent_route_log_path(
+                            route_source.log_path_at(playback_seconds),
+                            1,
+                            active_route_log_kind,
+                        )
+                        if next_path is not None and switch_route_source(next_path, now):
+                            playback_seconds = 0.0
+
                 route_source.corner_lateral_offset_m = route_active_corner_lateral_offset_m
                 keep_camera_video = active_camera_view_mode == CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA
                 state = route_source.state_at(
                     playback_seconds,
                     route_loop,
-                    include_overlay=route_overlay_mode != "off" or keep_camera_video,
+                    include_overlay=active_route_overlay_mode != "off" or keep_camera_video,
                 )
                 state = replace(
                     state,
                     route_overlay=route_overlay_for_mode(
                         state.route_overlay,
-                        route_overlay_mode,
+                        active_route_overlay_mode,
                         keep_video=keep_camera_video,
                     ),
                 )
+                cutin_active = route_state_has_cutin(state)
+                if route_options["pause_on_cutin"]:
+                    if cutin_active and not route_cutin_active:
+                        route_paused = True
+                        route_playback_base_s = playback_seconds
+                        route_wall_base_time = now
+                        play_cutin_alert()
+                        print(
+                            f"CUT-IN detected at {playback_seconds:.2f}s; replay paused",
+                            flush=True,
+                        )
+                    route_cutin_active = cutin_active
+                else:
+                    route_cutin_active = False
                 source_status = route_source.status_text(playback_seconds, route_loop)
+                if route_end_waiting:
+                    source_status += " | waiting for next log"
+                route_debug_overlay = state.route_overlay
+                if route_tools_window is not None:
+                    route_tools_window.update(
+                        playback_seconds,
+                        route_source.duration,
+                        route_paused,
+                        source_status,
+                        route_debug_overlay,
+                        str(route_source.log_folder_at(playback_seconds)),
+                        route_options,
+                    )
+                if route_tools_mode != "overlay" and route_debug_overlay is not None:
+                    state = replace(
+                        state,
+                        route_overlay=replace(route_debug_overlay, panel_visible=False),
+                    )
                 profile.add_elapsed("source.route_update", profile_stage)
             elif controller is None:
                 profile_stage = time.perf_counter()
@@ -1162,6 +1458,14 @@ def run_demo(
                     raise RuntimeError("simulator is not available for gamepad input")
                 state = simulator.update(command, dt)
                 profile.add_elapsed("source.gamepad_update", profile_stage)
+
+            if navi_overlay_enabled and navi_source is not None:
+                profile_stage = time.perf_counter()
+                navi_overlay_state = navi_source.update()
+                state = merge_navi_overlay_state(state, navi_overlay_state)
+                navi_status = navi_source.status_text()
+                source_status = f"{source_status} | {navi_status}" if source_status else navi_status
+                profile.add_elapsed("source.navi_overlay_update", profile_stage)
 
             if live_source is None:
                 center_clock_text = state.center_clock_text
@@ -1207,7 +1511,7 @@ def run_demo(
 
             if output_mode in ("window", "both"):
                 profile_stage = time.perf_counter()
-                if route_source is not None:
+                if route_source is not None and route_tools_mode == "overlay":
                     renderer.render_route_replay_frame(
                         state,
                         playback_seconds,
@@ -1260,30 +1564,66 @@ def run_demo(
                             if h264_render_nv12_layout is None:
                                 raise RuntimeError("H264 GPU NV12 render path is missing the native layout")
                             stride, y_scanlines, uv_scanlines, uv_offset, input_bytes, render_bytes, _ = h264_render_nv12_layout
-                            profile_stage = time.perf_counter()
-                            with renderer.render_to_nv12_buffer(
-                                state,
-                                h264_pipeline.encoder_width,
-                                h264_pipeline.encoder_height,
-                                stride,
-                                y_scanlines,
-                                uv_scanlines,
-                                uv_offset,
-                                render_bytes,
-                                h264_render_nv12_buffer,
-                                flip_x=not bool(active_hud_mirror_mode & 1),
-                            ) as h264_render_nv12_frame:
-                                profile.add_elapsed("main.usb.render_nv12_total", profile_stage)
-                                if isinstance(h264_render_nv12_frame, bytearray):
-                                    h264_render_nv12_buffer = h264_render_nv12_frame
+                            direct_submitted = False
+                            if h264_direct_nv12_input:
+                                try:
+                                    profile_stage = time.perf_counter()
+                                    with h264_pipeline.native_nv12_input_buffer() as direct_input:
+                                        profile.add_elapsed("main.usb_h264.acquire_direct", profile_stage)
+                                        profile_stage = time.perf_counter()
+                                        with renderer.render_to_nv12_buffer(
+                                            state,
+                                            h264_pipeline.encoder_width,
+                                            h264_pipeline.encoder_height,
+                                            stride,
+                                            y_scanlines,
+                                            uv_scanlines,
+                                            uv_offset,
+                                            render_bytes,
+                                            flip_x=not bool(active_hud_mirror_mode & 1),
+                                            destination_address=direct_input.address,
+                                            destination_size=direct_input.size,
+                                        ):
+                                            pass
+                                        profile.add_elapsed("main.usb.render_nv12_total", profile_stage)
 
+                                        profile_stage = time.perf_counter()
+                                        h264_pipeline.submit_native_nv12_input(direct_input)
+                                        profile.add_elapsed("main.usb_h264.submit_direct", profile_stage)
+                                    direct_submitted = True
+                                except DirectNv12ReadbackError as exc:
+                                    h264_direct_nv12_input = False
+                                    renderer.disable_direct_nv12_readback()
+                                    print(
+                                        f"H264 direct ION readback unavailable; using staged NV12 fallback: {exc}",
+                                        flush=True,
+                                    )
+
+                            if not direct_submitted:
                                 profile_stage = time.perf_counter()
-                                h264_pipeline.submit_nv12(
-                                    h264_render_nv12_frame,
+                                with renderer.render_to_nv12_buffer(
+                                    state,
                                     h264_pipeline.encoder_width,
                                     h264_pipeline.encoder_height,
-                                )
-                                profile.add_elapsed("main.usb_h264.submit_nv12", profile_stage)
+                                    stride,
+                                    y_scanlines,
+                                    uv_scanlines,
+                                    uv_offset,
+                                    render_bytes,
+                                    h264_render_nv12_buffer,
+                                    flip_x=not bool(active_hud_mirror_mode & 1),
+                                ) as h264_render_nv12_frame:
+                                    profile.add_elapsed("main.usb.render_nv12_total", profile_stage)
+                                    if isinstance(h264_render_nv12_frame, bytearray):
+                                        h264_render_nv12_buffer = h264_render_nv12_frame
+
+                                    profile_stage = time.perf_counter()
+                                    h264_pipeline.submit_nv12(
+                                        h264_render_nv12_frame,
+                                        h264_pipeline.encoder_width,
+                                        h264_pipeline.encoder_height,
+                                    )
+                                    profile.add_elapsed("main.usb_h264.submit_nv12", profile_stage)
                         else:
                             profile_stage = time.perf_counter()
                             with renderer.render_to_rgba_buffer(
@@ -1387,10 +1727,14 @@ def run_demo(
             usb_pipeline.close()
         if controller is not None:
             controller.close()
+        if route_tools_window is not None:
+            route_tools_window.close()
         if route_source is not None:
             route_source.close()
         if live_source is not None:
             live_source.close()
+        if navi_source is not None:
+            navi_source.close()
         if usb_display is not None:
             usb_display.close()
         renderer.close()
@@ -1415,9 +1759,40 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--input",
-        choices=("random", "gamepad", "route", "live"),
+        choices=("random", "gamepad", "route", "live", "navi"),
         default="random",
-        help="Input source. Use --input live for live openpilot cereal data, or route to replay logs.",
+        help=(
+            "Input source. Use navi for the embedded TCP 7714 Carrot receiver, "
+            "live for openpilot cereal data, or route to replay logs."
+        ),
+    )
+    parser.add_argument("--navi-host", default="0.0.0.0", help="Bind host for --input navi. Default: 0.0.0.0.")
+    parser.add_argument("--navi-port", type=int, default=7714, help="TCP port for --input navi. Default: 7714.")
+    parser.add_argument(
+        "--navi-advertise-ip",
+        default=None,
+        help="Address broadcast to the Android app for --input navi. Default: detected LAN address.",
+    )
+    parser.add_argument(
+        "--navi-no-beacon",
+        action="store_true",
+        help="Disable UDP 7705 discovery broadcast in --input navi mode.",
+    )
+    parser.add_argument(
+        "--navi-map-theme",
+        choices=("dark", "auto", "light"),
+        default="dark",
+        help="Theme requested for the smartphone-rendered map. Default: dark.",
+    )
+    parser.add_argument(
+        "--navi-overlay",
+        action="store_true",
+        help="Receive live Carrot navigation while keeping the selected route/live vehicle input.",
+    )
+    parser.add_argument(
+        "--navi-publish-cereal",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--output",
@@ -1685,6 +2060,12 @@ def parse_args() -> argparse.Namespace:
         help="Route replay debug overlay. Default compact shows the replay camera/data panel; use off for performance tests.",
     )
     parser.add_argument(
+        "--route-tools",
+        choices=("overlay", "separate", "off"),
+        default="overlay",
+        help="Replay seek/debug UI placement. separate keeps the cluster frame clean in a second PC window.",
+    )
+    parser.add_argument(
         "--camera-view-mode",
         type=int,
         choices=(0, 1, 2),
@@ -1696,6 +2077,11 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "dark", "light"),
         default=None,
         help=f"HUD theme override. Default reads {CLUSTER_THEME_PARAM}: 0 auto, 1 dark, 2 light.",
+    )
+    parser.add_argument(
+        "--screen-mode",
+        default=None,
+        help=f"HUD screen override such as default, navi, or navi-debug. Default reads {CLUSTER_SCREEN_MODE_PARAM}.",
     )
     parser.add_argument(
         "--cluster-hud-mode",
@@ -1727,10 +2113,21 @@ def parse_args() -> argparse.Namespace:
         help="Loop route replay instead of stopping at the end.",
     )
     parser.add_argument(
+        "--route-pause-on-cutin",
+        action="store_true",
+        help="Play an alert and pause route replay on the first frame of any cut-in detection.",
+    )
+    parser.add_argument(
         "--route-replay-speed",
         type=float,
         default=1.0,
         help="Route playback speed multiplier.",
+    )
+    parser.add_argument(
+        "--route-start-time",
+        type=float,
+        default=0.0,
+        help="Initial route playback position in seconds.",
     )
     parser.add_argument(
         "--route-start-segment",
@@ -1800,6 +2197,10 @@ def parse_args() -> argparse.Namespace:
         args.fps = DEFAULT_FPS
     if args.fps < 0:
         parser.error("--fps must be 0 or greater")
+    if not 1 <= args.navi_port <= 65535:
+        parser.error("--navi-port must be between 1 and 65535")
+    if args.navi_publish_cereal and args.input != "navi" and not args.navi_overlay:
+        parser.error("--navi-publish-cereal requires --input navi or --navi-overlay")
     if (args.width is not None and args.width <= 0) or (args.height is not None and args.height <= 0):
         parser.error("--width and --height must be greater than 0")
     args.usb_brightness_from_cli = args.usb_brightness is not None
@@ -1851,6 +2252,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--route-replay-speed must be greater than 0")
     if args.route_start_segment is not None and args.route_start_segment < 0:
         parser.error("--route-start-segment must be 0 or greater")
+    if args.route_start_time < 0.0:
+        parser.error("--route-start-time must be 0 or greater")
     if args.route_max_segments is not None and args.route_max_segments <= 0:
         parser.error("--route-max-segments must be greater than 0")
     if args.profile_interval <= 0:
@@ -1936,6 +2339,7 @@ def main(*, exit_on_error: bool = True) -> None:
     print(
         f"Refreshing native raylib cluster UI at {fps_text} "
         f"input={args.input} output={args.output}: {size_text} "
+        f"navi_overlay={'on' if args.navi_overlay else 'off'} "
         f"usb_codec={args.usb_codec} encoder_source={encoder_source}{h264_bitrate_text} "
         f"fps_source={fps_source} display_fps={display_fps_text} "
         f"brightness={brightness_text} brightness_source={brightness_source}"
@@ -1946,6 +2350,13 @@ def main(*, exit_on_error: bool = True) -> None:
             target_fps,
             live_fps_param_reader,
             args.input,
+            args.navi_host,
+            args.navi_port,
+            args.navi_advertise_ip,
+            not args.navi_no_beacon,
+            args.navi_map_theme,
+            args.navi_overlay,
+            args.navi_publish_cereal,
             args.output,
             args.controller_index,
             args.width,
@@ -1990,9 +2401,12 @@ def main(*, exit_on_error: bool = True) -> None:
             args.route,
             args.route_log,
             args.route_overlay,
+            args.route_tools,
             args.camera_view_mode,
             args.route_loop,
+            args.route_pause_on_cutin,
             args.route_replay_speed,
+            args.route_start_time,
             args.route_start_segment,
             args.route_max_segments,
             bool(args.live_include_can and not args.live_no_can),
@@ -2003,6 +2417,7 @@ def main(*, exit_on_error: bool = True) -> None:
             args.profile_interval,
             not args.no_gc_freeze,
             args.theme,
+            args.screen_mode,
             args.cluster_hud_mode,
             args.cluster_hud_encoder,
             args.cluster_hud_core_mode,

@@ -14,6 +14,7 @@ CUTIN_ASSOC_MAX_YREL = 0.75
 CUTIN_ASSOC_MAX_VREL = 2.5
 CORNER_TRACK_ID_RANGES = ((200, 220), (240, 250))
 CORNER_RADAR_SOURCES = ("corner235", "corner180")
+STABLE_CORNER_TRACK_ID_START = 1000
 CUTIN_FAST_CONFIRM_MAX_DREL = 10.0
 CUTIN_FAST_CONFIRM_MIN_INWARD_SPEED = 0.65
 CUTIN_URGENT_CONFIRM_MIN_INWARD_SPEED = 0.55
@@ -24,15 +25,74 @@ CUTIN_ASSUMED_VEHICLE_HALF_WIDTH = 0.9
 CUTIN_FAST_MAX_LANE_BOUNDARY_TTC_S = 0.55
 CUTIN_FAST_NEAR_MAX_LANE_BOUNDARY_TTC_S = 0.7
 CUTIN_FAST_MIN_RADAR_INWARD_SPEED = 0.2
+CUTIN_FAST_RADAR_INWARD_SPEED_MARGIN = 0.2
+CUTIN_FAST_MAX_PULL_AWAY_VREL_MPS = 3.0
+CUTIN_SUSTAINED_MIN_FUTURE_IN_LANE_PROB = 0.10
+CUTIN_SUSTAINED_MIN_INWARD_SPEED = 0.25
+CUTIN_SUSTAINED_MIN_RADAR_INWARD_SPEED = 0.18
+CUTIN_NORMAL_MIN_RADAR_INWARD_SPEED = 0.05
+CUTIN_NORMAL_RADAR_INWARD_SPEED_MARGIN = 0.35
 CUTIN_PROJECTED_BOOST_MIN_TEMPORAL_INWARD_SPEED = 0.3
+CUTIN_OUTER_TRACK_MIN_ABS_DPATH = 3.5
+FRONT_CUTIN_MIN_DREL_M = 5.0
+FRONT_CUTIN_MAX_DREL_M = 50.0
+FRONT_CUTIN_MAX_ABS_YREL_M = 7.0
+CORNER_CUTIN_MAX_DREL_M = 30.0
+CUTIN_MAX_FRAME_DREL_JUMP_M = 3.0
+CUTIN_MAX_FRAME_Y_JUMP_M = 0.60
+FRONT_CUTIN_MIN_CONFIRM_S = 0.30
+SIDE_CORNER_MAX_DREL_M = 0.20
+SIDE_CORNER_MIN_ABS_YREL_M = 1.40
+SIDE_CORNER_MAX_ABS_YREL_M = 4.50
+SIDE_CORNER_FRONT_MIN_DREL_M = 0.80
+SIDE_CORNER_FRONT_MAX_DREL_M = 6.00
+SIDE_CORNER_FRONT_MAX_ABS_YREL_M = 3.50
+SIDE_CORNER_FRONT_MAX_YREL_GAP_M = 2.00
+SIDE_CORNER_FRONT_MAX_VREL_GAP_MPS = 2.50
+SIDE_CORNER_MIN_CONFIRM_FRAMES = 5
+SIDE_CORNER_CUTIN_MIN_VLEAD_MPS = 0.30
+SIDE_CORNER_CUTIN_MIN_ABS_DPATH_M = 0.55
+SIDE_CORNER_CUTIN_MAX_ABS_DPATH_M = 1.80
+SIDE_CORNER_CUTIN_MIN_CENTERING_GAIN_M = 0.20
+SIDE_CORNER_CUTIN_MIN_INWARD_SPEED_MPS = 0.25
+SIDE_CORNER_CUTIN_MIN_RADAR_INWARD_SPEED_MPS = 0.05
+SIDE_CORNER_CUTIN_MAX_PATH_Y_STD_M = 0.80
 
 
 def is_corner_track_id(track_id: int) -> bool:
   return any(start <= track_id < end for start, end in CORNER_TRACK_ID_RANGES)
 
 
+def is_stable_corner_track_id(track_id: int) -> bool:
+  return track_id >= STABLE_CORNER_TRACK_ID_START
+
+
 def is_corner_radar_source(source: Any) -> bool:
   return str(source) in CORNER_RADAR_SOURCES
+
+
+def is_front_radar_cutin_enabled(enable_radar_tracks: int, enable_corner_radar: int, car_brand: str) -> bool:
+  return car_brand == "hyundai" and enable_radar_tracks == 3 and enable_corner_radar != 2
+
+
+def is_front_radar_cutin_candidate(track_id: int, radar_source: str, d_rel: float, y_rel: float,
+                                   is_corner_radar: bool) -> bool:
+  return (
+    not is_corner_radar and
+    radar_source != "scc" and
+    track_id != 0 and
+    FRONT_CUTIN_MIN_DREL_M <= d_rel <= FRONT_CUTIN_MAX_DREL_M and
+    abs(y_rel) <= FRONT_CUTIN_MAX_ABS_YREL_M
+  )
+
+
+def is_cutin_track_discontinuous(prev_measured: bool, prev_d_rel: float, prev_y_rel: float, prev_v_lead: float,
+                                 d_rel: float, y_rel: float, v_lead: float) -> bool:
+  return prev_measured and (
+    abs(d_rel - prev_d_rel) > CUTIN_MAX_FRAME_DREL_JUMP_M or
+    abs(y_rel - prev_y_rel) > CUTIN_MAX_FRAME_Y_JUMP_M or
+    abs(v_lead - prev_v_lead) > 7.0
+  )
 
 
 def cutin_confirmation_frames(base_frames: int, d_rel: float, inward_speed: float, v_ego: float = 0.0) -> int:
@@ -63,6 +123,7 @@ def is_fast_cutin_entry(
   lane_half_width: float,
   inward_speed: float,
   radar_inward_speed: float = 0.0,
+  v_rel: float = 0.0,
 ) -> bool:
   time_gap = d_rel / max(v_ego, 1.0)
   urgent_distance = d_rel < CUTIN_FAST_CONFIRM_MAX_DREL or (v_ego > 5.0 and time_gap < CUTIN_FAST_CONFIRM_MAX_TIME_GAP_S)
@@ -75,6 +136,7 @@ def is_fast_cutin_entry(
     not urgent_distance
     or inward_speed < min_inward_speed
     or radar_inward_speed < CUTIN_FAST_MIN_RADAR_INWARD_SPEED
+    or v_rel > CUTIN_FAST_MAX_PULL_AWAY_VREL_MPS
   ):
     return False
   edge_distance = max(0.0, abs(d_path) - lane_half_width - CUTIN_ASSUMED_VEHICLE_HALF_WIDTH)
@@ -83,7 +145,94 @@ def is_fast_cutin_entry(
     if d_rel < CUTIN_FAST_CONFIRM_MAX_DREL
     else CUTIN_FAST_MAX_LANE_BOUNDARY_TTC_S
   )
-  return edge_distance / max(inward_speed, 0.1) < max_boundary_ttc
+  boundary_inward_speed = min(inward_speed, radar_inward_speed + CUTIN_FAST_RADAR_INWARD_SPEED_MARGIN)
+  return edge_distance / max(boundary_inward_speed, 0.1) < max_boundary_ttc
+
+
+def is_side_corner_object(d_rel: float, y_rel: float) -> bool:
+  return (
+    0.0 <= d_rel <= SIDE_CORNER_MAX_DREL_M and
+    SIDE_CORNER_MIN_ABS_YREL_M <= abs(y_rel) <= SIDE_CORNER_MAX_ABS_YREL_M
+  )
+
+
+def match_side_corner_to_front_tracks(
+  corner_tracks: dict[int, tuple[float, float, float]],
+  front_tracks: dict[int, tuple[float, float, float]],
+) -> dict[int, int]:
+  candidates: list[tuple[float, int, int]] = []
+  for corner_id, (corner_d_rel, corner_y_rel, corner_v_rel) in corner_tracks.items():
+    if not is_side_corner_object(corner_d_rel, corner_y_rel):
+      continue
+    for front_id, (front_d_rel, front_y_rel, front_v_rel) in front_tracks.items():
+      if not (
+        SIDE_CORNER_FRONT_MIN_DREL_M <= front_d_rel <= SIDE_CORNER_FRONT_MAX_DREL_M and
+        abs(front_y_rel) <= SIDE_CORNER_FRONT_MAX_ABS_YREL_M and
+        math.copysign(1.0, front_y_rel) == math.copysign(1.0, corner_y_rel)
+      ):
+        continue
+      y_gap = abs(front_y_rel - corner_y_rel)
+      v_gap = abs(front_v_rel - corner_v_rel)
+      if y_gap > SIDE_CORNER_FRONT_MAX_YREL_GAP_M or v_gap > SIDE_CORNER_FRONT_MAX_VREL_GAP_MPS:
+        continue
+      score = (
+        front_d_rel / SIDE_CORNER_FRONT_MAX_DREL_M +
+        y_gap / SIDE_CORNER_FRONT_MAX_YREL_GAP_M +
+        v_gap / SIDE_CORNER_FRONT_MAX_VREL_GAP_MPS
+      )
+      candidates.append((score, front_id, corner_id))
+
+  matches: dict[int, int] = {}
+  used_corners: set[int] = set()
+  for _, front_id, corner_id in sorted(candidates):
+    if front_id in matches or corner_id in used_corners:
+      continue
+    matches[front_id] = corner_id
+    used_corners.add(corner_id)
+  return matches
+
+
+def hold_side_corner_front_matches(
+  current_matches: dict[int, int],
+  previous_matches: dict[int, int],
+  previous_misses: dict[int, int],
+  available_front_ids: set[int],
+  max_missing_frames: int = 1,
+) -> tuple[dict[int, int], dict[int, int]]:
+  held_matches = dict(current_matches)
+  misses = {front_id: 0 for front_id in current_matches}
+  for front_id, corner_id in previous_matches.items():
+    if front_id in held_matches or front_id not in available_front_ids:
+      continue
+    missing_frames = previous_misses.get(front_id, 0) + 1
+    if missing_frames <= max_missing_frames:
+      held_matches[front_id] = corner_id
+      misses[front_id] = missing_frames
+  return held_matches, misses
+
+
+def is_corner_confirmed_near_cutin(
+  *,
+  confirmed_frames: int,
+  d_rel: float,
+  v_lead: float,
+  d_path: float,
+  d_path_future: float,
+  inward_speed: float,
+  radar_inward_speed: float,
+  path_y_std: float,
+) -> bool:
+  centering_gain = abs(d_path) - abs(d_path_future)
+  return (
+    confirmed_frames >= SIDE_CORNER_MIN_CONFIRM_FRAMES and
+    SIDE_CORNER_FRONT_MIN_DREL_M <= d_rel <= SIDE_CORNER_FRONT_MAX_DREL_M and
+    v_lead >= SIDE_CORNER_CUTIN_MIN_VLEAD_MPS and
+    SIDE_CORNER_CUTIN_MIN_ABS_DPATH_M <= abs(d_path) <= SIDE_CORNER_CUTIN_MAX_ABS_DPATH_M and
+    centering_gain >= SIDE_CORNER_CUTIN_MIN_CENTERING_GAIN_M and
+    inward_speed >= SIDE_CORNER_CUTIN_MIN_INWARD_SPEED_MPS and
+    radar_inward_speed >= SIDE_CORNER_CUTIN_MIN_RADAR_INWARD_SPEED_MPS and
+    path_y_std <= SIDE_CORNER_CUTIN_MAX_PATH_Y_STD_M
+  )
 
 
 def effective_cutin_inward_speed(
@@ -135,6 +284,10 @@ def associate_cutin_tracks(
   candidates: list[tuple[float, int, int]] = []
   for current_id, (d_rel, y_rel, v_rel) in current.items():
     for previous_id, (prev_d_rel, prev_y_rel, prev_v_rel) in previous.items():
+      # Stable corner IDs describe the physical radar object, not its CAN slot.
+      # Never carry cut-in history between two different physical objects.
+      if current_id != previous_id and (is_stable_corner_track_id(current_id) or is_stable_corner_track_id(previous_id)):
+        continue
       d_delta = abs(d_rel - prev_d_rel)
       y_delta = abs(y_rel - prev_y_rel)
       v_delta = abs(v_rel - prev_v_rel)
@@ -215,9 +368,20 @@ def combine_cutin_future_projection(
   lane_half_width: float,
   projected_d_path: float,
   projected_in_lane_prob: float,
+  radar_inward_speed: float | None = None,
 ) -> tuple[float, float]:
   motion_horizon = min(horizon_s, CUTIN_LANE_MOTION_HORIZON_S)
-  motion_d_path = d_path + d_path_rate * motion_horizon
+  motion_rate = d_path_rate
+  if radar_inward_speed is not None and abs(d_path) > CUTIN_OUTER_TRACK_MIN_ABS_DPATH:
+    side = math.copysign(1.0, d_path)
+    motion_inward_speed = max(0.0, -side * d_path_rate)
+    bounded_inward_speed = min(
+      motion_inward_speed,
+      max(0.0, radar_inward_speed) + CUTIN_FAST_RADAR_INWARD_SPEED_MARGIN,
+    )
+    if motion_inward_speed > 0.0:
+      motion_rate = -side * bounded_inward_speed
+  motion_d_path = d_path + motion_rate * motion_horizon
   motion_in_lane_prob = max(0.0, 1.0 - abs(motion_d_path) / max(lane_half_width, 0.1))
   moving_inward = abs(motion_d_path) < abs(d_path)
   if moving_inward and motion_in_lane_prob > projected_in_lane_prob:
@@ -242,6 +406,8 @@ def cutin_entry_rejection_reason(
   inward_speed: float,
   tuning: dict[str, Any],
   fast_lane_entry: bool = False,
+  radar_inward_speed: float | None = None,
+  max_d_rel: float | None = None,
 ) -> str | None:
   if not enabled:
     return "disabled"
@@ -253,19 +419,37 @@ def cutin_entry_rejection_reason(
     return "behind-lead"
   if track_count < min_track_age:
     return "track-age"
-  if not (tuning["enter_min_x"] < d_rel < tuning["enter_max_x"] and v_lead > 4.0):
+  enter_max_x = tuning["enter_max_x"] if max_d_rel is None else min(tuning["enter_max_x"], max_d_rel)
+  if not (tuning["enter_min_x"] < d_rel < enter_max_x and v_lead > 4.0):
     return "range-speed"
   if abs(d_path) < tuning["enter_min_abs_dpath"]:
     return "already-center"
-  if not fast_lane_entry:
+  sustained_radar_entry = (
+    radar_inward_speed is not None
+    and radar_inward_speed >= CUTIN_SUSTAINED_MIN_RADAR_INWARD_SPEED
+    and inward_speed >= CUTIN_SUSTAINED_MIN_INWARD_SPEED
+    and in_lane_prob_future >= CUTIN_SUSTAINED_MIN_FUTURE_IN_LANE_PROB
+    and (in_lane_prob_future - in_lane_prob) >= CUTIN_ENTER_PROB_GAIN
+    and (abs(d_path) - abs(d_path_future)) >= tuning["enter_centering_gain"]
+  )
+  if not fast_lane_entry and not sustained_radar_entry:
     if in_lane_prob_future < tuning["enter_future_in_lane_prob"]:
       return "future-lane"
     if (in_lane_prob_future - in_lane_prob) < CUTIN_ENTER_PROB_GAIN:
       return "prob-gain"
     if (abs(d_path) - abs(d_path_future)) < tuning["enter_centering_gain"]:
       return "center-gain"
-  if inward_speed < tuning["enter_min_inward_speed"]:
+  if inward_speed < tuning["enter_min_inward_speed"] and not sustained_radar_entry:
     return "lane-motion"
+  if (
+    radar_inward_speed is not None
+    and not fast_lane_entry
+    and (
+      radar_inward_speed < CUTIN_NORMAL_MIN_RADAR_INWARD_SPEED
+      or inward_speed > radar_inward_speed + CUTIN_NORMAL_RADAR_INWARD_SPEED_MARGIN
+    )
+  ):
+    return "radar-motion"
   return None
 
 

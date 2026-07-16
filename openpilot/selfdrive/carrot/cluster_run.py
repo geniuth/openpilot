@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import gc
 import locale
 import os
 import sys
@@ -9,7 +10,7 @@ from pathlib import Path
 
 CARROT_DIR = Path(__file__).resolve().parent
 BUNDLE_DIR = CARROT_DIR / "cluster"
-OPENPILOT_ROOT = CARROT_DIR.parents[1]
+OPENPILOT_ROOT = CARROT_DIR.parents[2]
 
 for path in (OPENPILOT_ROOT, BUNDLE_DIR):
     path_text = str(path)
@@ -85,13 +86,17 @@ def configure_cluster_locale() -> None:
 
 def configure_cluster_realtime() -> None:
     realtime_enabled = os.environ.get("CLUSTER_REALTIME", "0").strip().lower() in ("1", "true", "yes", "on")
-    if not realtime_enabled:
-        return
-
     try:
-        from openpilot.common.realtime import config_realtime_process
+        from openpilot.common.realtime import config_realtime_process, drop_realtime, set_core_affinity
 
         cores = _resolved_realtime_cores()
+        if not realtime_enabled:
+            gc.enable()
+            drop_realtime()
+            set_core_affinity(cores)
+            print(f"[cluster_run] normal scheduler cores={cores}", flush=True)
+            return
+
         priority = _resolved_realtime_priority()
         config_realtime_process(cores, priority)
         print(f"[cluster_run] realtime enabled cores={cores} priority={priority}", flush=True)
