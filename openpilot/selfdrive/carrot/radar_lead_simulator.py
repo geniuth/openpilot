@@ -22,6 +22,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+  sys.path.insert(0, str(REPO_ROOT))
+
 try:
   from openpilot.selfdrive.carrot.radar_object_fusion import FusedRadarObject, RadarObjectFusion
 except ModuleNotFoundError:
@@ -29,6 +33,7 @@ except ModuleNotFoundError:
 
 try:
   from openpilot.selfdrive.carrot.radar_lead_model import (
+    CUTIN_ACTIVE_CURRENT_MIN,
     CUTIN_TEMPORAL_THRESHOLD_MAX,
     RadarLeadContext,
     RadarLeadDecisionFilter,
@@ -38,6 +43,7 @@ try:
   )
 except ModuleNotFoundError:
   from radar_lead_model import (
+    CUTIN_ACTIVE_CURRENT_MIN,
     CUTIN_TEMPORAL_THRESHOLD_MAX,
     RadarLeadContext,
     RadarLeadDecisionFilter,
@@ -45,6 +51,16 @@ except ModuleNotFoundError:
     RadarLeadModel,
     VisionLeadContext,
   )
+
+try:
+  from openpilot.selfdrive.carrot.radar_lead_controller import RadarLeadModelController
+except ModuleNotFoundError:
+  from radar_lead_controller import RadarLeadModelController
+
+try:
+  from openpilot.selfdrive.carrot.radar_vision_model_controller import PRIMARY_STEALTH_HOLD_S, STEALTH_LEAD_HOLD_S, VisionModelRadarController, VisionRadarMatcher, cutin_is_ahead_of_primary
+except ModuleNotFoundError:
+  from radar_vision_model_controller import PRIMARY_STEALTH_HOLD_S, STEALTH_LEAD_HOLD_S, VisionModelRadarController, VisionRadarMatcher, cutin_is_ahead_of_primary
 
 
 RADAR_TO_CAMERA = 1.52
@@ -108,6 +124,7 @@ class RadarFrame:
   model_leads: tuple[ModelLead, ...]
   recorded_one: RecordedLead
   recorded_two: RecordedLead
+  video_time_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +133,8 @@ class Candidate:
   score: float
   reason: str
   decision_threshold: float = 0.0
+  d_rel: float | None = None
+  y_rel: float | None = None
 
   @property
   def eligible(self) -> bool:
@@ -141,39 +160,247 @@ class ValidationReview:
   start_s: float
   end_s: float
   scene: str
+  target_track_ids: tuple[int, ...] = ()
+  forbidden_lead_two_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class CutinContinuity:
+  track_id: int
+  matched_frames: int
+  episode_frames: int
+  drop_runs: int
+  max_drop_s: float
+  current_drop_s: float
+  active: bool
+
+
+@dataclass(frozen=True)
+class LeadPlotValue:
+  track_id: int
+  d_rel: float
+
+
+@dataclass(frozen=True)
+class LeadComparisonFrame:
+  radard_one: LeadPlotValue | None
+  radard_two: LeadPlotValue | None
+  model_one: LeadPlotValue | None
+  model_two: LeadPlotValue | None
+
+
+def _candidate_plot_value(frame: RadarFrame, candidate: Candidate | None) -> LeadPlotValue | None:
+  if candidate is None:
+    return None
+  distance = candidate.d_rel
+  if distance is None:
+    point = next((point for point in frame.points if point.track_id == candidate.track_id), None)
+    distance = point.d_rel if point is not None else None
+  if distance is None or not math.isfinite(distance) or distance <= 0.0:
+    return None
+  return LeadPlotValue(candidate.track_id, float(distance))
+
+
+def lead_comparison_series(
+  frames: list[RadarFrame], radard_selector: LeadSelector, model_selector: LeadSelector,
+) -> tuple[LeadComparisonFrame, ...]:
+  """Return current-radard and model control-facing distance histories."""
+  result = []
+  for index, frame in enumerate(frames):
+    radard = radard_selector.select(frame, index)
+    model = model_selector.select(frame, index)
+    result.append(LeadComparisonFrame(
+      radard_one=_candidate_plot_value(frame, radard.lead_one),
+      radard_two=_candidate_plot_value(frame, radard.lead_two),
+      model_one=_candidate_plot_value(frame, model.lead_one),
+      model_two=_candidate_plot_value(frame, model.lead_two),
+    ))
+  return tuple(result)
+
+
+def cutin_continuity_series(
+  frames: list[RadarFrame], selector: LeadSelector, bridge_gap_s: float = 1.0, retain_s: float = 2.0,
+) -> tuple[CutinContinuity | None, ...]:
+  times = [frame.time_s for frame in frames]
+  active_ids: list[int | None] = []
+  indices_by_id: dict[int, list[int]] = {}
+  for index, frame in enumerate(frames):
+    lead_two = selector.select(frame, index).lead_two
+    track_id = (
+      lead_two.track_id
+      if lead_two is not None and lead_two.reason.endswith("active cutin")
+      else None
+    )
+    active_ids.append(track_id)
+    if track_id is not None:
+      indices_by_id.setdefault(track_id, []).append(index)
+
+  snapshots: list[CutinContinuity | None] = [None] * len(frames)
+  for track_id, active_indices in indices_by_id.items():
+    episodes: list[list[int]] = []
+    for index in active_indices:
+      if not episodes or frames[index].time_s - frames[episodes[-1][-1]].time_s > bridge_gap_s:
+        episodes.append([index])
+      else:
+        episodes[-1].append(index)
+
+    for episode in episodes:
+      start, end = episode[0], episode[-1]
+      matched = 0
+      drop_runs = 0
+      drop_started_at: float | None = None
+      max_drop_s = 0.0
+      for index in range(start, end + 1):
+        active = active_ids[index] == track_id
+        matched += int(active)
+        if not active:
+          if drop_started_at is None:
+            drop_started_at = frames[index].time_s
+            drop_runs += 1
+          frame_dt = frames[index].time_s - frames[index - 1].time_s if index > 0 else 0.05
+          current_drop_s = frames[index].time_s - drop_started_at + max(frame_dt, 0.0)
+          max_drop_s = max(max_drop_s, current_drop_s)
+        else:
+          drop_started_at = None
+          current_drop_s = 0.0
+        snapshot = CutinContinuity(
+          track_id, matched, index - start + 1, drop_runs, max_drop_s, current_drop_s, active,
+        )
+        if snapshots[index] is None or active:
+          snapshots[index] = snapshot
+
+      final_snapshot = snapshots[end]
+      if final_snapshot is not None:
+        retain_end = bisect.bisect_right(times, frames[end].time_s + retain_s)
+        for index in range(end + 1, retain_end):
+          if snapshots[index] is None:
+            snapshots[index] = final_snapshot
+  return tuple(snapshots)
 
 
 def validation_review_events(
-  frames: list[RadarFrame], selector: LeadSelector, _review: ValidationReview,
+  frames: list[RadarFrame], selector: LeadSelector, review: ValidationReview | None,
 ) -> dict[int, tuple[str, ...]]:
   events_by_frame: dict[int, tuple[str, ...]] = {}
   previous_cutins: set[int] = set()
-  handled_cutins: set[int] = set()
+  stationary_event_seen = False
+  previous_vision_lead = False
+  previous_vision_unmatched = False
+  previous_lead_one = False
+  previous_lead_two_only = False
+  previous_forbidden_lead_two: int | None = None
+  last_cutin_event_time: dict[int, float] = {}
   for index, frame in enumerate(frames):
     selection = selector.select(frame, index)
-    current_cutins = {candidate.track_id for candidate in selection.active_cutin_candidates}
-    new_cutins = current_cutins - previous_cutins - handled_cutins
+    events: list[str] = []
+    if review is not None and review.expected == "stationary":
+      if stationary_event_seen:
+        continue
+      targets = set(review.target_track_ids)
+      for role, candidate in (("leadOne", selection.lead_one), ("leadTwo", selection.lead_two)):
+        if candidate is None or (targets and candidate.track_id not in targets):
+          continue
+        stopped_points = [
+          point for point in frame.points
+          if point.track_id == candidate.track_id
+          and 0.8 < point.d_rel < 130.0
+          and abs(point.v_lead) * 3.6 < 3.0
+        ]
+        if stopped_points:
+          distance = min(point.d_rel for point in stopped_points)
+          events.append(f"STATIONARY {role} id {candidate.track_id} {distance:.0f}m")
+          stationary_event_seen = True
+          break
+      if events:
+        events_by_frame[index] = tuple(events)
+      continue
+
+    primary_track_id = selection.lead_one.track_id if selection.lead_one is not None else None
+    current_cutins = {
+      candidate.track_id for candidate in selection.active_cutin_candidates
+      if candidate.track_id != primary_track_id
+      and (candidate.score >= CUTIN_ACTIVE_CURRENT_MIN or candidate.track_id in previous_cutins)
+    }
+    if (
+      selection.lead_two is not None
+      and selection.lead_two.track_id != primary_track_id
+      and selection.lead_two.reason.endswith("active cutin")
+      and (selection.lead_two.score >= CUTIN_ACTIVE_CURRENT_MIN or selection.lead_two.track_id in previous_cutins)
+    ):
+      current_cutins.add(selection.lead_two.track_id)
+    new_cutins = {
+      track_id for track_id in current_cutins - previous_cutins
+      if frame.time_s - last_cutin_event_time.get(track_id, -math.inf) >= 1.0
+    }
     if new_cutins:
-      events_by_frame[index] = tuple(f"CUT-IN id {track_id}" for track_id in sorted(new_cutins))
-      handled_cutins.update(new_cutins)
+      events.extend(f"CUT-IN id {track_id}" for track_id in sorted(new_cutins))
+      last_cutin_event_time.update((track_id, frame.time_s) for track_id in new_cutins)
     previous_cutins = current_cutins
+
+    forbidden_lead_two = None
+    if review is not None and selection.lead_two is not None:
+      forbidden_ids = set(review.forbidden_lead_two_ids)
+      if selection.lead_two.track_id in forbidden_ids:
+        forbidden_lead_two = selection.lead_two.track_id
+        if forbidden_lead_two != previous_forbidden_lead_two:
+          events.append(f"FALSE leadTwo id {forbidden_lead_two}")
+    previous_forbidden_lead_two = forbidden_lead_two
+
+    # A maintained cut-in validation case must pause only for the decision it
+    # is labeling. Lead continuity diagnostics remain visible in the UI, but
+    # must not interrupt CUT-IN review playback.
+    if review is not None:
+      if events:
+        events_by_frame[index] = tuple(events)
+      continue
+
+    current_vision_lead = selection.lead_one is not None and selection.lead_one.track_id < 0
+    if current_vision_lead and not previous_vision_lead:
+      events.append("leadOne VISION")
+    previous_vision_lead = current_vision_lead
+
+    model_leads = getattr(frame, "model_leads", ())
+    vision_expected = bool(model_leads and model_leads[0].probability > 0.5)
+    current_lead_one = selection.lead_one is not None
+    current_lead_two = selection.lead_two is not None
+    if vision_expected and previous_lead_two_only and not current_lead_one and not current_lead_two:
+      events.append("leadTwo LOST (VISION)")
+    current_vision_unmatched = vision_expected and not current_lead_one
+    if current_vision_unmatched and previous_lead_one:
+      events.append("leadOne LOST (VISION)")
+    elif current_vision_unmatched and not previous_vision_unmatched:
+      events.append("VISION UNMATCHED")
+    previous_vision_unmatched = current_vision_unmatched
+    previous_lead_one = current_lead_one
+    previous_lead_two_only = current_lead_two and not current_lead_one
+
+    if events:
+      events_by_frame[index] = tuple(events)
   return events_by_frame
 
 
-def play_cutin_alert() -> None:
-  """Play an audible cut-in cue without blocking the replay renderer."""
+def qcamera_path_for_log(log_path: Path) -> Path:
+  return log_path.parent / "qcamera.ts"
+
+
+def play_review_alert(events: tuple[str, ...]) -> None:
+  """Play an audible lead/cut-in cue without blocking the replay renderer."""
   def play() -> None:
     if sys.platform == "win32":
       try:
         import winsound
-        winsound.Beep(1400, 140)
-        winsound.Beep(1900, 180)
+        if any(event.startswith("CUT-IN") for event in events):
+          winsound.Beep(1400, 140)
+          winsound.Beep(1900, 180)
+        else:
+          winsound.Beep(1050, 130)
+          winsound.Beep(1350, 150)
         return
       except (ImportError, RuntimeError):
         pass
     print("\a", end="", flush=True)
 
-  threading.Thread(target=play, name="cutin-alert", daemon=True).start()
+  threading.Thread(target=play, name="radar-review-alert", daemon=True).start()
 
 
 LABEL_ROLES = ("leadOne", "leadTwo", "cutin")
@@ -674,6 +901,12 @@ def _copy_recorded_lead(lead: Any) -> RecordedLead:
   )
 
 
+def aligned_video_time_s(qcamera_start_eof_ns: int, model_eof_ns: int) -> float | None:
+  if qcamera_start_eof_ns <= 0 or model_eof_ns < qcamera_start_eof_ns:
+    return None
+  return (model_eof_ns - qcamera_start_eof_ns) / 1e9
+
+
 def load_frames(log_path: Path) -> list[RadarFrame]:
   route_replay = _route_replay_module()
   schema = route_replay.load_openpilot_log_schema()
@@ -687,6 +920,8 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
   latest_lane_probs: tuple[float, ...] = ()
   latest_model_leads: tuple[ModelLead, ...] = ()
   latest_model_ns = 0
+  latest_model_eof_ns = 0
+  qcamera_start_eof_ns = 0
   absolute_frames: list[tuple[int, RadarFrame]] = []
   corner_tracker = route_replay.StableCornerObjectTracker()
 
@@ -696,14 +931,16 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
     except Exception:
       continue
     event_ns = int(event.logMonoTime)
-    if which == "liveTracks":
+    if which == "qRoadEncodeIdx" and qcamera_start_eof_ns == 0:
+      qcamera_start_eof_ns = int(event.qRoadEncodeIdx.timestampEof)
+    elif which == "liveTracks":
       event_t = event_ns / 1e9
       recorded_points = tuple(event.liveTracks.points)
       reconstructed = corner_tracker.live_tracks_at(event_t, latest_v_ego)
       merged = route_replay.merge_recorded_and_reconstructed_tracks(
         recorded_points,
         reconstructed,
-        prefer_reconstructed_corner=True,
+        raw_corner_only=True,
       )
       latest_points = _copy_track_points(merged)
       latest_points_ns = event_ns
@@ -720,6 +957,7 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
     elif which == "modelV2":
       latest_path, latest_lanes, latest_lane_probs, latest_model_leads = _copy_model(event.modelV2)
       latest_model_ns = event_ns
+      latest_model_eof_ns = int(event.modelV2.timestampEof)
     elif which == "radarState" and latest_points is not None:
       radar_state = event.radarState
       absolute_frames.append((event_ns, RadarFrame(
@@ -735,6 +973,7 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
         model_leads=latest_model_leads,
         recorded_one=_copy_recorded_lead(radar_state.leadOne),
         recorded_two=_copy_recorded_lead(radar_state.leadTwo),
+        video_time_s=aligned_video_time_s(qcamera_start_eof_ns, latest_model_eof_ns),
       )))
 
   if not absolute_frames:
@@ -755,6 +994,7 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
       model_leads=frame.model_leads,
       recorded_one=frame.recorded_one,
       recorded_two=frame.recorded_two,
+      video_time_s=frame.video_time_s,
     )
     for event_ns, frame in absolute_frames
   ]
@@ -1212,18 +1452,28 @@ class MLPLeadSelector:
 class MultitaskLeadSelector:
   """Fused object model with separate lead/cut-in/external outputs."""
 
-  def __init__(self, model_path: Path, frames: list[RadarFrame], include_scc: bool = False) -> None:
+  def __init__(
+    self, model_path: Path, frames: list[RadarFrame], include_scc: bool = False,
+    vision_match_primary: bool = False,
+  ) -> None:
     self.model = RadarLeadModel(model_path)
-    self.name = f"multitask:{model_path.stem}"
+    self.name = f"hybrid:{model_path.stem}" if vision_match_primary else f"multitask:{model_path.stem}"
     fusion = RadarObjectFusion(include_scc=include_scc)
     feature_builder = RadarLeadFeatureBuilder()
+    vision_matcher = VisionRadarMatcher() if vision_match_primary else None
     decision_filter = RadarLeadDecisionFilter(
       lead_threshold=max(0.5, float(self.model.thresholds[0])),
       cutin_threshold=max(0.5, min(CUTIN_TEMPORAL_THRESHOLD_MAX, float(self.model.thresholds[1]))),
       external_threshold=max(0.5, float(self.model.thresholds[2])),
     )
     selections = []
-    for frame in frames:
+    stealth_aliases: frozenset[str] = frozenset()
+    stealth_hold_until = 0.0
+    primary_hold_aliases: frozenset[str] = frozenset()
+    primary_hold_until = 0.0
+    displaced_primary_aliases: frozenset[str] = frozenset()
+    displaced_primary_hold_until = 0.0
+    for frame_index, frame in enumerate(frames):
       objects = fusion.update(frame.mono_time_s, frame.points)
       context = RadarLeadContext(
         time_s=frame.mono_time_s,
@@ -1261,21 +1511,125 @@ class MultitaskLeadSelector:
         for prediction in sorted(predictions, key=lambda value: value.external_prob, reverse=True)[:2]
         if prediction.external_prob >= MLP_CANDIDATE_FLOOR
       )
-      active_leads = [Candidate(track_id(value), value.lead_prob, "MLP active lead") for value in decision.lead_candidates]
-      active_cutins = [Candidate(track_id(value), value.cutin_prob, "MLP active cutin") for value in decision.cutin_candidates]
-      active_external = [
-        Candidate(track_id(value), value.external_prob, "MLP active external") for value in decision.external_candidates
+      if vision_matcher is not None:
+        vision_match = vision_matcher.match_context(
+          context.model_leads[0] if context.model_leads else None,
+          predictions,
+          frame.v_ego,
+        )
+        if vision_match is None:
+          lead_one = None
+        else:
+          obj = vision_match.prediction.features.radar_object
+          lead_one = Candidate(
+            track_id(vision_match.prediction),
+            vision_match.probability,
+            "vision-radar Laplacian match",
+            d_rel=obj.front_d_rel if obj.front_d_rel is not None else obj.d_rel,
+            y_rel=obj.y_rel,
+          )
+        primary_aliases = frozenset(vision_match.prediction.features.aliases) if vision_match is not None else frozenset()
+        if primary_aliases:
+          if primary_hold_aliases and not primary_aliases & primary_hold_aliases:
+            displaced_primary_aliases = primary_hold_aliases
+            displaced_primary_hold_until = frame.mono_time_s + PRIMARY_STEALTH_HOLD_S
+          primary_hold_aliases = primary_aliases
+          primary_hold_until = frame.mono_time_s + PRIMARY_STEALTH_HOLD_S
+      else:
+        lead_one_prediction = RadarLeadModelController._lead_one_prediction(decision.lead_candidates)
+        lead_one = Candidate(
+          track_id(lead_one_prediction), lead_one_prediction.lead_prob, "MLP active lead",
+        ) if lead_one_prediction is not None else None
+        if lead_one is None and frame.model_leads and frame.model_leads[0].probability > 0.5:
+          vision = frame.model_leads[0]
+          vision_distance = vision.x - RADAR_TO_CAMERA
+          if vision_distance > 0.5:
+            lead_one = Candidate(
+              -1, vision.probability, "MLP vision fallback",
+              d_rel=vision_distance, y_rel=-vision.y,
+            )
+        primary_aliases = frozenset()
+
+      def matches_primary(prediction: Any) -> bool:
+        return bool(primary_aliases & frozenset(prediction.features.aliases))
+      primary_d_rel = lead_one.d_rel if lead_one is not None else None
+
+      def cutin_relevant(prediction: Any) -> bool:
+        return cutin_is_ahead_of_primary(prediction.features.radar_object.d_rel, primary_d_rel)
+
+      active_leads = [] if vision_matcher is not None else [
+        Candidate(track_id(value), value.lead_prob, "MLP active lead") for value in decision.lead_candidates
       ]
-      lead_one = active_leads[0] if active_leads else None
-      lead_two = next(
-        (candidate for candidate in (*active_cutins, *active_external, *active_leads[1:])
-         if lead_one is None or candidate.track_id != lead_one.track_id),
-        None,
-      )
+      active_cutins = [
+        Candidate(track_id(value), value.cutin_prob, "MLP active cutin")
+        for value in decision.cutin_candidates if not matches_primary(value) and cutin_relevant(value)
+      ]
+      active_external = [
+        Candidate(track_id(value), value.external_prob, "MLP active external")
+        for value in decision.external_candidates
+      ]
+      stealth_predictions = sorted((
+        prediction for prediction in decision.lead_candidates
+        if not matches_primary(prediction) and VisionModelRadarController._stealth_control_usable(prediction)
+      ), key=lambda prediction: prediction.features.radar_object.d_rel)
+      if stealth_predictions:
+        stealth_aliases = frozenset(stealth_predictions[0].features.aliases)
+        stealth_hold_until = frame.mono_time_s + STEALTH_LEAD_HOLD_S
+      elif stealth_aliases and frame.mono_time_s <= stealth_hold_until:
+        held_prediction = next((
+          prediction for prediction in predictions
+          if stealth_aliases & frozenset(prediction.features.aliases)
+          and not matches_primary(prediction)
+          and VisionModelRadarController._stealth_control_usable(prediction)
+        ), None)
+        if held_prediction is not None:
+          stealth_predictions = [held_prediction]
+      else:
+        stealth_aliases = frozenset()
+        stealth_hold_until = 0.0
+      primary_hold_prediction = None
+      hold_aliases = displaced_primary_aliases if primary_aliases else primary_hold_aliases
+      hold_until = displaced_primary_hold_until if primary_aliases else primary_hold_until
+      if hold_aliases and frame.mono_time_s <= hold_until:
+        primary_hold_prediction = next((
+          prediction for prediction in predictions
+          if hold_aliases & frozenset(prediction.features.aliases)
+          and not matches_primary(prediction)
+          and VisionModelRadarController._primary_hold_usable(prediction)
+        ), None)
+      lead_two_prediction = next((
+        prediction for prediction in decision.cutin_candidates
+        if not matches_primary(prediction)
+        and cutin_relevant(prediction)
+        and VisionModelRadarController._external_control_usable(prediction)
+      ), None)
+      lead_two_reason = "MLP active cutin"
+      lead_two_probability = lead_two_prediction.cutin_prob if lead_two_prediction is not None else 0.0
+      if lead_two_prediction is None:
+        lead_two_prediction = next((
+          prediction for prediction in decision.external_candidates
+          if not matches_primary(prediction)
+          and VisionModelRadarController._external_control_usable(prediction)
+        ), None)
+        lead_two_reason = "MLP active external"
+        lead_two_probability = lead_two_prediction.external_prob if lead_two_prediction is not None else 0.0
+      if lead_two_prediction is None and primary_hold_prediction is not None:
+        lead_two_prediction = primary_hold_prediction
+        lead_two_reason = "MLP primary stealth"
+        lead_two_probability = lead_two_prediction.lead_prob
+      if lead_two_prediction is None and stealth_predictions:
+        lead_two_prediction = stealth_predictions[0]
+        lead_two_reason = "MLP active stealth"
+        lead_two_probability = lead_two_prediction.lead_prob
+      lead_two = Candidate(
+        track_id(lead_two_prediction),
+        lead_two_probability,
+        lead_two_reason,
+      ) if lead_two_prediction is not None else None
       selections.append(Selection(
         lead_one=lead_one,
         lead_two=lead_two,
-        front_candidates=raw_leads,
+        front_candidates=() if vision_matcher is not None else raw_leads,
         corner_candidates=raw_cutins,
         active_cutin_candidates=tuple(active_cutins),
         external_candidates=raw_external,
@@ -1312,6 +1666,7 @@ class SimulatorUI:
     log_path: Path,
     include_scc_fusion: bool = False,
     review: ValidationReview | None = None,
+    radard_selector: LeadSelector | None = None,
   ) -> None:
     import pyray as rl
     self.rl = rl
@@ -1344,26 +1699,103 @@ class SimulatorUI:
     self.range_anchor: tuple[int, str, int | None] | None = None
     self.label_status = f"labels: {labels.count()} loaded"
     self.review = review
+    self.radard_selector = radard_selector
     self.review_events: dict[int, tuple[str, ...]] = {}
     self.review_handled: set[int] = set()
     self.review_status = ""
+    self.lead_expected_prefix: list[int] = [0]
+    self.lead_matched_prefix: list[int] = [0]
+    self.lead_drop_runs: list[int] = []
+    self.lead_max_drop_s: list[float] = []
+    self.lead_current_drop_s: list[float] = []
+    self.lead_two_continuity: tuple[CutinContinuity | None, ...] = ()
+    self.lead_comparison = (
+      lead_comparison_series(self.frames, self.radard_selector, self.selector)
+      if self.radard_selector is not None else ()
+    )
     fusion = RadarObjectFusion(include_scc=include_scc_fusion)
     self.fused_frames = tuple(fusion.update(frame.mono_time_s, frame.points) for frame in frames)
-    self.video_path = log_path.parent / "qcamera.ts"
+    self.video_path = qcamera_path_for_log(log_path)
     self.video_reader: Any | None = None
     self.video_texture: Any | None = None
     self.video_texture_size: tuple[int, int] | None = None
     self.video_frame_id: str | None = None
     self.font: Any | None = None
+    self._prepare_lead_continuity()
+    self.lead_two_continuity = cutin_continuity_series(self.frames, self.selector)
     self._prepare_review_events()
     if self.video_path.is_file():
       cluster_dir = Path(__file__).resolve().parent / "cluster"
       if str(cluster_dir) not in sys.path:
         sys.path.insert(0, str(cluster_dir))
       from cluster_route_replay import RouteVideoFrameReader, RouteVideoSegment
+      video_end_s = max((frame.video_time_s if frame.video_time_s is not None else frame.time_s) for frame in self.frames)
       self.video_reader = RouteVideoFrameReader([
-        RouteVideoSegment(None, self.video_path, 0.0, self.times[-1]),
+        RouteVideoSegment(None, self.video_path, 0.0, video_end_s),
       ])
+
+  def _prepare_lead_continuity(self) -> None:
+    drop_runs = 0
+    drop_started_at: float | None = None
+    max_drop_s = 0.0
+    for index, frame in enumerate(self.frames):
+      vision_expected = bool(frame.model_leads and frame.model_leads[0].probability > 0.5)
+      lead_present = self.selector.select(frame, index).lead_one is not None
+      dropped = vision_expected and not lead_present
+      self.lead_expected_prefix.append(self.lead_expected_prefix[-1] + int(vision_expected))
+      self.lead_matched_prefix.append(self.lead_matched_prefix[-1] + int(vision_expected and lead_present))
+
+      if dropped:
+        if drop_started_at is None:
+          drop_started_at = frame.time_s
+          drop_runs += 1
+        frame_dt = self.times[index] - self.times[index - 1] if index > 0 else 0.05
+        current_drop_s = max(0.0, frame.time_s - drop_started_at) + max(frame_dt, 0.0)
+        max_drop_s = max(max_drop_s, current_drop_s)
+      else:
+        drop_started_at = None
+        current_drop_s = 0.0
+      self.lead_drop_runs.append(drop_runs)
+      self.lead_max_drop_s.append(max_drop_s)
+      self.lead_current_drop_s.append(current_drop_s)
+
+  def _lead_continuity_text(self) -> tuple[str, bool]:
+    end = self.index + 1
+    expected = self.lead_expected_prefix[end]
+    matched = self.lead_matched_prefix[end]
+    recent_start = bisect.bisect_left(self.times, max(0.0, self.times[self.index] - 5.0))
+    recent_expected = expected - self.lead_expected_prefix[recent_start]
+    recent_matched = matched - self.lead_matched_prefix[recent_start]
+    if expected == 0:
+      return "leadOne continuity: waiting for vision lead", False
+    total_rate = 100.0 * matched / expected
+    recent_rate = 100.0 * recent_matched / max(recent_expected, 1)
+    lost_frames = expected - matched
+    current_drop_s = self.lead_current_drop_s[self.index]
+    text = (
+      f"leadOne continuity {total_rate:5.1f}%  recent5s {recent_rate:5.1f}%  "
+      f"loss {lost_frames}f/{self.lead_drop_runs[self.index]}x  "
+      f"max {self.lead_max_drop_s[self.index]:.2f}s"
+    )
+    if current_drop_s > 0.0:
+      text += f"  NOW LOST {current_drop_s:.2f}s"
+    return text, current_drop_s > 0.0
+
+  def _lead_two_continuity_text(self) -> tuple[str, bool]:
+    continuity = self.lead_two_continuity[self.index]
+    if continuity is None:
+      return "leadTwo cut-in continuity: waiting for active cut-in", False
+    rate = 100.0 * continuity.matched_frames / max(continuity.episode_frames, 1)
+    lost_frames = continuity.episode_frames - continuity.matched_frames
+    text = (
+      f"leadTwo cut-in id{continuity.track_id} {rate:5.1f}%  "
+      f"loss {lost_frames}f/{continuity.drop_runs}x  max {continuity.max_drop_s:.2f}s"
+    )
+    if continuity.current_drop_s > 0.0:
+      text += f"  NOW LOST {continuity.current_drop_s:.2f}s"
+    elif not continuity.active:
+      text += "  ENDED"
+    return text, continuity.current_drop_s > 0.0
 
   def _prepare_review_events(self) -> None:
     if self.review is None:
@@ -1379,8 +1811,8 @@ class SimulatorUI:
         self.review_handled.add(index)
         self.seek(self.times[index])
         self.paused = True
-        self.review_status = "PAUSED: " + " + ".join(self.review_events[index])
-        play_cutin_alert()
+        self.review_status = f"PAUSED @{self.times[index]:.2f}s: " + " + ".join(self.review_events[index])
+        play_review_alert(self.review_events[index])
         return
 
   def _color(self, value: tuple[int, int, int, int]) -> Any:
@@ -1485,22 +1917,44 @@ class SimulatorUI:
     if candidate is None:
       return
     point = self._track_point(frame, candidate.track_id)
-    if point is None or point.d_rel > self.forward_range_m:
+    distance = point.d_rel if point is not None else candidate.d_rel
+    lateral = point.y_rel if point is not None else candidate.y_rel
+    if distance is None or lateral is None or distance > self.forward_range_m:
       return
-    position = self._world_to_screen(map_rect, point.d_rel, point.y_rel)
+    position = self._world_to_screen(map_rect, distance, lateral)
     rect = self.rl.Rectangle(position.x - size * 0.5, position.y - size * 0.5, size, size)
     self.rl.draw_rectangle_lines_ex(rect, 3.0, color)
-    display_label = f"{label}/SCC" if point.source == "scc" else label
+    if candidate.track_id == -1:
+      display_label = f"{label}/VISION"
+    else:
+      display_label = f"{label}/SCC" if point is not None and point.source == "scc" else label
     label_x = (
       rect.x - self._measure_text(display_label, 13) - 4.0
       if label.startswith("lead") else rect.x + rect.width + 4.0
     )
     self._draw_text(display_label, label_x, rect.y - 1.0, 13, color)
 
+  def _draw_radard_candidate(
+    self, map_rect: Any, frame: RadarFrame, candidate: Candidate | None, color: Any, radius: float, label: str,
+    label_above: bool,
+  ) -> None:
+    if candidate is None:
+      return
+    point = self._track_point(frame, candidate.track_id)
+    distance = point.d_rel if point is not None else candidate.d_rel
+    lateral = point.y_rel if point is not None else candidate.y_rel
+    if distance is None or lateral is None or distance <= 0.0 or distance > self.forward_range_m:
+      return
+    position = self._world_to_screen(map_rect, distance, lateral)
+    self.rl.draw_circle_lines(int(position.x), int(position.y), radius, color)
+    self.rl.draw_circle_lines(int(position.x), int(position.y), radius + 1.0, color)
+    label_y = position.y - radius - 14.0 if label_above else position.y + radius + 2.0
+    self._draw_text(label, position.x + radius + 4.0, label_y, 13, color)
+
   def _candidate_visible(self, candidate: Candidate | None) -> bool:
     if candidate is None:
       return False
-    return not self.selector.name.startswith(("mlp:", "multitask:")) or candidate.score >= self.min_candidate_probability
+    return not self.selector.name.startswith(("mlp:", "multitask:", "hybrid:")) or candidate.score >= self.min_candidate_probability
 
   def _draw_manual_label(self, map_rect: Any, frame: RadarFrame, role: str, color: Any, radius: float) -> None:
     is_set, track_id = self.labels.get(self.index, role)
@@ -1518,7 +1972,8 @@ class SimulatorUI:
   def _video_texture_for_time(self, playback_time: float) -> Any | None:
     if self.video_reader is None:
       return None
-    video_frame = self.video_reader.frame_at(playback_time)
+    aligned_time = self.frames[self.index].video_time_s
+    video_frame = self.video_reader.frame_at(aligned_time if aligned_time is not None else playback_time)
     if video_frame is None:
       return None
     size = (video_frame.width, video_frame.height)
@@ -1599,8 +2054,8 @@ class SimulatorUI:
       self._draw_recorded(rect, frame, frame.recorded_one, self._color(self.ORANGE), 12.0, "L1")
     if self.show_recorded_two:
       self._draw_recorded(rect, frame, frame.recorded_two, self._color(self.YELLOW), 16.0, "L2")
-    if self.selector.name.startswith(("mlp:", "multitask:")):
-      multitask = self.selector.name.startswith("multitask:")
+    if self.selector.name.startswith(("mlp:", "multitask:", "hybrid:")):
+      multitask = self.selector.name.startswith(("multitask:", "hybrid:"))
       source_markers = (
         (self.show_front_candidates, "L" if multitask else "F", selection.front_candidates, (self.GREEN, self.CYAN)),
         (self.show_corner_candidates, "X" if multitask else "C", selection.corner_candidates, (self.PURPLE, self.YELLOW)),
@@ -1623,13 +2078,17 @@ class SimulatorUI:
     else:
       self._draw_candidate(rect, frame, selection.lead_one, self._color(self.GREEN), 23.0, "1")
       self._draw_candidate(rect, frame, selection.lead_two, self._color(self.PURPLE), 29.0, "2")
+    if self.radard_selector is not None:
+      radard = self.radard_selector.select(frame, self.index)
+      self._draw_radard_candidate(rect, frame, radard.lead_one, self._color(self.CYAN), 14.0, "R1", True)
+      self._draw_radard_candidate(rect, frame, radard.lead_two, self._color(self.PURPLE), 18.0, "R2", False)
     if self.review is None:
       self._draw_manual_label(rect, frame, "leadOne", self._color(self.ORANGE), 18.0)
       self._draw_manual_label(rect, frame, "leadTwo", self._color(self.YELLOW), 22.0)
 
     point_legend = "fused objects" if self.show_fused_objects else "radar points"
     extras = f"   {point_legend} enabled" if self.show_radar_points else ""
-    legend = f"boxes: leadOne orange / leadTwo yellow{extras}"
+    legend = f"boxes: model L1 orange / L2 yellow   circles: current radard L1 cyan / L2 purple{extras}"
     self._draw_text(legend, rect.x + 18, rect.y + rect.height - 24, 14, self._color(self.MUTED))
 
   @staticmethod
@@ -1649,6 +2108,8 @@ class SimulatorUI:
     if candidate is None:
       return "NONE"
     point = self._track_point(frame, candidate.track_id)
+    if candidate.track_id == -1:
+      return f"VISION  prob {candidate.score:.2f}  {candidate.reason}"
     source = "SCC " if point is not None and point.source == "scc" else ""
     value_name = "prob" if candidate.reason.startswith("MLP") else "score"
     return f"{source}id {candidate.track_id}  {value_name} {candidate.score:.2f}  {candidate.reason}"
@@ -1676,10 +2137,16 @@ class SimulatorUI:
       status_color = self.YELLOW if self.paused else self.GREEN
       line(self.review_status, status_color, 14, 27)
 
-    if self.selector.name.startswith("multitask:"):
+    if self.selector.name.startswith(("multitask:", "hybrid:")):
       line("MODEL RESULT", self.MUTED, 15, 22)
       line("leadOne  " + self._candidate_text(frame, selection.lead_one), self.ORANGE, 17, 24)
       line("leadTwo  " + self._candidate_text(frame, selection.lead_two), self.YELLOW, 17, 31)
+
+    if self.radard_selector is not None:
+      radard = self.radard_selector.select(frame, self.index)
+      line("CURRENT RADARD RESULT", self.MUTED, 15, 22)
+      line("leadOne  " + self._candidate_text(frame, radard.lead_one), self.CYAN, 15, 22)
+      line("leadTwo  " + self._candidate_text(frame, radard.lead_two), self.PURPLE, 15, 29)
 
     if self.show_recorded_one or self.show_recorded_two:
       line("RECORDED RADARSTATE", self.MUTED, 15, 22)
@@ -1695,9 +2162,9 @@ class SimulatorUI:
     two_expected = two_target if two_manual else resolved_recorded_track_id(frame, frame.recorded_two)
     one_match = one_expected == candidate_track_id(selection.lead_one)
     two_match = two_expected == candidate_track_id(selection.lead_two)
-    if show_candidates and self.selector.name.startswith(("mlp:", "multitask:")):
+    if show_candidates and self.selector.name.startswith(("mlp:", "multitask:", "hybrid:")):
       line(f"CANDIDATE  {self.selector.name[:34]}", self.MUTED, 15, 22)
-      multitask = self.selector.name.startswith("multitask:")
+      multitask = self.selector.name.startswith(("multitask:", "hybrid:"))
       source_rows = (
         ("L0" if multitask else "F0", selection.front_candidates[0] if selection.front_candidates else None, self.GREEN, self.show_front_candidates),
         ("L1" if multitask else "F1", selection.front_candidates[1] if len(selection.front_candidates) > 1 else None, self.CYAN, self.show_front_candidates),
@@ -1771,10 +2238,10 @@ class SimulatorUI:
     self._draw_text("DISPLAY FILTERS", x, y, 13, self._color(self.MUTED))
     y += 22.0
     self.filter_checkboxes = {}
-    multitask = self.selector.name.startswith("multitask:")
+    multitask = self.selector.name.startswith(("multitask:", "hybrid:"))
     controls = (
-      ("recorded_one", "REC L1", self.show_recorded_one),
-      ("recorded_two", "REC L2", self.show_recorded_two),
+      ("recorded_one", "LOG L1", self.show_recorded_one),
+      ("recorded_two", "LOG L2", self.show_recorded_two),
       ("front", "LEAD" if multitask else "FRONT", self.show_front_candidates),
       ("corner", "CUTIN" if multitask else "CORNER", self.show_corner_candidates),
       ("external", "EXT", self.show_external_candidates),
@@ -1811,21 +2278,97 @@ class SimulatorUI:
   def _draw_timeline(self, width: int, height: int) -> Any:
     rl = self.rl
     rect = rl.Rectangle(24.0, float(height - 38), float(width - 48), 13.0)
+    plot_rect = self._draw_lead_comparison_plot(width, rect.y) if self.review is not None else None
     rl.draw_rectangle_rounded(rect, 1.0, 8, self._color((55, 65, 75, 255)))
     if self.review is not None and self.times[-1] > 0.0:
       for index in self.review_events:
         event_ratio = min(max(self.times[index] / self.times[-1], 0.0), 1.0)
         marker_x = rect.x + rect.width * event_ratio
+        events = self.review_events[index]
+        marker_color = self.PURPLE if any(event.startswith("CUT-IN") for event in events) else self.RED
         rl.draw_line_ex(
           rl.Vector2(marker_x, rect.y - 5.0), rl.Vector2(marker_x, rect.y + rect.height + 5.0),
-          2.0, self._color(self.PURPLE),
+          2.0, self._color(marker_color),
         )
     ratio = 0.0 if self.times[-1] <= 0.0 else self.playback_time / self.times[-1]
     fill = rl.Rectangle(rect.x, rect.y, rect.width * ratio, rect.height)
     rl.draw_rectangle_rounded(fill, 1.0, 8, self._color((72, 145, 255, 255)))
     rl.draw_circle_v(rl.Vector2(rect.x + rect.width * ratio, rect.y + rect.height * 0.5), 8.0, self._color(self.TEXT))
     state = "PAUSED" if self.paused else f"{self.speed:.2g}x"
+    if self.review is not None:
+      lead_one_text, lead_one_lost = self._lead_continuity_text()
+      lead_two_text, lead_two_lost = self._lead_two_continuity_text()
+      text_y = plot_rect.y - 40.0 if plot_rect is not None else rect.y - 40.0
+      self._draw_text(lead_one_text, rect.x, text_y, 13, self._color(self.RED if lead_one_lost else self.GREEN))
+      self._draw_text(lead_two_text, rect.x, text_y + 17.0, 13, self._color(self.RED if lead_two_lost else self.PURPLE))
     self._draw_text(state, rect.x + rect.width - 85, rect.y - 23, 15, self._color(self.TEXT))
+    return rect
+
+  def _draw_lead_comparison_plot(self, width: int, timeline_y: float) -> Any:
+    rl = self.rl
+    rect = rl.Rectangle(24.0, timeline_y - 154.0, float(width - 48), 130.0)
+    rl.draw_rectangle_rec(rect, self._color((11, 15, 20, 255)))
+    rl.draw_rectangle_lines_ex(rect, 1.0, self._color(self.GRID))
+
+    legend = (
+      ("CURRENT RADARD L1", "radard_one", self.CYAN),
+      ("CURRENT RADARD L2", "radard_two", self.PURPLE),
+      ("MODEL L1", "model_one", self.ORANGE),
+      ("MODEL L2", "model_two", self.YELLOW),
+    )
+    legend_x = rect.x + 10.0
+    current = self.lead_comparison[self.index]
+    for label, field, color_value in legend:
+      value = getattr(current, field)
+      value_text = "--" if value is None else f"{value.d_rel:.0f}m"
+      item = f"{label} {value_text}"
+      rl.draw_line_ex(
+        rl.Vector2(legend_x, rect.y + 13.0), rl.Vector2(legend_x + 18.0, rect.y + 13.0),
+        3.0, self._color(color_value),
+      )
+      self._draw_text(item, legend_x + 24.0, rect.y + 5.0, 13, self._color(color_value))
+      legend_x += self._measure_text(item, 13) + 52.0
+
+    graph_top = rect.y + 29.0
+    graph_bottom = rect.y + rect.height - 9.0
+    graph_height = graph_bottom - graph_top
+    max_distance = 100.0
+    for distance in (0.0, 50.0, 100.0):
+      y = graph_bottom - graph_height * distance / max_distance
+      rl.draw_line_ex(rl.Vector2(rect.x + 38.0, y), rl.Vector2(rect.x + rect.width - 8.0, y), 1.0, self._color(self.GRID))
+      self._draw_text(f"{int(distance)}m", rect.x + 5.0, y - 7.0, 11, self._color(self.MUTED))
+
+    plot_left = rect.x + 38.0
+    plot_width = rect.width - 46.0
+    total_time = max(self.times[-1], 1e-3)
+    max_gap_s = 0.15
+    for _, field, color_value in legend:
+      previous: tuple[float, float, LeadPlotValue] | None = None
+      color = self._color(color_value)
+      for frame, values in zip(self.frames, self.lead_comparison, strict=True):
+        value = getattr(values, field)
+        if value is None:
+          previous = None
+          continue
+        x = plot_left + plot_width * min(max(frame.time_s / total_time, 0.0), 1.0)
+        y = graph_bottom - graph_height * min(value.d_rel, max_distance) / max_distance
+        if previous is not None:
+          previous_time, previous_x, previous_value = previous
+          if value.track_id == previous_value.track_id and frame.time_s - previous_time <= max_gap_s:
+            previous_y = graph_bottom - graph_height * min(previous_value.d_rel, max_distance) / max_distance
+            rl.draw_line_ex(rl.Vector2(previous_x, previous_y), rl.Vector2(x, y), 2.0, color)
+        previous = (frame.time_s, x, value)
+
+      value = getattr(current, field)
+      if value is not None:
+        x = plot_left + plot_width * min(max(self.times[self.index] / total_time, 0.0), 1.0)
+        y = graph_bottom - graph_height * min(value.d_rel, max_distance) / max_distance
+        rl.draw_circle_v(rl.Vector2(x, y), 4.0, color)
+
+    cursor_x = plot_left + plot_width * min(max(self.playback_time / total_time, 0.0), 1.0)
+    rl.draw_line_ex(
+      rl.Vector2(cursor_x, graph_top), rl.Vector2(cursor_x, graph_bottom), 1.5, self._color(self.TEXT),
+    )
     return rect
 
   def _save_labels(self) -> None:
@@ -1955,7 +2498,9 @@ class SimulatorUI:
         return
       if rl.check_collision_point_rec(mouse, timeline):
         self.paused = True
+        previous_index = self.index
         self.seek((mouse.x - timeline.x) / timeline.width * self.times[-1])
+        self._pause_for_review(previous_index, self.index)
       elif rl.check_collision_point_rec(mouse, map_rect):
         clicked = self._nearest_clicked_point(map_rect, frame, mouse)
         if clicked is not None:
@@ -1996,11 +2541,12 @@ class SimulatorUI:
         height = rl.get_screen_height()
         panel_width = min(510.0, max(430.0, width * 0.35))
         content_width = float(width) - panel_width - 30.0
-        content_height = float(height) - 65.0
+        content_height = float(height) - (250.0 if self.review is not None else 65.0)
         video_height = max(230.0, content_height * 0.57)
         video_rect = rl.Rectangle(12.0, 12.0, content_width, video_height)
         map_rect = rl.Rectangle(12.0, video_rect.y + video_rect.height + 8.0, content_width, content_height - video_height - 8.0)
-        panel_rect = rl.Rectangle(float(width) - panel_width - 10.0, 12.0, panel_width, float(height) - 65.0)
+        panel_height = content_height if self.review is not None else float(height) - 65.0
+        panel_rect = rl.Rectangle(float(width) - panel_width - 10.0, 12.0, panel_width, panel_height)
         frame = self.frames[self.index]
         selection = self.selector.select(frame, self.index)
 
@@ -2051,6 +2597,10 @@ def parse_args() -> argparse.Namespace:
     "--teacher-current-radard", action="store_true",
     help="use the pure-Python current-radard source port as selector and dataset teacher",
   )
+  parser.add_argument(
+    "--hybrid", action="store_true",
+    help="use independent vision-radar leadOne with model cut-in/external leadTwo",
+  )
   parser.add_argument("--validation-case", help="auto-review one case id from the maintained validation set")
   parser.add_argument("--validation-root", type=Path, default=Path(r"W:\routes"), help="validation route root")
   parser.add_argument("--validation-cases", type=Path, default=DEFAULT_VALIDATION_CASES)
@@ -2073,6 +2623,8 @@ def resolve_validation_case(
   review = ValidationReview(
     case_id=str(case["id"]), expected=str(case["expected"]), source=str(case["source"]),
     start_s=float(window[0]), end_s=float(window[1]), scene=str(case["scene"]),
+    target_track_ids=tuple(int(value) for value in case.get("target_track_ids", ())),
+    forbidden_lead_two_ids=tuple(int(value) for value in case.get("forbidden_lead_two_ids", ())),
   )
   return route_root / str(case["vehicle_folder"]) / Path(str(case["log"])), review
 
@@ -2080,8 +2632,8 @@ def resolve_validation_case(
 def print_summary(log_path: Path, frames: list[RadarFrame], selector: LeadSelector) -> None:
   print(f"log: {log_path}")
   print(f"frames: {len(frames)}  duration: {frames[-1].time_s:.2f}s  selector: {selector.name}")
-  if selector.name.startswith(("mlp:", "multitask:")):
-    multitask = selector.name.startswith("multitask:")
+  if selector.name.startswith(("mlp:", "multitask:", "hybrid:")):
+    multitask = selector.name.startswith(("multitask:", "hybrid:"))
     front_outputs = 0
     corner_outputs = 0
     external_outputs = 0
@@ -2152,10 +2704,16 @@ def main() -> int:
   frames = load_frames(args.rlog)
   if args.model is not None and not args.model.is_file():
     raise SystemExit(f"model file does not exist: {args.model}")
-  if args.model is not None and args.teacher_current_radard:
+  if args.model is not None and args.teacher_current_radard and not args.hybrid:
     raise SystemExit("--model and --teacher-current-radard cannot be used together")
   selector: LeadSelector
-  if args.model is not None:
+  radard_selector: LeadSelector | None = None
+  if args.hybrid:
+    args.model = args.model or DEFAULT_MULTITASK_MODEL
+    selector = MultitaskLeadSelector(
+      args.model, frames, include_scc=True, vision_match_primary=True,
+    )
+  elif args.model is not None:
     try:
       import numpy as np
       with np.load(args.model, allow_pickle=False) as model_data:
@@ -2171,6 +2729,9 @@ def main() -> int:
     selector = CurrentRadardTeacher(frames, current_cutin_track_ids(args.rlog, frames))
   else:
     selector = SimpleLeadSelector()
+  if review is not None and not isinstance(selector, CurrentRadardTeacher):
+    print("Recomputing current radard comparison ...", flush=True)
+    radard_selector = CurrentRadardTeacher(frames, current_cutin_track_ids(args.rlog, frames))
   label_path = args.labels or args.rlog.with_name(args.rlog.name + ".lead-labels.json")
   labels = ManualLabels.load(label_path, len(frames))
   print_summary(args.rlog, frames, selector)
@@ -2195,7 +2756,7 @@ def main() -> int:
   display_name = f"{args.rlog.parent.name}/{args.rlog.name}"
   SimulatorUI(
     frames, selector, display_name, labels, label_path, args.rlog, include_scc_fusion=args.fusion_scc,
-    review=review,
+    review=review, radard_selector=radard_selector,
   ).run(args.start, args.paused, args.screenshot)
   return 0
 

@@ -13,9 +13,16 @@ if TYPE_CHECKING:
 SCHEMA_VERSION = 1
 PUBLISH_HEARTBEAT_SECONDS = 0.5
 PUBLISH_COALESCE_SECONDS = 0.05
+MEDIA_REQUEST_POLL_SECONDS = 0.25
 MAX_AHEAD_LANES = 8
 MAX_LANE_VALUES = 16
 MAX_ROUTE_POINTS = 256
+WEB_BOOTSTRAP_KIND = "web_render"
+WEB_BOOTSTRAP_IMAGE_KIND = "web_image"
+
+
+def _is_web_media_stream(kind: str, name: str) -> bool:
+  return kind == "image" or (kind == "render" and name == "map_main")
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -134,6 +141,7 @@ def build_carrot_navi_payload(snapshot: dict[str, Any], publish_mono_ns: int | N
   speed_record = _record(snapshot, "speed")
   speed = _dict(speed_record.get("value")) if speed_record.get("present") else {}
   sdi = _dict(speed.get("sdi"))
+  secondary_sdi = _dict(speed.get("sdi_secondary"))
   section = _dict(speed.get("section"))
   road_limit_valid = speed.get("road_limit_kph") is not None
 
@@ -196,6 +204,18 @@ def build_carrot_navi_payload(snapshot: dict[str, Any], publish_mono_ns: int | N
       "sdiType": _integer(sdi.get("type"), default=-1, minimum=-1, maximum=100_000),
       "sdiDistanceM": _integer(sdi.get("distance_m"), minimum=0, maximum=2_000_000),
       "sdiSpeedLimitKph": _integer(sdi.get("speed_limit_kph"), minimum=0, maximum=300),
+      "sdiSectionType": _integer(sdi.get("section_type"), default=-1, minimum=-1, maximum=100_000),
+      "sdiBlockType": _integer(sdi.get("block_type"), default=-1, minimum=-1, maximum=100_000),
+      "sdiBlockSpeedKph": _integer(sdi.get("block_speed_kph"), minimum=0, maximum=300),
+      "sdiBlockDistanceM": _integer(sdi.get("block_distance_m"), minimum=0, maximum=2_000_000),
+      "secondarySdiPresent": bool(secondary_sdi),
+      "secondarySdiType": _integer(secondary_sdi.get("type"), default=-1, minimum=-1, maximum=100_000),
+      "secondarySdiDistanceM": _integer(secondary_sdi.get("distance_m"), minimum=0, maximum=2_000_000),
+      "secondarySdiSpeedLimitKph": _integer(secondary_sdi.get("speed_limit_kph"), minimum=0, maximum=300),
+      "secondarySdiSectionType": _integer(secondary_sdi.get("section_type"), default=-1, minimum=-1, maximum=100_000),
+      "secondarySdiBlockType": _integer(secondary_sdi.get("block_type"), default=-1, minimum=-1, maximum=100_000),
+      "secondarySdiBlockSpeedKph": _integer(secondary_sdi.get("block_speed_kph"), minimum=0, maximum=300),
+      "secondarySdiBlockDistanceM": _integer(secondary_sdi.get("block_distance_m"), minimum=0, maximum=2_000_000),
       "sectionPresent": bool(section),
       "sectionActive": bool(section.get("active", False)),
       "sectionSpeedLimitKph": _integer(section.get("speed_limit_kph"), minimum=0, maximum=300),
@@ -277,15 +297,25 @@ def build_carrot_navi_media_payload(record: Any, session_id: str) -> dict[str, A
 
 
 class CarrotNaviCerealPublisher:
-  def __init__(self, receiver: CarrotNaviReceiver, messaging_module: Any | None = None) -> None:
+  def __init__(self, receiver: CarrotNaviReceiver, messaging_module: Any | None = None,
+               params: Any | None = None) -> None:
     if messaging_module is None:
       import openpilot.cereal.messaging as messaging_module
 
     self.receiver = receiver
     self.messaging = messaging_module
     self.pm = messaging_module.PubMaster(["carrotNavi", "carrotNaviMedia"])
+    if params is None:
+      try:
+        from openpilot.common.params import Params
+        params = Params()
+      except Exception:
+        params = None
+    self.params = params
     self._stop = threading.Event()
     self._thread: threading.Thread | None = None
+    self._media_request = ""
+    self._next_media_request_poll = 0.0
 
   def start(self) -> None:
     if self._thread is not None:
@@ -309,11 +339,28 @@ class CarrotNaviCerealPublisher:
     self.receiver.record_cereal_publish()
     return _integer(snapshot.get("generation"), minimum=0)
 
-  def publish_media(self, record: Any, session_id: str) -> None:
+  def publish_media(self, record: Any, session_id: str, kind_override: str | None = None) -> None:
     message = self.messaging.new_message("carrotNaviMedia", valid=True)
-    message.carrotNaviMedia = build_carrot_navi_media_payload(record, session_id)
+    payload = build_carrot_navi_media_payload(record, session_id)
+    if kind_override is not None:
+      payload["kind"] = kind_override
+    message.carrotNaviMedia = payload
     self.pm.send("carrotNaviMedia", message)
     self.receiver.record_cereal_publish()
+
+  def _media_web_request(self) -> str:
+    now = time.monotonic()
+    if now < self._next_media_request_poll:
+      return self._media_request
+    self._next_media_request_poll = now + MEDIA_REQUEST_POLL_SECONDS
+    try:
+      value = self.params.get("CarrotNaviWebBootstrapRequest") if self.params is not None else None
+      if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+      self._media_request = str(value or "")
+    except Exception:
+      pass
+    return self._media_request
 
   def _run(self) -> None:
     last_generation = -1
@@ -331,6 +378,19 @@ class CarrotNaviCerealPublisher:
       snapshot = self.receiver.cereal_snapshot()
       media_updates = self.receiver.drain_media_updates()
       try:
+        media_request_before = self._media_request
+        media_request = self._media_web_request()
+        if media_request and media_request != media_request_before:
+          bootstrap = [
+            record for record in self.receiver.media_bootstrap()
+            if _is_web_media_stream(record.kind, record.name)
+          ]
+          media_update_ids = {(record.kind, record.name, record.sequence) for record in media_updates}
+          for record in bootstrap:
+            if (record.kind, record.name, record.sequence) in media_update_ids:
+              continue
+            kind_override = WEB_BOOTSTRAP_IMAGE_KIND if record.kind == "image" else WEB_BOOTSTRAP_KIND
+            self.publish_media(record, str(snapshot.get("session_id", "")), kind_override=kind_override)
         for record in media_updates:
           self.publish_media(record, str(snapshot.get("session_id", "")))
       except Exception as exc:

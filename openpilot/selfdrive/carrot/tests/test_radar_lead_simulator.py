@@ -18,11 +18,14 @@ from openpilot.selfdrive.carrot.radar_lead_simulator import (
   SimpleLeadSelector,
   Selection,
   ValidationReview,
+  aligned_video_time_s,
   candidate_track_id,
   comparison_summary,
+  lead_comparison_series,
   _copy_track_points,
   _route_replay_module,
   export_training_dataset,
+  qcamera_path_for_log,
   resolve_validation_case,
   resolved_recorded_track_id,
   validation_review_events,
@@ -74,8 +77,8 @@ def test_simple_selector_matches_model_lead() -> None:
   assert candidate_track_id(selected.lead_one) == 10
 
 
-def test_validation_review_stops_once_per_cutin_track_across_full_route() -> None:
-  frames = [replace(frame(()), mono_time_s=float(index), time_s=float(index)) for index in range(6)]
+def test_validation_review_rearms_cutin_track_after_it_clears() -> None:
+  frames = [replace(frame(()), mono_time_s=float(index), time_s=float(index), model_leads=()) for index in range(6)]
   lead_one = Candidate(10, 0.9, "MLP active lead")
   lead_two = Candidate(20, 0.9, "MLP active cutin")
   selections = (
@@ -91,19 +94,120 @@ def test_validation_review_stops_once_per_cutin_track_across_full_route() -> Non
     def select(self, _frame, frame_index=None):
       return selections[int(frame_index)]
 
-  review = ValidationReview("case", "detect", "corner", 40.0, 50.0, "scene")
+  review = ValidationReview("case", "detect", "corner", 0.0, 5.0, "scene")
 
   assert validation_review_events(frames, Selector(), review) == {
     2: ("CUT-IN id 20",),
+    5: ("CUT-IN id 20",),
   }
 
 
+def test_validation_review_covers_full_log_outside_labeled_window() -> None:
+  frames = [replace(frame(()), mono_time_s=float(index), time_s=float(index), model_leads=()) for index in range(6)]
+  cutin = Candidate(59, 0.9, "MLP active cutin")
+
+  class Selector:
+    def select(self, _frame, frame_index=None):
+      if int(frame_index) >= 4:
+        return Selection(None, cutin, active_cutin_candidates=(cutin,))
+      return Selection(None, None)
+
+  review = ValidationReview("early", "detect", "corner", 0.0, 2.0, "scene")
+  assert validation_review_events(frames, Selector(), review) == {
+    4: ("CUT-IN id 59",),
+  }
+
+
+def test_validation_review_does_not_rearm_low_probability_sticky_cutin() -> None:
+  frames = [replace(frame(()), mono_time_s=float(index), time_s=float(index), model_leads=()) for index in range(3)]
+  sticky = Candidate(59, 0.01, "MLP active cutin")
+
+  class Selector:
+    def select(self, _frame, frame_index=None):
+      return Selection(None, sticky, active_cutin_candidates=(sticky,)) if int(frame_index) == 1 else Selection(None, None)
+
+  review = ValidationReview("full", "detect", "corner", 0.0, 2.0, "scene")
+  assert validation_review_events(frames, Selector(), review) == {}
+
+
 def test_validation_review_without_cutin_has_no_pause_events() -> None:
-  frames = [replace(frame(()), mono_time_s=float(index), time_s=float(index)) for index in range(3)]
+  frames = [replace(frame(()), mono_time_s=float(index), time_s=float(index), model_leads=()) for index in range(3)]
 
   class Selector:
     def select(self, _frame, frame_index=None):
       return Selection(None, None)
+
+  review = ValidationReview("clear", "clear", "corner", 0.0, 2.0, "scene")
+  assert validation_review_events(frames, Selector(), review) == {}
+
+
+def test_validation_review_pauses_on_forbidden_lead_two() -> None:
+  frames = [replace(frame(()), mono_time_s=float(index), time_s=float(index), model_leads=()) for index in range(4)]
+  false_lead = Candidate(40, 0.9, "MLP active stealth")
+
+  class Selector:
+    def select(self, _frame, frame_index=None):
+      return Selection(None, false_lead) if int(frame_index) in (1, 2) else Selection(None, None)
+
+  review = ValidationReview("tunnel", "clear", "front", 0.0, 3.0, "scene", forbidden_lead_two_ids=(40,))
+  assert validation_review_events(frames, Selector(), review) == {
+    1: ("FALSE leadTwo id 40",),
+  }
+
+
+def test_cutin_review_does_not_pause_for_lead_continuity_diagnostics() -> None:
+  frames = [replace(frame(()), mono_time_s=float(index), time_s=float(index)) for index in range(3)]
+  selections = (
+    Selection(Candidate(43, 1.0, "vision-radar Laplacian match"), None),
+    Selection(None, None),
+    Selection(Candidate(43, 1.0, "vision-radar Laplacian match"), None),
+  )
+
+  class Selector:
+    def select(self, _frame, frame_index=None):
+      return selections[int(frame_index)]
+
+  review = ValidationReview("early", "detect", "corner", 0.0, 2.0, "scene")
+  assert validation_review_events(frames, Selector(), review) == {}
+
+
+def test_stationary_review_pauses_on_selected_target_track() -> None:
+  frames = [
+    replace(frame((point(35, 108.0, 0.1, 0.0),)), mono_time_s=float(index), time_s=float(index))
+    for index in range(3)
+  ]
+
+  class Selector:
+    def select(self, _frame, frame_index=None):
+      if frame_index == 0:
+        return Selection(None, Candidate(35, 0.9, "MLP active stealth"))
+      return Selection(Candidate(35, 0.9, "vision-radar Laplacian match"), None)
+
+  review = ValidationReview("stopped", "stationary", "front", 0.0, 2.0, "scene", (35,))
+  assert validation_review_events(frames, Selector(), review) == {
+    0: ("STATIONARY leadTwo id 35 108m",),
+  }
+
+
+def test_all_rlog_variants_use_primary_qcamera() -> None:
+  assert qcamera_path_for_log(Path("route/rlog.1.zst")) == Path("route/qcamera.ts")
+  assert qcamera_path_for_log(Path("route/rlog.zst")) == Path("route/qcamera.ts")
+
+
+def test_video_time_aligns_model_frame_to_qcamera_start() -> None:
+  assert aligned_video_time_s(1_000_000_000, 6_800_000_000) == 5.8
+  assert aligned_video_time_s(0, 6_800_000_000) is None
+  assert aligned_video_time_s(7_000_000_000, 6_800_000_000) is None
+
+
+def test_validation_review_ignores_internal_cutin_on_current_lead_one() -> None:
+  frames = [replace(frame(()), mono_time_s=float(index), time_s=float(index)) for index in range(2)]
+  lead_one = Candidate(10, 0.9, "MLP active lead")
+  internal_cutin = Candidate(10, 0.9, "MLP active cutin")
+
+  class Selector:
+    def select(self, _frame, frame_index=None):
+      return Selection(lead_one, None, active_cutin_candidates=(internal_cutin,))
 
   review = ValidationReview("clear", "clear", "corner", 0.0, 2.0, "scene")
   assert validation_review_events(frames, Selector(), review) == {}
@@ -153,6 +257,32 @@ def test_comparison_summary_counts_exact_radar_ids() -> None:
 
   assert summary["lead_one_matches"] == 1
   assert summary["lead_two_matches"] == 1
+
+
+def test_lead_comparison_series_contains_current_radard_and_model_distances() -> None:
+  sample = frame(
+    (point(10, 31.0, 0.2, 20.0), point(21, 18.0, 0.6, 18.0, "corner235")),
+    RecordedLead(True, True, 10, 30.5, 0.2, 0.0, 20.0, 0.0, 0.9, 1.0),
+    RecordedLead(True, True, 22, 42.0, 0.4, 0.0, 18.0, 0.0, 0.8, 0.9),
+  )
+
+  class RadardSelector:
+    def select(self, _frame, frame_index=None):
+      return Selection(Candidate(21, 1.0, "current radard lead"), None)
+
+  class ModelSelector:
+    def select(self, _frame, frame_index=None):
+      return Selection(
+        Candidate(10, 1.0, "model lead", d_rel=30.8, y_rel=0.2),
+        Candidate(21, 0.9, "model cutin"),
+      )
+
+  values = lead_comparison_series([sample], RadardSelector(), ModelSelector())[0]
+
+  assert values.radard_one is not None and values.radard_one.d_rel == 18.0
+  assert values.radard_two is None
+  assert values.model_one is not None and values.model_one.d_rel == 30.8
+  assert values.model_two is not None and values.model_two.d_rel == 18.0
 
 
 def test_manual_labels_round_trip_and_training_export(tmp_path: Path) -> None:
@@ -357,6 +487,13 @@ def test_reconstructed_corner_tracks_fill_only_missing_groups() -> None:
   )
 
   assert [point.trackId for point in preferred] == [1000, 1001]
+
+  front = SimpleNamespace(trackId=42, radarSource="frontRadar")
+  raw_only = route_replay.merge_recorded_and_reconstructed_tracks(
+    (front, recorded), (), raw_corner_only=True,
+  )
+
+  assert [point.trackId for point in raw_only] == [42]
 
 
 def test_route_parser_accepts_explicit_front_cutin_source() -> None:

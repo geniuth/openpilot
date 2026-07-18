@@ -1,5 +1,8 @@
 import ctypes
+from collections import OrderedDict, deque
+from dataclasses import replace
 import importlib
+import os
 from pathlib import Path
 import queue
 import sys
@@ -13,6 +16,8 @@ sys.path.insert(0, str(CLUSTER_DIR))
 
 from cluster_git_status import GitBranchStatusProvider
 import cluster_gles_readback
+import cluster_h264_decoder
+from cluster_h264_decoder import TiciH264DecodedBuffer
 from cluster_h264_pipeline import (
   H264PipelineInitializationError,
   H264UsbPipeline,
@@ -20,6 +25,53 @@ from cluster_h264_pipeline import (
 )
 import cluster_renderer
 from cluster_renderer import ClusterUiRenderer
+
+
+def test_tici_decoded_buffer_releases_fd_and_capture_lease_once():
+  read_fd, write_fd = os.pipe()
+  owner = types.SimpleNamespace(generation=7, releases=[])
+  owner.release = owner.releases.append
+  owner.disable = lambda _reason: None
+  buffer = TiciH264DecodedBuffer(owner, 3, read_fd, 960, 540, 1024, 557056, 42)
+
+  buffer.release()
+  buffer.release()
+
+  assert owner.releases == [3]
+  with pytest.raises(OSError):
+    os.fstat(read_fd)
+  os.close(write_fd)
+
+
+def test_hardware_h264_decoder_factory_does_not_require_tici_marker(monkeypatch, tmp_path):
+  library_path = tmp_path / "libcluster_h264_decoder_bridge.so"
+  library_path.touch()
+  calls = []
+  original_is_file = Path.is_file
+
+  def reject_tici_marker_check(path):
+    assert str(path) != "/TICI"
+    return original_is_file(path)
+
+  monkeypatch.setenv("CLUSTER_HARDWARE_H264_DECODE", "1")
+  monkeypatch.setenv("CLUSTER_H264_DECODER_LIBRARY", str(library_path))
+  monkeypatch.setenv("CLUSTER_H264_DECODER_DEVICE", "/dev/test-vidc")
+  monkeypatch.setattr(Path, "is_file", reject_tici_marker_check)
+  monkeypatch.setattr(
+    cluster_h264_decoder,
+    "TiciH264Decoder",
+    lambda width, height, fps, **kwargs: calls.append((width, height, fps, kwargs)) or "decoder",
+  )
+
+  decoder = cluster_h264_decoder.create_tici_h264_decoder(960, 540, 30)
+
+  assert decoder == "decoder"
+  assert calls == [(960, 540, 30, {
+    "library_path": library_path,
+    "device_path": "/dev/test-vidc",
+    "timeout_ms": 250,
+    "debug": False,
+  })]
 
 
 def _import_cluster_autorun(monkeypatch):
@@ -155,6 +207,145 @@ def test_renderer_fonts_use_bilinear_filter_without_mipmaps(tmp_path, monkeypatc
   assert load_args[0][1:] == (160, None, 0)
   assert load_args[1][1] == cluster_renderer.KOREAN_FONT_BASE_SIZE
   assert load_args[1][3] == len(renderer._navi_font_codepoints())
+
+
+def test_stroked_text_texture_rasterizes_once_and_reuses_cached_draw(monkeypatch):
+  renderer = object.__new__(ClusterUiRenderer)
+  renderer._font = object()
+  renderer._korean_font = None
+  renderer._stroked_text_texture_cache = OrderedDict()
+  renderer._pending_stroked_text_textures = OrderedDict()
+  renderer._stroked_text_texture_cache_enabled = True
+  renderer._text_measure_cache = {}
+  renderer.profile_enabled = False
+  renderer._profile_samples = []
+  image = object()
+  texture = types.SimpleNamespace(id=7)
+  image_draws = []
+  texture_loads = []
+  texture_draws = []
+
+  monkeypatch.setattr(cluster_renderer, "rl_color", lambda color: color)
+  monkeypatch.setattr(cluster_renderer.rl, "measure_text_ex", lambda *_args: types.SimpleNamespace(x=50, y=20))
+  monkeypatch.setattr(cluster_renderer.rl, "gen_image_color", lambda *_args: image)
+  monkeypatch.setattr(
+    cluster_renderer.rl,
+    "image_draw_text_ex",
+    lambda *args: image_draws.append(args),
+  )
+  monkeypatch.setattr(
+    cluster_renderer.rl,
+    "load_texture_from_image",
+    lambda source: texture_loads.append(source) or texture,
+  )
+  monkeypatch.setattr(cluster_renderer.rl, "is_texture_valid", lambda _texture: True)
+  monkeypatch.setattr(cluster_renderer.rl, "set_texture_filter", lambda *_args: None)
+  monkeypatch.setattr(cluster_renderer.rl, "unload_image", lambda *_args: None)
+  monkeypatch.setattr(
+    cluster_renderer.rl,
+    "draw_texture_pro",
+    lambda *args: texture_draws.append(args),
+  )
+
+  direct_draws = []
+  monkeypatch.setattr(renderer, "_draw_text", lambda *args: direct_draws.append(args))
+
+  renderer._draw_text_with_stroke("NAVI", 100, 50, 27, (0, 255, 0), (0, 0, 0), 2, cache=True)
+
+  assert len(direct_draws) == 9
+  assert image_draws == []
+  assert texture_loads == []
+  assert len(renderer._pending_stroked_text_textures) == 1
+
+  renderer._flush_pending_stroked_text_textures()
+  renderer._draw_text_with_stroke("NAVI", 100, 50, 27, (0, 255, 0), (0, 0, 0), 2, cache=True)
+
+  assert len(image_draws) == 9
+  assert texture_loads == [image]
+  assert len(texture_draws) == 1
+  assert len(renderer._stroked_text_texture_cache) == 1
+
+
+def test_fast_changing_stroked_text_can_bypass_texture_cache(monkeypatch):
+  renderer = object.__new__(ClusterUiRenderer)
+  renderer._stroked_text_texture_cache_enabled = True
+  direct_draws = []
+  monkeypatch.setattr(
+    renderer,
+    "_draw_text",
+    lambda *args: direct_draws.append(args),
+  )
+  monkeypatch.setattr(
+    renderer,
+    "_stroked_text_texture",
+    lambda *_args: pytest.fail("dynamic text must not create a cached texture"),
+  )
+
+  renderer._draw_text_with_stroke(
+    "+0.17",
+    100,
+    50,
+    17,
+    (255, 255, 255),
+    (0, 0, 0),
+    2,
+    cache=False,
+  )
+
+  assert len(direct_draws) == 9
+
+
+def test_raw_stroked_text_preserves_draw_order_positions_and_colors(monkeypatch):
+  renderer = object.__new__(ClusterUiRenderer)
+  renderer._raw_stroked_text_enabled = True
+  renderer._font = object()
+  renderer._korean_font = None
+  renderer._text_measure_cache = {}
+  calls = []
+
+  class Position:
+    def __init__(self, x, y):
+      self.x = x
+      self.y = y
+
+  def draw_text_ex(font, text, position, size, spacing, color):
+    calls.append((font, text, position.x, position.y, size, spacing, color))
+
+  renderer._raw_draw_text_ex = draw_text_ex
+  monkeypatch.setattr(cluster_renderer.rl, "Vector2", Position)
+  monkeypatch.setattr(cluster_renderer, "rl_color", lambda color: color)
+  monkeypatch.setattr(renderer, "_measure_text", lambda *_args: (40.0, 20.0))
+  monkeypatch.setattr(
+    renderer,
+    "_draw_text",
+    lambda *_args: pytest.fail("raw stroked-text path must bypass the pyray wrapper"),
+  )
+
+  renderer._draw_text_with_stroke(
+    "NAVI",
+    100.0,
+    50.0,
+    25.0,
+    (0, 255, 0),
+    (0, 0, 0),
+    2,
+    anchor="center",
+  )
+
+  assert [(call[2], call[3]) for call in calls] == [
+    (78.0, 40.0),
+    (82.0, 40.0),
+    (80.0, 38.0),
+    (80.0, 42.0),
+    (78.0, 38.0),
+    (82.0, 38.0),
+    (78.0, 42.0),
+    (82.0, 42.0),
+    (80.0, 40.0),
+  ]
+  assert [call[6] for call in calls] == [(0, 0, 0)] * 8 + [(0, 255, 0)]
+  assert all(call[1] == b"NAVI" for call in calls)
+  assert all(call[4:6] == (25.0, 1.0) for call in calls)
 
 
 def test_cluster_autorun_falls_back_only_for_h264_initialization(monkeypatch):
@@ -313,6 +504,158 @@ def test_renderer_rgba_upload_reuses_frame_buffer(monkeypatch):
   assert upload_calls == [(texture, void_pointer)]
 
 
+def test_renderer_yuv420_upload_reuses_plane_textures(monkeypatch):
+  renderer = object.__new__(ClusterUiRenderer)
+  renderer._navi_media_textures = {}
+  renderer.profile_enabled = False
+  renderer._profile_samples = []
+  created = []
+  filters = []
+  uploads = []
+  ffi_arrays = []
+
+  def load_texture(image):
+    texture = types.SimpleNamespace(id=len(created) + 1, width=image.width, height=image.height)
+    created.append(texture)
+    return texture
+
+  monkeypatch.setattr(
+    cluster_renderer.rl,
+    "Image",
+    lambda _data, width, height, _mips, _format: types.SimpleNamespace(width=width, height=height),
+  )
+  monkeypatch.setattr(cluster_renderer.rl, "load_texture_from_image", load_texture)
+  monkeypatch.setattr(cluster_renderer.rl, "is_texture_valid", lambda _texture: True)
+  monkeypatch.setattr(
+    cluster_renderer.rl,
+    "set_texture_filter",
+    lambda texture, texture_filter: filters.append((texture.id, texture_filter)),
+  )
+  monkeypatch.setattr(cluster_renderer.rl, "unload_texture", lambda *_args: None)
+  monkeypatch.setattr(
+    cluster_renderer.rl,
+    "ffi",
+    types.SimpleNamespace(
+      new=lambda _ctype, values: ffi_arrays.append(tuple(values)) or tuple(values),
+      from_buffer=lambda _ctype, data: data,
+      cast=lambda _ctype, pointer: pointer,
+    ),
+  )
+  monkeypatch.setattr(
+    cluster_renderer.rl,
+    "update_texture",
+    lambda texture, pixels: uploads.append((texture.id, pixels)),
+  )
+
+  first = cluster_renderer.NaviMediaFrame(
+    "render:map_main",
+    1,
+    True,
+    "image/yuv420p",
+    4,
+    2,
+    plane_data=(b"y" * 16, b"u" * 4, b"v" * 4),
+    plane_strides=(8, 4, 4),
+  )
+  second = replace(first, sequence=2, plane_data=(b"Y" * 16, b"U" * 4, b"V" * 4))
+
+  assert renderer._navi_media_texture_for(first) is created[0]
+  assert renderer._navi_media_texture_for(second) is created[0]
+  assert [(texture.width, texture.height) for texture in created] == [(8, 2), (4, 1), (4, 1)]
+  assert filters == [
+    (1, cluster_renderer.rl.TextureFilter.TEXTURE_FILTER_BILINEAR),
+    (2, cluster_renderer.rl.TextureFilter.TEXTURE_FILTER_POINT),
+    (3, cluster_renderer.rl.TextureFilter.TEXTURE_FILTER_POINT),
+  ]
+  assert [texture_id for texture_id, _pixels in uploads] == [1, 2, 3, 1, 2, 3]
+  assert ffi_arrays == [(1.0, 1.0), (1.0, 1.0)]
+  cached = renderer._navi_media_textures["render:map_main"]
+  assert cached.sequence == 2
+  assert cached.size == (4, 2)
+
+
+def test_renderer_binds_hardware_nv12_dmabuf_without_pixel_upload(monkeypatch):
+  renderer = object.__new__(ClusterUiRenderer)
+  renderer._navi_media_textures = {}
+  renderer._navi_egl_images = OrderedDict()
+  renderer._navi_external_shader = object()
+  renderer.profile_enabled = False
+  renderer._profile_samples = []
+  texture = types.SimpleNamespace(id=7, width=1, height=1)
+  image = object()
+  created_images = []
+  bindings = []
+  destroyed_images = []
+  failed = []
+
+  egl_module = types.ModuleType("openpilot.system.ui.lib.egl")
+  egl_module.init_egl = lambda: True
+  egl_module.create_egl_image = (
+    lambda width, height, stride, fd, uv_offset:
+      created_images.append((width, height, stride, fd, uv_offset)) or object()
+  )
+  egl_module.bind_egl_image_to_texture = lambda texture_id, egl_image: bindings.append((texture_id, egl_image))
+  egl_module.destroy_egl_image = destroyed_images.append
+  monkeypatch.setitem(sys.modules, "openpilot.system.ui.lib.egl", egl_module)
+  monkeypatch.setattr(cluster_renderer.rl, "gen_image_color", lambda *_args: image)
+  monkeypatch.setattr(cluster_renderer.rl, "load_texture_from_image", lambda _image: texture)
+  monkeypatch.setattr(cluster_renderer.rl, "unload_image", lambda _image: None)
+  monkeypatch.setattr(cluster_renderer.rl, "is_texture_valid", lambda _texture: True)
+  monkeypatch.setattr(cluster_renderer.rl, "set_texture_filter", lambda *_args: None)
+  monkeypatch.setattr(cluster_renderer.rl, "unload_texture", lambda *_args: None)
+
+  first_buffer = types.SimpleNamespace(
+    fd=31,
+    stride=1024,
+    uv_offset=557056,
+    token=(3, 0),
+    mark_egl_import_failed=lambda reason: failed.append(reason),
+  )
+  second_buffer = types.SimpleNamespace(
+    fd=32,
+    stride=1024,
+    uv_offset=557056,
+    token=(3, 1),
+    mark_egl_import_failed=lambda reason: failed.append(reason),
+  )
+  third_buffer = types.SimpleNamespace(
+    fd=33,
+    stride=1024,
+    uv_offset=557056,
+    token=(4, 0),
+    mark_egl_import_failed=lambda reason: failed.append(reason),
+  )
+  first = cluster_renderer.NaviMediaFrame(
+    "render:map_main", 1, True, "video/nv12-dmabuf", 960, 540, hardware_buffer=first_buffer
+  )
+  second = replace(first, sequence=2, hardware_buffer=second_buffer)
+  third = replace(first, sequence=3, hardware_buffer=third_buffer)
+
+  assert renderer._navi_media_texture_for(first) is texture
+  assert renderer._navi_media_texture_for(second) is texture
+  previous_generation_images = tuple(renderer._navi_egl_images.values())
+  assert renderer._navi_media_texture_for(third) is texture
+  assert created_images == [
+    (960, 540, 1024, 31, 557056),
+    (960, 540, 1024, 32, 557056),
+    (960, 540, 1024, 33, 557056),
+  ]
+  assert len(bindings) == 3
+  assert destroyed_images == list(previous_generation_images)
+  assert failed == []
+  assert renderer._navi_media_textures["render:map_main"].hardware_token == (4, 0)
+  assert (texture.width, texture.height) == (960, 540)
+
+  monkeypatch.setattr(cluster_renderer.rl, "begin_shader_mode", lambda _shader: None)
+  monkeypatch.setattr(cluster_renderer.rl, "draw_texture_pro", lambda *_args: None)
+  monkeypatch.setattr(cluster_renderer.rl, "end_shader_mode", lambda: None)
+  cached = renderer._navi_media_textures["render:map_main"]
+  rect = cluster_renderer.rl.Rectangle(0.0, 0.0, 960.0, 540.0)
+  renderer._draw_cached_navi_media(cached, rect, rect)
+  renderer._draw_cached_navi_media(cached, rect, rect)
+  assert bindings[-2:] == [(7, renderer._navi_egl_images[(4, 0)])] * 2
+
+
 def test_native_h264_direct_input_lease_submits_or_cancels():
   pipeline = _new_h264_pipeline()
   calls = []
@@ -354,6 +697,49 @@ def test_native_h264_direct_input_lease_submits_or_cancels():
 
   assert calls[-2:] == ["acquire", ("cancel", 3)]
   assert pipeline._native_frame_index == 1
+
+
+def test_native_h264_direct_input_lease_exposes_dmabuf_fd():
+  pipeline = _new_h264_pipeline()
+  calls = []
+
+  def acquire_dmabuf(_handle, address_out, size_out, index_out, fd_out, _callback, _opaque):
+    ctypes.cast(address_out, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(0x56780000)
+    ctypes.cast(size_out, ctypes.POINTER(ctypes.c_size_t))[0] = 16384
+    ctypes.cast(index_out, ctypes.POINTER(ctypes.c_uint32))[0] = 5
+    ctypes.cast(fd_out, ctypes.POINTER(ctypes.c_int))[0] = 42
+    calls.append("acquire_dmabuf")
+    return 0
+
+  def cancel(_handle, index):
+    calls.append(("cancel", index))
+    return 0
+
+  def submit_dmabuf(_handle, index, timestamp_us, _callback, _opaque):
+    calls.append(("submit_dmabuf", index, timestamp_us))
+    return 0
+
+  pipeline._native_lib = types.SimpleNamespace(
+    cluster_h264_encoder_bridge_acquire_nv12_input_dmabuf=acquire_dmabuf,
+    cluster_h264_encoder_bridge_submit_nv12_input_dmabuf=submit_dmabuf,
+    cluster_h264_encoder_bridge_cancel_nv12_input=cancel,
+  )
+  pipeline._native_handle = 1
+  pipeline._native_callback = object()
+  pipeline._native_has_direct_input = True
+  pipeline._native_has_dmabuf_input = True
+  pipeline._native_input_bytesused = 16384
+
+  with pipeline.native_nv12_input_buffer() as input_buffer:
+    assert (
+      input_buffer.address,
+      input_buffer.size,
+      input_buffer.index,
+      input_buffer.dmabuf_fd,
+    ) == (0x56780000, 16384, 5, 42)
+    pipeline.submit_native_nv12_dmabuf_input(input_buffer)
+
+  assert calls == ["acquire_dmabuf", ("submit_dmabuf", 5, 0)]
 
 
 def test_gles_direct_readback_restores_gl_state():
@@ -407,3 +793,89 @@ def test_gles_direct_readback_restores_gl_state():
     ("buffer", cluster_gles_readback.GL_PIXEL_PACK_BUFFER, 19),
     ("framebuffer", cluster_gles_readback.GL_FRAMEBUFFER, 17),
   ]
+
+
+def test_gles_async_readback_uses_nonblocking_fence_and_copies_ready_pbo():
+  calls = []
+  errors = iter((0, 0, 0, 0, 0, 0))
+  waits = iter((cluster_gles_readback.GL_TIMEOUT_EXPIRED, cluster_gles_readback.GL_ALREADY_SIGNALED))
+  source = (ctypes.c_ubyte * 16)(*range(16))
+  destination = (ctypes.c_ubyte * 16)()
+
+  class FakeGles:
+    def glGetIntegerv(self, name, value_out):
+      if name == cluster_gles_readback.GL_FRAMEBUFFER_BINDING:
+        value = 17
+      elif name == cluster_gles_readback.GL_PIXEL_PACK_BUFFER_BINDING:
+        value = 19
+      else:
+        value = 8
+      ctypes.cast(value_out, ctypes.POINTER(ctypes.c_int))[0] = value
+
+    def glGetError(self):
+      return next(errors)
+
+    def glGenBuffers(self, count, buffers):
+      for index in range(count):
+        buffers[index] = 31 + index
+
+    def glDeleteBuffers(self, count, buffers):
+      calls.append(("delete_buffers", tuple(buffers[index] for index in range(count))))
+
+    def glBindBuffer(self, target, buffer):
+      calls.append(("buffer", target, buffer))
+
+    def glBufferData(self, target, size, _data, usage):
+      calls.append(("allocate", target, size, usage))
+
+    def glBindFramebuffer(self, target, framebuffer):
+      calls.append(("framebuffer", target, framebuffer))
+
+    def glPixelStorei(self, name, value):
+      calls.append(("pack", name, value))
+
+    def glReadPixels(self, _x, _y, width, height, _format, _type, destination_pointer):
+      calls.append(("read_pbo", width, height, destination_pointer.value))
+
+    def glFenceSync(self, condition, flags):
+      calls.append(("fence", condition, flags))
+      return 0x1234
+
+    def glFlush(self):
+      calls.append(("flush",))
+
+    def glClientWaitSync(self, fence, flags, timeout):
+      calls.append(("wait", fence.value, flags, timeout))
+      return next(waits)
+
+    def glMapBufferRange(self, target, offset, length, access):
+      calls.append(("map", target, offset, length, access))
+      return ctypes.addressof(source)
+
+    def glUnmapBuffer(self, target):
+      calls.append(("unmap", target))
+      return True
+
+    def glDeleteSync(self, fence):
+      calls.append(("delete_fence", fence.value))
+
+  readback = object.__new__(cluster_gles_readback.GlesDirectReadback)
+  readback._gles = FakeGles()
+  readback._async_supported = True
+  readback._pbo_slots = []
+  readback._pbo_free = deque()
+  readback._pbo_pending = deque()
+  readback._pbo_byte_count = 0
+
+  assert readback.enqueue_rgba(23, 2, 2)
+  assert not readback.async_ready()
+  assert readback.copy_ready(ctypes.addressof(destination), ctypes.sizeof(destination))
+  assert bytes(destination) == bytes(source)
+  assert not readback.async_ready()
+  assert len(readback._pbo_free) == cluster_gles_readback.ASYNC_READBACK_RING_SIZE
+
+  readback.close()
+  assert ("read_pbo", 2, 2, None) in calls
+  assert ("map", cluster_gles_readback.GL_PIXEL_PACK_BUFFER, 0, 16, cluster_gles_readback.GL_MAP_READ_BIT) in calls
+  assert ("delete_fence", 0x1234) in calls
+  assert ("delete_buffers", (31, 32, 33)) in calls
