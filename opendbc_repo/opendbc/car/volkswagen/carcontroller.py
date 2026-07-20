@@ -170,8 +170,13 @@ class CarController(CarControllerBase):
       if self.frame % self.CCP.ACC_CONTROL_STEP == 0:
         if self.CP.flags & VolkswagenFlags.MEB:
           stopping = actuators.longControlState == LongCtrlState.stopping
-          starting = actuators.longControlState == LongCtrlState.starting and CS.out.vEgo <= self.CP.vEgoStarting
           accel = float(np.clip(actuators.accel, self.CCP.ACCEL_MIN, self.CCP.ACCEL_MAX) if CC.enabled else 0)
+          # 앞차를 따라 스르륵 정차하면 플래너가 완전정지(stopping)를 안 잡고 "pid"에 머무는데,
+          # 이때 차가 스스로 ESP 홀드를 걸면 기존 (lcs==starting) 조건으로는 ACC_Anfahren(출발요청)이
+          # 영영 안 나가 차가 홀드에 갇힌다(앞차 출발해도 안 감). 정차 잠금 중 openpilot이 가속하려
+          # 하면(accel>0) 출발요청을 내보내 잠금을 푼다. (HKG는 accel 직접명령이라 이 핸드셰이크가 없음)
+          starting = (actuators.longControlState == LongCtrlState.starting and CS.out.vEgo <= self.CP.vEgoStarting) \
+                     or (actuators.longControlState == LongCtrlState.pid and CS.esp_hold_confirmation and accel > 0.0)
 
           # override / disable ramp handling to avoid EPB error at low speed (infiniteCable2)
           long_override = CC.cruiseControl.override or CS.out.gasPressed

@@ -4,6 +4,21 @@
 
 ## 판정 완료 (더 파도 답이 안 바뀌는 것)
 
+### 앞차 출발했는데 안 감(정차잠금에 갇힘) — 수정함 (2026-07)
+
+실차 rlog(fc6a1528)로 확정. 앞차가 5m 앞에서 살살 기다 서면 플래너가 완전정지
+(shouldStop)를 안 잡고 롱컨 상태가 "pid"에 머문다. 이 상태에서 차가 스스로 ESP
+홀드(Motion_State==3)를 걸면, MEB의 `starting=(longControlState==starting)` 조건은
+"stopping"을 안 거쳐 영영 False → `ACC_Anfahren`(출발요청)이 안 나가 잠금이 안 풀린다.
+그래서 앞차가 출발해 openpilot이 가속을 2.5m/s²까지 명령해도 차는 홀드에 갇힌 채
+안 움직이고, 결국 운전자가 밟아야 출발. 로그에서 ACC_Anfahren=0 내내 확인.
+
+- if2도 MEB는 동일 구조(구멍 공유). HKG는 accel을 SCC에 직접 명령해 이 핸드셰이크가
+  없어 해당 없음.
+- 수정: carcontroller MEB `starting`에 "pid + esp_hold_confirmation + accel>0"를 OR로
+  추가 → 정차잠금 중 가속 의지가 있으면 출발요청을 내보내 잠금 해제. 정상 정차
+  (lcs=stopping 또는 accel≤0)에선 발동 안 함.
+
 ### 주행 중 기기 재부팅 → 시동 재점화까지 ACC 먹통 — 소프트웨어 해결 불가
 
 메커니즘 (코드로 확정):
