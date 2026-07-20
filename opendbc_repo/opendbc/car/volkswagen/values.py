@@ -186,6 +186,7 @@ class WMI(StrEnum):
 class VolkswagenSafetyFlags(IntFlag):
   LONG_CONTROL = 1
   ALT_CRC_VARIANT_1 = 2  # MEB GEN2(2024+) 신형 CRC (infiniteCable2 동일 비트)
+  DISABLE_RADAR = 4      # 카메라 하네스 롱컨: AEB/레이더 대체 메시지 tx 허용 (panda safety)
 
 
 class VolkswagenFlags(IntFlag):
@@ -199,6 +200,12 @@ class VolkswagenFlags(IntFlag):
   MEB = 16
   MEB_GEN2 = 128
   MQB_EVO = 256  # referenced by MEB longitudinal (mebcan); not set for ID.4 MK1
+  DISABLE_RADAR = 512  # 카메라 하네스 롱컨: 순정 레이더를 프로그래밍 세션에 가두고 openpilot이 대체 (미검증)
+
+
+# DISABLE_RADAR init 훅(interface.py)과 carstate 사이의 상태 공유:
+# 부팅 시 레이더 무력화 실패하면 error=True -> carstate가 radarDisableFailed로 올림
+RADAR_DISABLE_STATE: dict[str, bool] = {"error": False}
 
 
 @dataclass

@@ -2,7 +2,7 @@ from opendbc.can import CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.interfaces import CarStateBase
 from opendbc.car.common.conversions import Conversions as CV
-from opendbc.car.volkswagen.values import DBC, CANBUS, NetworkLocation, TransmissionType, GearShifter, \
+from opendbc.car.volkswagen.values import DBC, CANBUS, NetworkLocation, RADAR_DISABLE_STATE, TransmissionType, GearShifter, \
                                                       CarControllerParams, VolkswagenFlags
 
 ButtonType = structs.CarState.ButtonEvent.Type
@@ -257,6 +257,9 @@ class CarState(CarStateBase):
 
     ret.stockFcw = False
     ret.stockAeb = False
+
+    # DISABLE_RADAR: 부팅 시 레이더 무력화(interface.init)가 실패하면 롱컨 폴트를 유발하므로 표시
+    ret.radarDisableFailed = RADAR_DISABLE_STATE["error"] and bool(self.CP.flags & VolkswagenFlags.DISABLE_RADAR)
 
     self.acc_type = 2  # ACC stop and go
     self.eps_stock_values = pt_cp.vl["LH_EPS_03"]

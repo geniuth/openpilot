@@ -320,3 +320,40 @@ def create_acc_hud_control(packer, bus, acc_control, set_speed, lead_visible, di
   }
   # carrot DBC names this message MEB_ACC_01 (== infiniteCable2 ACC_19, BO_ 768)
   return packer.make_can_msg("MEB_ACC_01", bus, values)
+
+
+# **** DISABLE_RADAR (카메라 하네스 롱컨) 레이더 대체 메시지 ****
+# 순정 레이더를 프로그래밍 세션에 가둔 뒤, openpilot이 아래 3종을 대신 송신해
+# EPS/ACC ECU가 레이더 소실로 폴트나지 않게 한다. 순정 AEB/FCW/EA는 비활성됨.
+# (infiniteCable2 실코드 이식 - 미검증, 카메라 하네스 테스터 필요)
+
+def create_aeb_control(packer, bus):
+  # 비활성 상태의 AWV_03 대체본 (MEB Gen1/Gen2 공통 상수값)
+  values = {
+    "SET_ME_126":         126,
+    "SET_ME_30":          30,
+    "Timer_SET_ME_254":   254,
+    "Speed_SET_ME_254":   254,
+    "Accel_SET_ME_1023":  1023,
+    "Timer_2_SET_ME_255": 255,
+    "Timer_3_SET_ME_126": 126,
+    "SET_ME_15":          15,
+    "SET_ME_2":           2,
+  }
+  return packer.make_can_msg("AWV_03", bus, values)
+
+
+def create_aeb_hud(packer, bus, disabled):
+  values = {
+    "AWV_Enabled":  not disabled,  # AEB 비활성 표시
+    "AWV_Init":     1,             # 미초기화(흰색 아이콘) 표시
+    "SET_ME_1":     1,
+    "SET_ME_511":   511,
+  }
+  return packer.make_can_msg("MEB_AWV_01", bus, values)
+
+
+def create_radar_objects(packer, bus):
+  # 빈 더미 레이더 오브젝트 (Strukturen_01)
+  values = {}
+  return packer.make_can_msg("Strukturen_01", bus, values)

@@ -13,16 +13,22 @@
 #define MSG_TA_01            0x26B   // TX by OP (long), Travel Assist status (8B)
 #define MSG_KLR_01           0x25D   // TX by OP, capacitive steering wheel touch (EA hands-on pacify, 8B)
 #define MSG_EA_02            0x1F0   // TX by OP, Emergency Assist HUD relay (steering-wheel icon, 8B)
+#define MSG_AWV_03           0x0DB       // TX by OP (DISABLE_RADAR), radar AEB control replacement (48B)
+#define MSG_MEB_AWV_01       0x16A954ADU // TX by OP (DISABLE_RADAR), radar AEB HUD replacement (ext ID, 8B)
+#define MSG_STRUKTUREN_01    0x24F       // TX by OP (DISABLE_RADAR), empty radar objects replacement (64B)
+#define MSG_DIAGNOSTIC       0x700       // TX by OP (DISABLE_RADAR), Tester Present to keep radar programming session
 
 // Note: MSG_LH_EPS_03 (0x09F), MSG_GRA_ACC_01 (0x12B), MSG_MOTOR_14 (0x3BE),
 //       MSG_LDW_02 (0x397) are shared with MQB (defined in safety_volkswagen_common.h)
 
 #define FLAG_VOLKSWAGEN_LONG_CONTROL 1       // matches VolkswagenSafetyFlags.LONG_CONTROL
 #define FLAG_VOLKSWAGEN_ALT_CRC_VARIANT_1 2  // matches VolkswagenSafetyFlags.ALT_CRC_VARIANT_1 (MEB GEN2, 2024+)
+#define FLAG_VOLKSWAGEN_DISABLE_RADAR 4      // matches VolkswagenSafetyFlags.DISABLE_RADAR (camera-harness long)
 
 static bool volkswagen_meb_brake_pedal_switch = false;
 static bool volkswagen_meb_longitudinal = false;
 static bool volkswagen_meb_gen2 = false;  // GEN2(ID.4 MK2 등): ESC_51=64B, Motor_51=48B (신호 오프셋은 동일)
+static bool volkswagen_meb_disable_radar = false;  // 카메라 하네스 롱컨: AEB/레이더 대체 메시지 송신 허용
 
 
 static safety_config volkswagen_meb_init(uint16_t param) {
@@ -56,6 +62,26 @@ static safety_config volkswagen_meb_init(uint16_t param) {
     {MSG_EA_02, 0, 8},        // Emergency Assist HUD relay (steering-wheel icon)
   };
 
+  // DISABLE_RADAR(카메라 하네스 롱컨): 롱컨 tx + 레이더 대체 메시지 4종.
+  // 순정 레이더를 프로그래밍 세션에 가둔 뒤 openpilot이 AEB/레이더/진단 메시지를 대신 송신.
+  static const CanMsg VOLKSWAGEN_MEB_LONG_RADAR_DISABLE_TX_MSGS[] = {
+    {MSG_HCA_03, 0, 24},
+    {MSG_GRA_ACC_01, 0, 8},
+    {MSG_GRA_ACC_01, 2, 8},
+    {MSG_LDW_02, 0, 8},
+    {MSG_LH_EPS_03, 2, 8},
+    {MSG_ACC_18, 0, 32},
+    {MSG_ACC_19, 0, 48},
+    {MSG_TA_01, 0, 8},
+    {MSG_KLR_01, 0, 8},
+    {MSG_KLR_01, 2, 8},
+    {MSG_EA_02, 0, 8},
+    {MSG_AWV_03, 0, 48},          // AEB control replacement
+    {MSG_MEB_AWV_01, 0, 8},       // AEB HUD replacement (extended ID)
+    {MSG_STRUKTUREN_01, 0, 64},   // empty radar objects replacement
+    {MSG_DIAGNOSTIC, 0, 8},       // Tester Present to keep radar programming session
+  };
+
   // 크기는 vw_meb.dbc 실제 길이와 일치해야 함 (ESC_51=48, QFK_01/Motor_51=32 CAN-FD).
   // CRC lut는 LH_EPS_03/GRA_ACC_01만 커버 → 나머지는 checksum/counter 무시(bring-up).
   static RxCheck volkswagen_meb_rx_checks[] = {
@@ -79,6 +105,7 @@ static safety_config volkswagen_meb_init(uint16_t param) {
 
   volkswagen_meb_longitudinal = GET_FLAG(param, FLAG_VOLKSWAGEN_LONG_CONTROL);
   volkswagen_meb_gen2 = GET_FLAG(param, FLAG_VOLKSWAGEN_ALT_CRC_VARIANT_1);
+  volkswagen_meb_disable_radar = GET_FLAG(param, FLAG_VOLKSWAGEN_DISABLE_RADAR);
 
   volkswagen_set_button_prev = false;
   volkswagen_resume_button_prev = false;
@@ -86,10 +113,16 @@ static safety_config volkswagen_meb_init(uint16_t param) {
 
   gen_crc_lookup_table_8(0x2F, volkswagen_crc8_lut_8h2f);
   if (volkswagen_meb_gen2) {
+    if (volkswagen_meb_longitudinal && volkswagen_meb_disable_radar) {
+      return BUILD_SAFETY_CFG(volkswagen_meb_gen2_rx_checks, VOLKSWAGEN_MEB_LONG_RADAR_DISABLE_TX_MSGS);
+    }
     if (volkswagen_meb_longitudinal) {
       return BUILD_SAFETY_CFG(volkswagen_meb_gen2_rx_checks, VOLKSWAGEN_MEB_LONG_TX_MSGS);
     }
     return BUILD_SAFETY_CFG(volkswagen_meb_gen2_rx_checks, VOLKSWAGEN_MEB_STOCK_TX_MSGS);
+  }
+  if (volkswagen_meb_longitudinal && volkswagen_meb_disable_radar) {
+    return BUILD_SAFETY_CFG(volkswagen_meb_rx_checks, VOLKSWAGEN_MEB_LONG_RADAR_DISABLE_TX_MSGS);
   }
   if (volkswagen_meb_longitudinal) {
     return BUILD_SAFETY_CFG(volkswagen_meb_rx_checks, VOLKSWAGEN_MEB_LONG_TX_MSGS);

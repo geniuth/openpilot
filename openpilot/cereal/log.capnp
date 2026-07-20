@@ -158,6 +158,8 @@ struct OnroadEvent @0xc4fa6047f024e718 {
 
     torqueNNLoad @118;
 
+    radarDisableFailed @123;  # VW MEB DISABLE_RADAR: stock radar knockout failed
+
     soundsUnavailableDEPRECATED @47;
   }
 }
