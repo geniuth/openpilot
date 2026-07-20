@@ -12,6 +12,10 @@ window.CarrotVisionCompact = (() => {
     "modelV2", "liveCalibration", "roadCameraState", "lateralPlan",
     "radarState", "carControl", "liveDelay", "liveTorqueParameters", "liveParameters",
   ];
+  // Kept out of OVERLAY_SERVICES so the always-on overlay group does not pay
+  // for a full radar track list. Decoded frames still land in the overlay
+  // state; only the subscription is opt-in via the "tracks" activity channel.
+  const TRACK_SERVICES = ["liveTracks"];
 
   const xyz = [
     ["x", "u16cmlist"],
@@ -19,9 +23,18 @@ window.CarrotVisionCompact = (() => {
     ["z", "i16mmlist"],
   ];
   const velocity = [["x", "i16cmlist"]];
+  // y/v arrive as single-sample lists (see MODEL_LEAD_SCHEMA); the wire shape
+  // is identical to any other f32 list, so "f32list" reads them unchanged.
   const modelLead = [
     ["prob", "f32"],
     ["x", "u16cmlist"],
+    ["y", "f32list"],
+    ["v", "f32list"],
+  ];
+  const radarPoint = [
+    ["trackId", "u32"], ["dRel", "f32"], ["yRel", "f32"], ["vRel", "f32"],
+    ["measured", "bool"],
+    ["radarSource", "enumname", ["frontRadar", "scc", "corner235", "corner180"]],
   ];
   const radarLead = [
     ["dRel", "f32"], ["yRel", "f32"], ["vRel", "f32"], ["aRel", "f32"],
@@ -29,6 +42,9 @@ window.CarrotVisionCompact = (() => {
     ["vLeadK", "f32"], ["aLeadK", "f32"], ["fcw", "bool"], ["status", "bool"],
     ["aLeadTau", "f32"], ["modelProb", "f32"], ["radar", "bool"],
     ["radarTrackId", "i32"], ["jLead", "f32"], ["score", "f32"],
+  ];
+  const tpms = [
+    ["fl", "f32"], ["fr", "f32"], ["rl", "f32"], ["rr", "f32"],
   ];
 
   const schemas = new Map([
@@ -39,6 +55,8 @@ window.CarrotVisionCompact = (() => {
       ["brakeLights", "bool"], ["leftBlindspot", "bool"], ["rightBlindspot", "bool"],
       ["leftLaneLine", "i16"], ["rightLaneLine", "i16"],
       ["gearShifter", "enumname", ["unknown", "park", "drive", "neutral", "reverse", "sport", "low", "brake", "eco", "manumatic"]],
+      ["leftBlinker", "bool"], ["rightBlinker", "bool"],
+      ["fuelGauge", "f32"], ["ureaGauge", "f32"], ["tpms", "struct", tpms],
     ]]],
     [2, ["controlsState", [
       ["enabled", "bool"], ["vCruiseCluster", "f32"], ["activeLaneLine", "bool"],
@@ -98,6 +116,8 @@ window.CarrotVisionCompact = (() => {
       ["leadRight", "struct", radarLead], ["leadLeft", "struct", radarLead],
       ["leadsLeft", "structlist", radarLead], ["leadsCenter", "structlist", radarLead],
       ["leadsRight", "structlist", radarLead],
+      ["leadsLeft2", "structlist", radarLead], ["leadsRight2", "structlist", radarLead],
+      ["leadsCutIn", "structlist", radarLead],
     ]]],
     [14, ["carControl", [
       ["latActive", "bool"], ["longActive", "bool"],
@@ -111,6 +131,7 @@ window.CarrotVisionCompact = (() => {
       ["frictionCoefficientFiltered", "f32"], ["calPerc", "i8"],
     ]]],
     [17, ["liveParameters", [["angleOffsetDeg", "f32"], ["steerRatio", "f32"]]]],
+    [18, ["liveTracks", [["points", "structlist", radarPoint]]]],
   ]);
 
   class Cursor {
@@ -269,5 +290,5 @@ window.CarrotVisionCompact = (() => {
     }));
   }
 
-  return { HUD_SERVICES, OVERLAY_SERVICES, decodeFrame, decodeFrames, catalog };
+  return { HUD_SERVICES, OVERLAY_SERVICES, TRACK_SERVICES, decodeFrame, decodeFrames, catalog };
 })();

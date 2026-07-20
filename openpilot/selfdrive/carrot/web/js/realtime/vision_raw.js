@@ -14,7 +14,21 @@ const RAW_OVERLAY_STATE = Object.create(null);
 window.CarrotOverlayState = RAW_OVERLAY_STATE;
 const RAW_STATE_UPDATED_AT = Object.create(null);
 window.CarrotStateUpdatedAt = RAW_STATE_UPDATED_AT;
-const RAW_OVERLAY_HUD_ONLY_SERVICES = new Set(["roadCameraState", "liveDelay", "liveTorqueParameters", "liveParameters"]);
+const RAW_STATE_RECEIVED_AT_MONOTONIC = Object.create(null);
+window.CarrotStateReceivedAtMonotonic = RAW_STATE_RECEIVED_AT_MONOTONIC;
+// Subscribed only while something holds a "tracks" lease, but stored and
+// routed exactly like an overlay service once it arrives.
+const RAW_TRACK_SERVICES = window.CarrotVisionCompact?.TRACK_SERVICES || [];
+const RAW_OVERLAY_HUD_ONLY_SERVICES = new Set([
+  "roadCameraState", "liveDelay", "liveTorqueParameters", "liveParameters",
+  // Drive Insights reads this through the live state provider; the camera
+  // overlay never draws it, so it must not force an overlay repaint.
+  "liveTracks",
+]);
+
+function isOverlayStateService(service) {
+  return RAW_OVERLAY_SERVICES.includes(service) || RAW_TRACK_SERVICES.includes(service);
+}
 const COMPACT_STATE_MODE = "carrot-state-v1";
 let COMPACT_OVERLAY_WS = null;
 let COMPACT_OVERLAY_RETRY_T = null;
@@ -124,8 +138,12 @@ function compactStateActive() {
 
 function compactDesiredServices() {
   const services = [];
-  if (shouldRunCarrotHudRealtime()) services.push(...RAW_HUD_SERVICES);
-  if (COMPACT_OVERLAY_REQUESTED && shouldRunCarrotVisionRealtime()) services.push(...RAW_OVERLAY_SERVICES);
+  if (shouldRunCarrotHudData()) services.push(...RAW_HUD_SERVICES);
+  if (
+    (COMPACT_OVERLAY_REQUESTED && shouldRunCarrotVisionRealtime())
+    || isCarrotDriveDataRequested("overlay")
+  ) services.push(...RAW_OVERLAY_SERVICES);
+  if (isCarrotDriveDataRequested("tracks")) services.push(...RAW_TRACK_SERVICES);
   return Array.from(new Set(services));
 }
 
@@ -156,7 +174,7 @@ function applyCompactFrame(service, decoded, options = {}) {
     hudDirty = true;
     applied = true;
   }
-  if (RAW_OVERLAY_SERVICES.includes(service)) {
+  if (isOverlayStateService(service)) {
     if (service === "modelV2") rememberModelFrame(decoded);
     RAW_OVERLAY_STATE[service] = decoded;
     window.CarrotOverlayState = RAW_OVERLAY_STATE;
@@ -165,6 +183,15 @@ function applyCompactFrame(service, decoded, options = {}) {
     }
     overlayDirty = !RAW_OVERLAY_HUD_ONLY_SERVICES.has(service);
     applied = true;
+  }
+  if (applied) {
+    try {
+      const providerSnapshot = window.CarrotDriveLiveStateProvider?.noteServiceReceived?.(service);
+      const receivedAt = Number(providerSnapshot?.receivedAtMonotonic?.[service]);
+      if (Number.isFinite(receivedAt)) RAW_STATE_RECEIVED_AT_MONOTONIC[service] = receivedAt;
+    } catch (error) {
+      console.warn("[compact state] provider receipt rejected", error);
+    }
   }
   if (applied && options.render !== false) {
     emitCarrotRenderRequest({
@@ -185,7 +212,7 @@ function applyCompactFrames(frames, options = {}) {
   for (const frame of list) {
     const service = frame?.service;
     const isHud = RAW_HUD_SERVICES.includes(service);
-    const isOverlay = RAW_OVERLAY_SERVICES.includes(service);
+    const isOverlay = isOverlayStateService(service);
     if (!isHud && !isOverlay) continue;
     if (!applyCompactFrame(service, frame.decoded, {
       render: false,
@@ -198,7 +225,14 @@ function applyCompactFrames(frames, options = {}) {
     overlayDirty = overlayDirty || (isOverlay && !RAW_OVERLAY_HUD_ONLY_SERVICES.has(service));
   }
 
-  if (hudReady) _hudMarkDirty();
+  if (hudReady) {
+    if (options.flushHud === true) {
+      _hudRenderDirty = false;
+      drivingHudUpdateFromRawState();
+    } else {
+      _hudMarkDirty();
+    }
+  }
   if (hudReady || overlayReady) {
     setCarrotVisionState({
       raw: {
@@ -217,6 +251,12 @@ function clearCompactState(options = {}) {
   for (const key of Object.keys(RAW_HUD_STATE)) delete RAW_HUD_STATE[key];
   for (const key of Object.keys(RAW_OVERLAY_STATE)) delete RAW_OVERLAY_STATE[key];
   for (const key of Object.keys(RAW_STATE_UPDATED_AT)) delete RAW_STATE_UPDATED_AT[key];
+  for (const key of Object.keys(RAW_STATE_RECEIVED_AT_MONOTONIC)) delete RAW_STATE_RECEIVED_AT_MONOTONIC[key];
+  try {
+    window.CarrotDriveLiveStateProvider?.noteServiceReceived?.("*", { clear: true });
+  } catch (error) {
+    console.warn("[compact state] provider clear rejected", error);
+  }
   LAST_HUD_PAYLOAD_SIGNATURE = "";
   resetFrameSynchronization();
   setCarrotVisionState({ raw: { hud: "idle", overlay: "idle" } }, {
@@ -251,6 +291,16 @@ function drivingHudUpdateFromCarPayload(j) {
     tfBars: j.tfBars,
     gear: j.gear,
     gearStep: j.gearStep,
+    lfaActive: j.lfaActive,
+    steeringAngleDeg: j.steeringAngleDeg,
+    aEgo: j.aEgo,
+    steerOutput: j.steerOutput,
+    leftBlinker: j.leftBlinker,
+    rightBlinker: j.rightBlinker,
+    fuelGauge: j.fuelGauge,
+    ureaGauge: j.ureaGauge,
+    tpms: j.tpms,
+    trafficState: j.trafficState,
     gpsOk: j.gpsOk,
     driveMode: j.driveMode,
     speedLimitKph: j.speedLimitKph,
@@ -284,6 +334,19 @@ function drivingHudUpdateFromCarPayload(j) {
     payload.tfBars ?? "-",
     payload.gear ?? "-",
     payload.gearStep ?? "-",
+    payload.lfaActive ? 1 : 0,
+    Math.round(Number(payload.steeringAngleDeg) || 0), // 1° 단위로만 갱신
+    Math.round((Number(payload.aEgo) || 0) * 20),      // 0.05 단위
+    Math.round((Number(payload.steerOutput) || 0) * 50), // 0.02 단위
+    payload.leftBlinker ? 1 : 0,
+    payload.rightBlinker ? 1 : 0,
+    Math.round((Number(payload.fuelGauge) || 0) * 100),
+    Math.round((Number(payload.ureaGauge) || 0) * 100),
+    Math.round(Number(payload.tpms?.fl) || 0),
+    Math.round(Number(payload.tpms?.fr) || 0),
+    Math.round(Number(payload.tpms?.rl) || 0),
+    Math.round(Number(payload.tpms?.rr) || 0),
+    payload.trafficState ?? "-",
     payload.gpsOk ?? "-",
     payload.driveMode?.name ?? "-",
     payload.driveMode?.kind ?? "-",
@@ -294,7 +357,10 @@ function drivingHudUpdateFromCarPayload(j) {
   ].join("|");
   if (payloadSignature === LAST_HUD_PAYLOAD_SIGNATURE) return;
   LAST_HUD_PAYLOAD_SIGNATURE = payloadSignature;
-  window.DriveVisionHudContent?.update?.(payload);
+  // Both live and replay publish the same normalized payload to independent
+  // presentation sinks. Neither sink wraps or owns the other one's lifecycle.
+  try { window.CarrotHudOverlay?.update?.(payload); } catch {}
+  try { window.DriveVisionHudContent?.update?.(payload); } catch {}
 }
 
 function averageFiniteMetric(values) {
@@ -433,6 +499,7 @@ function deriveCompactHudPayload(state) {
     ? Math.round(Number(carState.gearStep))
     : null;
   const trafficState = Number(carrotMan?.trafficState ?? state?.longitudinalPlan?.trafficState);
+  const vehiclePayload = window.CarrotHudDataBridge?.deriveVehicleHudPayload?.(state) || {};
   return {
     cpuTempC,
     memPct: Number(deviceState?.memoryUsagePercent),
@@ -445,8 +512,17 @@ function deriveCompactHudPayload(state) {
     tlight: trafficState === 1 ? "red" : (trafficState === 2 ? "green" : "off"),
     tfGap,
     tfBars: tfGap,
-    gear: compactHudGear(state),
-    gearStep,
+    gear: vehiclePayload.gear ?? compactHudGear(state),
+    gearStep: vehiclePayload.gearStep ?? gearStep,
+    lfaActive: vehiclePayload.lfaActive,
+    steeringAngleDeg: vehiclePayload.steeringAngleDeg,
+    aEgo: vehiclePayload.aEgo,
+    steerOutput: vehiclePayload.steerOutput,
+    leftBlinker: vehiclePayload.leftBlinker,
+    rightBlinker: vehiclePayload.rightBlinker,
+    fuelGauge: vehiclePayload.fuelGauge,
+    ureaGauge: vehiclePayload.ureaGauge,
+    tpms: vehiclePayload.tpms,
     gpsOk: state?.gpsLocationExternal?.latitude != null || state?.gpsLocationExternal?.longitude != null,
     driveMode: compactHudDriveMode(state),
     speedLimitKph,
@@ -543,7 +619,7 @@ function compactOverlayConnect() {
       const frames = window.CarrotVisionCompact?.decodeFrames?.(data)
         || [window.CarrotVisionCompact?.decodeFrame?.(data)].filter(Boolean);
       for (const frame of frames) {
-        if (!frame || (!RAW_HUD_SERVICES.includes(frame.service) && !RAW_OVERLAY_SERVICES.includes(frame.service))) continue;
+        if (!frame || (!RAW_HUD_SERVICES.includes(frame.service) && !isOverlayStateService(frame.service))) continue;
         applyCompactFrame(frame.service, frame.decoded);
       }
       if (!frames.length) return;
@@ -569,7 +645,7 @@ function compactOverlayConnect() {
 }
 
 function rawHudConnectAll() {
-  if (!shouldRunCarrotHudRealtime()) return;
+  if (!shouldRunCarrotDriveDataRealtime()) return;
   setCarrotVisionState({ raw: { hud: "connecting" } }, { reason: "raw hud connecting" });
   compactOverlayConnect();
   _hudMarkDirty();
@@ -623,6 +699,14 @@ async function rawOverlayDisconnectAll() {
   if (compactDesiredServices().length) compactOverlayConnect();
 }
 
+function syncCompactDriveDataActivity() {
+  if (compactDesiredServices().length) {
+    compactOverlayConnect();
+    return;
+  }
+  rawHudDisconnectAll();
+}
+
 window.CarrotVisionRaw = {
   applyCompactFrame,
   applyCompactFrames,
@@ -634,6 +718,7 @@ window.CarrotVisionRaw = {
   hasCompactState: compactStateActive,
   markHudDirty: _hudMarkDirty,
   scheduleHudRender: _hudScheduleRender,
+  syncDataActivity: syncCompactDriveDataActivity,
   stopHudRenderLoop: _hudStopRenderLoop,
   updateHudFromCarPayload: drivingHudUpdateFromCarPayload,
   updateHudFromRawState: drivingHudUpdateFromRawState,

@@ -9,6 +9,7 @@ import numpy as np
 from openpilot.selfdrive.carrot.radar_lead_simulator import (
   MODEL_FEATURE_NAMES,
   Candidate,
+  CurrentRadardTeacher,
   MLPLeadSelector,
   ManualLabels,
   ModelLead,
@@ -75,6 +76,56 @@ def test_simple_selector_matches_model_lead() -> None:
   )))
 
   assert candidate_track_id(selected.lead_one) == 10
+
+
+def test_current_radard_teacher_rejects_adjacent_lane_distance_match() -> None:
+  frames = [replace(frame((
+      point(35, 9.6, 2.8, 13.8),
+      point(36, 6.7, -0.6, 13.0),
+    )), model_leads=(ModelLead(0.999, 11.12, -0.1, 13.5, 0.0, 1.0, 2.0, 2.0),))
+    for _ in range(4)
+  ]
+
+  selected = CurrentRadardTeacher(frames).select(frames[-1], len(frames) - 1)
+
+  assert candidate_track_id(selected.lead_one) == 36
+
+
+def radar_center_frame(points: tuple[RadarPoint, ...]) -> RadarFrame:
+  lane_xs = ((0.0, 1.8), (100.0, 1.8))
+  lane_center = ((0.0, 0.0), (100.0, 0.0))
+  lane_right = ((0.0, -1.8), (100.0, -1.8))
+  return replace(
+    frame(points),
+    lane_lines=(lane_center, lane_xs, lane_right),
+    lane_probs=(0.0, 1.0, 1.0),
+    model_leads=(),
+  )
+
+
+def test_current_radard_teacher_rejects_far_unmatched_corner_center() -> None:
+  frames = [radar_center_frame((point(1190, 68.0, 0.2, 12.0, "corner235"),)) for _ in range(8)]
+
+  selected = CurrentRadardTeacher(frames).select(frames[-1], len(frames) - 1)
+
+  assert selected.lead_two is None
+
+
+def test_current_radard_teacher_keeps_near_corner_center() -> None:
+  frames = [radar_center_frame((point(1190, 35.0, 0.2, 12.0, "corner235"),)) for _ in range(6)]
+
+  selected = CurrentRadardTeacher(frames).select(frames[-1], len(frames) - 1)
+
+  assert candidate_track_id(selected.lead_two) == 1190
+
+
+def test_current_radard_teacher_rechecks_discontinuous_corner_track() -> None:
+  frames = [radar_center_frame((point(1189, 40.0, 0.2, 12.0, "corner235"),)) for _ in range(5)]
+  frames.append(radar_center_frame((point(1189, 33.0, 0.2, 25.0, "corner235"),)))
+
+  selected = CurrentRadardTeacher(frames).select(frames[-1], len(frames) - 1)
+
+  assert selected.lead_two is None
 
 
 def test_validation_review_rearms_cutin_track_after_it_clears() -> None:

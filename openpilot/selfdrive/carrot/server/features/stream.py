@@ -11,7 +11,7 @@ from ..services.vision_diag import record_stream_proxy_event
 def _cluster_hud_active(request: web.Request) -> bool:
   params = request.app.get("params")
   try:
-    return params is not None and params.get_int("ClusterHud") in (1, 2)
+    return params is not None and params.get_int("ClusterHud") == 1
   except Exception:
     return False
 
@@ -24,6 +24,7 @@ def _request_summary(body: bytes) -> dict:
       "bridge_services_in": payload.get("bridge_services_in"),
       "bridge_services_out": payload.get("bridge_services_out"),
       "client_id": str(payload.get("client_id") or "")[:128],
+      "takeover": bool(payload.get("takeover")),
       "carrot_state": bool(payload.get("carrot_state")),
       "sdp_bytes": len(str(payload.get("sdp") or "")),
     }
