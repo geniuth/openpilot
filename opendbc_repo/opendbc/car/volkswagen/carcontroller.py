@@ -50,6 +50,7 @@ class CarController(CarControllerBase):
     # DISABLE_RADAR: 레이더 무력화 후 대체 메시지 송신 상태
     self.radar_disabled_warning_timer = 0
     self.hide_ea_error = False
+    self.hold_release_latch = False  # 정차잠금 해제 래치 (경사로 롤백/HMS 디더링 방지)
 
   def update(self, CC, CS, now_nanos):
     actuators = CC.actuators
@@ -175,8 +176,17 @@ class CarController(CarControllerBase):
           # 이때 차가 스스로 ESP 홀드를 걸면 기존 (lcs==starting) 조건으로는 ACC_Anfahren(출발요청)이
           # 영영 안 나가 차가 홀드에 갇힌다(앞차 출발해도 안 감). 정차 잠금 중 openpilot이 가속하려
           # 하면(accel>0) 출발요청을 내보내 잠금을 푼다. (HKG는 accel 직접명령이라 이 핸드셰이크가 없음)
-          starting = (actuators.longControlState == LongCtrlState.starting and CS.out.vEgo <= self.CP.vEgoStarting) \
-                     or (actuators.longControlState == LongCtrlState.pid and CS.esp_hold_confirmation and accel > 0.0)
+          want_go = (actuators.longControlState == LongCtrlState.starting and CS.out.vEgo <= self.CP.vEgoStarting) \
+                    or (actuators.longControlState == LongCtrlState.pid and CS.esp_hold_confirmation and accel > 0.0)
+          # 경사로 롤백 방지: 정차잠금 상태에선 accel이 0.2 m/s^2 이상 걸린 뒤에만 해제를 시작
+          # (미세 가속값에 잠금이 풀려 토크 공백 동안 뒤로 밀리는 것 방지. 정상 출발은
+          # startAccel=0.8이라 첫 프레임 통과 = 지연 없음). 한번 해제를 시작하면 가속의지가
+          # 있는 한 유지(래치) - 문턱 부근에서 HOLD/RELEASE가 깜빡이는 디더링 방지.
+          if not want_go:
+            self.hold_release_latch = False
+          elif not CS.esp_hold_confirmation or accel >= 0.2:
+            self.hold_release_latch = True
+          starting = want_go and self.hold_release_latch
 
           # override / disable ramp handling to avoid EPB error at low speed (infiniteCable2)
           long_override = CC.cruiseControl.override or CS.out.gasPressed
