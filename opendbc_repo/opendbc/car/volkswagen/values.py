@@ -104,6 +104,9 @@ class CarControllerParams:
         Button(structs.CarState.ButtonEvent.Type.accelCruise, "GRA_ACC_01", "GRA_Tip_Hoch", [1]),
         Button(structs.CarState.ButtonEvent.Type.decelCruise, "GRA_ACC_01", "GRA_Tip_Runter", [1]),
         Button(structs.CarState.ButtonEvent.Type.gapAdjustCruise, "GRA_ACC_01", "GRA_Verstellung_Zeitluecke", [3]),
+        # 핸들 Travel Assist 버튼 -> lfaButton: openpilot이 순정 TA를 대체해 놀고 있는 버튼.
+        # carrot cruise.py의 lfaButton 핸들러가 상시조향 토글로 처리 (LfaButtonMode=0 기본).
+        Button(structs.CarState.ButtonEvent.Type.lfaButton, "GRA_ACC_01", "GRA_TravelAssist", [1]),
       ]
       # 메인 스위치 종류에 따라 cancel 매핑 분리 (infiniteCable2 방식):
       # - 모멘터리(getastet) 메인버튼: 메인버튼(GRA_Hauptschalter)을 cancel로 사용
