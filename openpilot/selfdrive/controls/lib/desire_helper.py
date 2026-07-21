@@ -424,7 +424,13 @@ class DesireHelper:
                   if side.lane_change_available or atc_line_release:
                     self.lane_change_state = LaneChangeState.laneChangeStarting
                 else:
-                  if torque_applied or ((not atc_lane_change_manual_only) and (
+                  # 실선/판정불가에서 내비 ATC 자동 진입 차단 (깜빡이 없는 자동 변경).
+                  # laneLineCheck>=1이고 그쪽 경계가 실선(geom로 막힘)이면, 운전자 토크가
+                  # 없는 자동 트리거는 시작 안 함. 종전에는 이 else 경로가 lane_change_available/
+                  # atc_line_release만 봐서 실선을 우회했음(포켓/합류용 예외가 일반 실선까지 뚫음).
+                  auto_solid_block = (self.laneLineCheck >= 1) and (not side.lane_change_available_geom) and \
+                                     (side.lane_available or side.edge_available)
+                  if torque_applied or ((not atc_lane_change_manual_only) and not auto_solid_block and (
                     auto_lane_change_trigger or side.lane_line_info_edge_detect or block_released_auto
                   )):
                     # 여기서는 시작 직전 안전성 체크
