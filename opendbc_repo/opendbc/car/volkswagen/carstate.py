@@ -40,6 +40,19 @@ class CarState(CarStateBase):
       fault = False
     return fault
 
+  @staticmethod
+  def _meb_lane_line(code: int) -> int:
+    # MEB_Camera_01 차선 종류 코드 -> carrot leftLaneLine/rightLaneLine 값 (색*10+종류).
+    # bit3=점선, bit4=실선. MEB는 색 미방송 -> 흰색(1) 고정. 0x00=차선없음 -> 0 (현대 무정보 기본값과 동일).
+    if code == 0:
+      return 0
+    t = code & 0x18
+    if t == 0x08:
+      return 10  # 흰 점선
+    if t == 0x10:
+      return 11  # 흰 실선 (빗금 안전지대 경계 포함)
+    return 12    # 판정불가(종류 2=미상) -> LaneLineCheck 시 차단측
+
   def update_button_enable(self, buttonEvents: list[structs.CarState.ButtonEvent]):
     if not self.CP.pcmCruise:
       for b in buttonEvents:
@@ -268,6 +281,14 @@ class CarState(CarStateBase):
     # Travel Assist 가용성 (순정 TA_01) - TA_01 송신 게이트 = 스티어링휠 버튼 LED/핸들 아이콘 (infiniteCable2 방식)
     self.travel_assist_available = bool(cam_cp.vl["TA_01"]["Travel_Assist_Available"])
 
+    # 순정 카메라 좌/우 차선 종류 (MEB_Camera_01, 카메라 리버싱 10차 확정):
+    # byte47=좌/byte63=우, bit3(0x08)=점선, bit4(0x10)=실선, 0x00=차선없음, 그 외=판정불가.
+    # carrot leftLaneLine 규약(현대 CAM_0x2a4와 동일) = 색*10 + 종류(0점선/1실선/2미상).
+    # MEB는 색 미방송 -> 흰색(1) 고정. LaneLineCheck 켜면 실선/미상쪽 자동 차선변경 차단.
+    if not (self.CP.flags & VolkswagenFlags.MEB_GEN2):  # MK2는 0x183 존재 미확인이라 제외
+      ret.leftLaneLine = self._meb_lane_line(int(cam_cp.vl["MEB_Camera_01"]["Lane_Left_Type"]))
+      ret.rightLaneLine = self._meb_lane_line(int(cam_cp.vl["MEB_Camera_01"]["Lane_Right_Type"]))
+
     # ESP 홀드 (정차 확인): infiniteCable2와 동일하게 ESC_50.Motion_State == 3(완전정지) 사용.
     # 기존 Standstill(1비트)은 Motion_State(2비트)의 하위 1비트만 읽어 정차 판정 시점이
     # 어긋났음 -> EPB 홀드/릴리스 타이밍 불일치로 재출발이 막힐 수 있었음.
@@ -490,6 +511,9 @@ class CarState(CarStateBase):
     cam_messages = [
       ("TA_01", 10 if gen2 else 50),  # Travel Assist 상태 (GEN2 실측 10Hz)
     ]
+    if not gen2:
+      # 순정 카메라 차선 정보 (좌/우 종류·횡위치, MK1 실측 25Hz. MK2는 존재 미확인이라 제외)
+      cam_messages += [("MEB_Camera_01", 25)]
 
     if CP.flags & VolkswagenFlags.STOCK_EA_PRESENT:
       cam_messages += [("EA_01", 2 if gen2 else 10), ("EA_02", 2 if gen2 else 10)]  # EA HUD (GEN2 실측 2Hz)

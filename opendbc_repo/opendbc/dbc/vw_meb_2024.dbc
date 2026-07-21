@@ -340,20 +340,22 @@ BO_ 387 MEB_Camera_01: 64 XXX
  SG_ NEW_SIGNAL_7 : 280|12@1+ (1,0) [0|255] "" XXX
  SG_ NEW_SIGNAL_11 : 292|12@1+ (1,0) [0|15] "" XXX
  SG_ NEW_SIGNAL_12 : 304|8@1+ (1,0) [0|255] "" XXX
- SG_ NEW_SIGNAL_13 : 320|8@1+ (1,0) [0|255] "" XXX
+ SG_ Lane_Left_Position : 320|12@1+ (0.001,0) [0|4.095] "Unit_Meter" XXX
  SG_ NEW_SIGNAL_14 : 332|12@1+ (1,0) [0|15] "" XXX
  SG_ NEW_SIGNAL_15 : 344|12@1+ (1,0) [0|255] "" XXX
  SG_ NEW_SIGNAL_16 : 356|12@1+ (1,0) [0|15] "" XXX
- SG_ NEW_SIGNAL_17 : 368|10@1+ (1,0) [0|255] "" XXX
+ SG_ NEW_SIGNAL_17 : 368|8@1+ (1,0) [0|255] "" XXX
+ SG_ Lane_Left_Type : 376|8@1+ (1,0) [0|255] "" XXX
  SG_ NEW_SIGNAL_18 : 384|12@1+ (1,0) [0|255] "" XXX
  SG_ NEW_SIGNAL_19 : 396|12@1+ (1,0) [0|15] "" XXX
  SG_ NEW_SIGNAL_20 : 408|12@1+ (1,0) [0|255] "" XXX
  SG_ NEW_SIGNAL_21 : 420|12@1+ (1,0) [0|15] "" XXX
  SG_ NEW_SIGNAL_22 : 432|5@1+ (1,0) [0|31] "" XXX
- SG_ NEW_SIGNAL_23 : 448|12@1+ (1,0) [0|255] "" XXX
+ SG_ Lane_Right_Position : 448|12@1+ (0.001,-2.5) [-2.5|1.595] "Unit_Meter" XXX
  SG_ NEW_SIGNAL_24 : 460|12@1+ (1,0) [0|15] "" XXX
  SG_ NEW_SIGNAL_25 : 472|12@1+ (1,0) [0|255] "" XXX
  SG_ NEW_SIGNAL_26 : 484|12@1+ (1,0) [0|15] "" XXX
+ SG_ Lane_Right_Type : 504|8@1+ (1,0) [0|255] "" XXX
 
 BO_ 420 EA_01: 8 Gateway
  SG_ CHECKSUM : 0|8@1+ (1,0) [0|255] "" Vector__XXX
