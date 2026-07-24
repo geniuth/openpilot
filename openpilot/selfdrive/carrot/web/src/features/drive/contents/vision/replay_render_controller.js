@@ -6,6 +6,7 @@ export function createReplayRenderController(options = {}) {
   const resetReplayState = options.resetReplayState;
   const mergePendingRenderState = options.mergePendingRenderState;
   const flushScheduledRender = options.flushScheduledRender;
+  const notifyPresentedFrame = options.notifyPresentedFrame;
 
   if (
     typeof isReplayActive !== "function"
@@ -15,6 +16,7 @@ export function createReplayRenderController(options = {}) {
     || typeof resetReplayState !== "function"
     || typeof mergePendingRenderState !== "function"
     || typeof flushScheduledRender !== "function"
+    || typeof notifyPresentedFrame !== "function"
   ) {
     return null;
   }
@@ -22,16 +24,30 @@ export function createReplayRenderController(options = {}) {
   function renderVideoFrame(renderOptions = {}) {
     if (!isReplayActive() || !isStageVisible()) return false;
 
-    cancelScheduledRender();
-    if (renderOptions.resetTemporal) resetFrameTemporalState();
-    mergePendingRenderState({
-      force: Boolean(renderOptions.force),
-      overlayDirty: renderOptions.overlayDirty !== false,
-      hudDirty: renderOptions.hudDirty !== false,
+    const force = Boolean(renderOptions.force);
+    const resetTemporal = renderOptions.resetTemporal === true;
+    const overlayDirty = renderOptions.overlayDirty !== false;
+    const hudDirty = renderOptions.hudDirty !== false;
+    const hasVisualWork = force || resetTemporal || overlayDirty || hudDirty;
+    if (hasVisualWork) {
+      cancelScheduledRender();
+      if (resetTemporal) resetFrameTemporalState();
+      mergePendingRenderState({ force, overlayDirty, hudDirty });
+      // Replay invokes this after applying the rlog samples for the presented
+      // media frame, so render synchronously against that exact frame.
+      flushScheduledRender();
+    }
+    notifyPresentedFrame({
+      source: "replay",
+      mediaTime: Number.isFinite(Number(renderOptions.mediaTime))
+        ? Number(renderOptions.mediaTime)
+        : null,
+      reason: String(renderOptions.reason || "replay video frame"),
+      discontinuity: resetTemporal,
+      discontinuityReason: resetTemporal
+        ? String(renderOptions.discontinuityReason || "replay-seek")
+        : null,
     });
-    // Replay invokes this after applying the rlog samples for the presented
-    // media frame, so render synchronously against that exact frame.
-    flushScheduledRender();
     return true;
   }
 

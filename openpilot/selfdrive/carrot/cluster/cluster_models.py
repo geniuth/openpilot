@@ -368,6 +368,7 @@ class ClusterUiState:
     surround_view_active: bool
     lanes: tuple[LaneMarking, ...]
     onroad: bool = False
+    active_lane_line: bool | None = None
     camera_view_mode: int = 0
     extra_left_lane_visible: bool = False
     extra_right_lane_visible: bool = False
@@ -455,6 +456,7 @@ class ClusterUiState:
     lateral_plan_curvature_rates: tuple[float, ...] = ()
     display_speed_kph: float | None = None
     traffic_state: int = 0
+    driving_mode: int | None = None
     git_status: GitBranchStatus | None = None
     actual_fps: float | None = None
     cluster_core_usage_text: str | None = None
@@ -467,6 +469,8 @@ class ClusterUiState:
     fuel_gauge: float | None = None
     energy_gauge_label: Literal["fuel", "battery"] = "fuel"
     urea_gauge: float | None = None
+    ev_mode_valid: bool = False
+    ev_mode_active: bool = False
     cruise_override_kph: float | None = None
     cruise_override_label: str | None = None
     cruise_override_color_mode: int = 0

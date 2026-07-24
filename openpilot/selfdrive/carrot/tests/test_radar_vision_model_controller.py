@@ -1,15 +1,15 @@
 from dataclasses import replace
 from types import SimpleNamespace
 
-from openpilot.selfdrive.carrot.radar_lead_model import RadarLeadDecision, VisionLeadContext
-from openpilot.selfdrive.carrot.radar_lead_runtime import RadarLeadRuntimeResult
-from openpilot.selfdrive.carrot.radar_lead_simulator import (
+from openpilot.selfdrive.carrot.radar.radar_lead_model import RadarLeadDecision, VisionLeadContext
+from openpilot.selfdrive.carrot.radar.radar_lead_runtime import RadarLeadRuntimeResult
+from openpilot.selfdrive.carrot.radar.tools.radar_lead_simulator import (
   Candidate,
   Selection,
   cutin_continuity_series,
   validation_review_events,
 )
-from openpilot.selfdrive.carrot.radar_vision_model_controller import VisionModelRadarController, VisionRadarMatcher
+from openpilot.selfdrive.carrot.radar.radar_vision_model_controller import VisionModelRadarController, VisionRadarMatcher
 from openpilot.selfdrive.carrot.tests.test_radar_lead_controller import prediction
 
 
@@ -75,6 +75,65 @@ def test_previous_match_bridges_small_distance_gate_jitter() -> None:
   assert held is not None and held.prediction.features.radar_object.front_track_id == 40
 
 
+def test_long_range_off_path_target_does_not_match_vision() -> None:
+  matcher = VisionRadarMatcher()
+  ghost = prediction(46, -11.6, 0.1, 0.1, d_rel=64.0, v_lead=16.2)
+  ghost = replace(ghost, features=replace(
+    ghost.features,
+    d_path=-4.65,
+    d_path_future=-5.47,
+    in_lane_prob=0.0,
+    radar_object=replace(ghost.features.radar_object, front_d_rel=64.0, front_v_rel=-0.8),
+  ))
+  vision = VisionLeadContext(0.54, 81.0, -11.0, 16.0, 0.0, 10.0, 2.0, 3.0)
+
+  assert matcher.match_context(vision, (ghost,), 17.0) is None
+
+
+def test_large_vision_velocity_std_does_not_match_stationary_front_reflection() -> None:
+  matcher = VisionRadarMatcher()
+  reflection = prediction(61, 1.0, 0.0, 0.0, d_rel=61.3, v_lead=0.7)
+  reflection = replace(reflection, features=replace(
+    reflection.features,
+    track_age=23,
+    d_path=1.04,
+    in_lane_prob=0.7,
+    radar_object=replace(
+      reflection.features.radar_object,
+      front_d_rel=61.3,
+      front_v_rel=-14.0,
+    ),
+  ))
+  vision = VisionLeadContext(0.86, 81.9, -0.3, 10.3, 0.0, 11.6, 0.5, 4.0)
+
+  assert matcher.match_context(vision, (reflection,), 14.7) is None
+
+
+def test_slow_corner_track_can_match_stationary_vision_with_front_corroboration() -> None:
+  matcher = VisionRadarMatcher()
+  corner = prediction(1012, 7.6, 0.0, 0.0, front=False, d_rel=85.1, v_lead=2.4)
+  corner = replace(corner, features=replace(
+    corner.features,
+    track_age=14,
+    d_path=0.35,
+    d_path_future=-0.67,
+    in_lane_prob=0.77,
+  ))
+  front = prediction(60, 7.3, 0.0, 0.0, d_rel=84.7, v_lead=0.2)
+  front = replace(front, features=replace(
+    front.features,
+    track_age=18,
+    d_path=0.12,
+    in_lane_prob=0.92,
+    radar_object=replace(front.features.radar_object, front_d_rel=84.7, front_v_rel=-21.1),
+  ))
+  vision = VisionLeadContext(0.66, 91.5, 8.3, 17.7, 0.0, 11.3, 2.0, 3.2)
+
+  match = matcher.match_context(vision, (corner, front), 21.3)
+  assert match is not None
+  assert match.prediction.features.radar_object.corner_track_id == 1012
+
+
 def test_high_probability_vision_can_replace_farther_previous_match() -> None:
   matcher = VisionRadarMatcher()
   farther = prediction(43, 0.41, 0.1, 0.1, d_rel=29.1, v_lead=9.2)
@@ -116,6 +175,66 @@ def test_stable_in_lane_closer_second_match_wins_for_small_target() -> None:
   match = matcher.match_context(vision, (farther, closer), 9.9)
   assert match is not None
   assert match.prediction is closer
+
+
+def test_corner_backed_previous_match_resists_closer_second_match_jitter() -> None:
+  matcher = VisionRadarMatcher()
+  farther = prediction(33, -10.0, 1.0, 0.0, d_rel=84.5, v_lead=17.3)
+  closer = prediction(52, -6.4, 1.0, 0.0, d_rel=62.7, v_lead=22.9)
+  farther = replace(farther, features=replace(
+    farther.features,
+    aliases=("front:33", "corner:1007"),
+    d_path=0.5,
+    radar_object=replace(
+      farther.features.radar_object,
+      front_d_rel=84.5,
+      front_v_rel=-2.7,
+      corner_track_id=1007,
+      corner_d_rel=84.5,
+      corner_y_rel=-10.0,
+      corner_v_rel=-2.7,
+    ),
+  ))
+  closer = replace(closer, features=replace(
+    closer.features,
+    d_path=-0.7,
+    radar_object=replace(closer.features.radar_object, front_d_rel=62.7, front_v_rel=2.9),
+  ))
+
+  initial = VisionLeadContext(0.90, 80.1, -8.9, 19.0, 0.0, 5.0, 1.0, 3.0)
+  assert matcher.match_context(initial, (farther,), 20.0).prediction is farther
+
+  jitter = VisionLeadContext(0.94, 76.3, -8.3, 18.7, 0.0, 5.0, 1.0, 3.0)
+  match = matcher.match_context(jitter, (farther, closer), 20.0)
+  assert match is not None
+  assert match.prediction is farther
+
+
+def test_corner_backed_previous_match_bridges_lateral_vision_jitter() -> None:
+  matcher = VisionRadarMatcher()
+  target = prediction(52, -5.7, 1.0, 0.0, d_rel=60.0, v_lead=23.4)
+  target = replace(target, features=replace(
+    target.features,
+    aliases=("front:52", "corner:1000"),
+    d_path=-1.0,
+    radar_object=replace(
+      target.features.radar_object,
+      front_d_rel=60.0,
+      front_v_rel=3.4,
+      corner_track_id=1000,
+      corner_d_rel=60.0,
+      corner_y_rel=-5.7,
+      corner_v_rel=3.4,
+    ),
+  ))
+
+  initial = VisionLeadContext(0.96, 70.0, -7.0, 20.0, 0.0, 7.0, 1.2, 3.0)
+  assert matcher.match_context(initial, (target,), 20.0) is not None
+
+  lateral_jitter = VisionLeadContext(0.95, 75.8, -8.0, 19.5, 0.0, 6.6, 1.3, 3.0)
+  match = matcher.match_context(lateral_jitter, (target,), 20.0)
+  assert match is not None
+  assert match.prediction is target
 
 
 def test_scc_can_supply_vision_matched_lead_one() -> None:
@@ -317,6 +436,47 @@ def test_controller_rejects_stationary_front_external_as_lead_two() -> None:
   assert output.lead_external is None
 
 
+def test_controller_rejects_long_range_unmatched_external_as_lead_two() -> None:
+  ghost = prediction(51, 0.2, 0.0, 0.0, external_prob=0.99, d_rel=89.0)
+  ghost = replace(ghost, features=replace(
+    ghost.features, d_path=0.1, d_path_future=0.2, in_lane_prob=0.9, track_age=12,
+  ))
+
+  class Runtime:
+    def update(self, *_args):
+      return RadarLeadRuntimeResult(True, RadarLeadDecision((), (), (ghost,)), (ghost,), 0.1)
+
+  controller = VisionModelRadarController()
+  controller.runtime = Runtime()
+  output = controller.update(0.0, 20.0, (), vision_model(40.0, 0.0, 18.0))
+
+  assert output.lead_two is None
+  assert output.lead_external is None
+
+
+def test_controller_rejects_external_track_moving_out_of_lane() -> None:
+  ghost = prediction(51, -1.0, 0.0, 0.0, external_prob=0.99, d_rel=35.0)
+  ghost = replace(ghost, features=replace(
+    ghost.features,
+    d_path=-1.0,
+    d_path_future=-2.4,
+    in_lane_prob=0.45,
+    track_age=12,
+    radar_object=replace(ghost.features.radar_object, corner_track_id=1000),
+  ))
+
+  class Runtime:
+    def update(self, *_args):
+      return RadarLeadRuntimeResult(True, RadarLeadDecision((), (), (ghost,)), (ghost,), 0.1)
+
+  controller = VisionModelRadarController()
+  controller.runtime = Runtime()
+  output = controller.update(0.0, 20.0, (), vision_model(60.0, 0.0, 18.0))
+
+  assert output.lead_two is None
+  assert output.lead_external is None
+
+
 def test_controller_rejects_stationary_unmatched_front_stealth_lead_two() -> None:
   ghost = prediction(40, 0.2, 1.0, 0.0, v_lead=0.0, d_rel=22.0)
   ghost = replace(ghost, features=replace(
@@ -330,6 +490,23 @@ def test_controller_rejects_stationary_unmatched_front_stealth_lead_two() -> Non
   controller = VisionModelRadarController()
   controller.runtime = Runtime()
   output = controller.update(0.0, 17.0, (), vision_model(75.0, 0.0, 18.0))
+
+  assert output.lead_two is None
+
+
+def test_controller_rejects_distant_unmatched_stealth_lead_two() -> None:
+  ghost = prediction(62, 0.1, 1.0, 0.0, v_lead=20.0, d_rel=57.0)
+  ghost = replace(ghost, features=replace(
+    ghost.features, d_path=0.1, d_path_future=0.1, in_lane_prob=0.9, track_age=12,
+  ))
+
+  class Runtime:
+    def update(self, *_args):
+      return RadarLeadRuntimeResult(True, RadarLeadDecision((ghost,), ()), (ghost,), 0.1)
+
+  controller = VisionModelRadarController()
+  controller.runtime = Runtime()
+  output = controller.update(0.0, 20.0, (), vision_model(80.0, 0.0, 18.0))
 
   assert output.lead_two is None
 

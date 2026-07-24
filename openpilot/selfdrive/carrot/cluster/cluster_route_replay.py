@@ -97,7 +97,7 @@ class DbcSignalSpec:
     offset: float
 
 
-MODEL_LEAD_MIN_PROB = 0.08
+MODEL_LEAD_MIN_PROB = 0.50
 RADAR_POINT_STALE_S = 0.25
 CORNER_DETECTION_STALE_S = 0.8
 RADAR_MIN_LONGITUDINAL_M = 0.0
@@ -206,7 +206,7 @@ LANE_CHANGE_REINDEX_PEAK_THRESHOLD = 0.22
 LANE_CHANGE_REINDEX_RESET_THRESHOLD = -0.08
 CONTINUOUS_LANE_CHANGE_REBASE_PROGRESS = 0.12
 LANE_CHANGE_MODEL_DIRECT_ONLY = True
-ROUTE_REPLAY_USE_LANE_CHANGE_ANIMATION = False
+ROUTE_REPLAY_USE_LANE_CHANGE_ANIMATION = True
 LANE_LINE_PROBABILITY_MIN = 0.4
 MODEL_DIRECT_LANE_SETTLE_MIN_PROGRESS = 0.65
 LONGITUDINAL_PERSONALITY_GAPS = {
@@ -426,6 +426,7 @@ class RouteReplayFrame:
     gear_text: str | None
     cruise_gap: int | None
     lfa_active: bool | None
+    active_lane_line: bool | None
     left_signal: bool
     right_signal: bool
     left_blindspot: bool
@@ -463,8 +464,11 @@ class RouteReplayFrame:
     radar_points: tuple[RadarPoint, ...] = ()
     corner_radar_supported: bool = False
     tpms: TpmsInfo = TpmsInfo()
+    ev_mode_valid: bool = False
+    ev_mode_active: bool = False
     display_speed_kph: float | None = None
     traffic_state: int = 0
+    driving_mode: int | None = None
     planned_speed_kph: float | None = None
     planned_accel_mps2: float | None = None
     planned_curvature_m_inv: float | None = None
@@ -1374,6 +1378,7 @@ class RouteLogParser:
         self.cruise_kph: int | None = None
         self.cruise_gap: int | None = None
         self.lfa_active: bool | None = None
+        self.active_lane_line: bool | None = None
         self.selfdrive_enabled: bool | None = None
         self.controls_enabled: bool | None = None
         self.lane_width_m = DEFAULT_LANE_WIDTH_M
@@ -1444,6 +1449,7 @@ class RouteLogParser:
         self.longitudinal_plan_allow_throttle: bool | None = None
         self.longitudinal_plan_allow_brake: bool | None = None
         self.traffic_state = 0
+        self.driving_mode: int | None = None
         self.longitudinal_t_follow_s: float | None = None
         self.longitudinal_desired_distance_m: float | None = None
         self.longitudinal_v_target_kph: float | None = None
@@ -1519,7 +1525,10 @@ class RouteLogParser:
             elif event_type in ("navInstructionCarrot", "navInstruction"):
                 self._update_nav_instruction(getattr(event, event_type), event_t)
             elif event_type == "longitudinalPlan":
-                self._update_longitudinal_plan(event.longitudinalPlan)
+                self._update_longitudinal_plan(
+                    event.longitudinalPlan,
+                    bool(safe_get(event, "valid", True)),
+                )
             elif event_type == "controlsState":
                 self._update_controls_state(event.controlsState)
             elif event_type == "selfdriveState":
@@ -1616,6 +1625,8 @@ class RouteLogParser:
             detected_vehicles = tuple((*detected_vehicles, *self.cutin_detections))
         radar_points = self._radar_points_from_current_state(event_t)
         tpms = tpms_info_from_car_state(car_state)
+        ev_mode_valid = bool(safe_get(car_state, "evModeValid", False))
+        ev_mode_active = ev_mode_valid and bool(safe_get(car_state, "evModeActive", False))
 
         return RouteReplayFrame(
             t=event_t,
@@ -1630,6 +1641,7 @@ class RouteLogParser:
             gear_text=gear_text,
             cruise_gap=cruise_gap,
             lfa_active=self.lfa_active,
+            active_lane_line=self.active_lane_line,
             left_signal=left_signal,
             right_signal=right_signal,
             left_blindspot=left_blindspot,
@@ -1667,8 +1679,11 @@ class RouteLogParser:
             radar_points=radar_points,
             corner_radar_supported=self.corner_radar_active_for_display(),
             tpms=tpms,
+            ev_mode_valid=ev_mode_valid,
+            ev_mode_active=ev_mode_active,
             display_speed_kph=display_speed_kph,
             traffic_state=self.traffic_state,
+            driving_mode=self.driving_mode,
             planned_speed_kph=self.planned_speed_kph,
             planned_accel_mps2=self.planned_accel_mps2,
             planned_curvature_m_inv=self.model_action_curvature_m_inv,
@@ -1877,7 +1892,7 @@ class RouteLogParser:
             self.nav_speed_limit_kph = None
             self.nav_speed_limit_t = -999.0
 
-    def _update_longitudinal_plan(self, longitudinal_plan: Any) -> None:
+    def _update_longitudinal_plan(self, longitudinal_plan: Any, valid: bool = True) -> None:
         self.longitudinal_plan_source = enum_text(
             safe_get(longitudinal_plan, "longitudinalPlanSource", self.longitudinal_plan_source or "")
         ) or self.longitudinal_plan_source
@@ -1905,6 +1920,8 @@ class RouteLogParser:
         traffic_state = safe_optional_int(longitudinal_plan, "trafficState")
         if traffic_state in (0, 1, 2):
             self.traffic_state = traffic_state
+        driving_mode = safe_optional_int(longitudinal_plan, "myDrivingMode")
+        self.driving_mode = driving_mode if valid and driving_mode in (1, 2, 3, 4) else None
         t_follow = safe_optional_float(longitudinal_plan, "tFollow")
         if t_follow is not None and 0.0 <= t_follow <= 5.0:
             self.longitudinal_t_follow_s = t_follow
@@ -1965,6 +1982,10 @@ class RouteLogParser:
         if enabled is not None:
             self.controls_enabled = bool(enabled)
 
+        active_lane_line = safe_get(controls_state, "activeLaneLine", None)
+        if active_lane_line is not None:
+            self.active_lane_line = bool(active_lane_line)
+
         desired_curvature = safe_optional_float(controls_state, "desiredCurvature")
         if desired_curvature is not None and abs(desired_curvature) < 0.05:
             self.controls_curvature_m_inv = desired_curvature
@@ -1983,8 +2004,10 @@ class RouteLogParser:
         alert_type = str(safe_get(selfdrive_state, "alertType", "") or "").lower()
         self.recorded_cutin_sound = bool(
             self.recorded_cutin_ids
-            and alert_sound == "prompt"
-            and alert_type.startswith("audioprompt/")
+            and (
+                (alert_sound == "prompt" and alert_type.startswith("audioprompt/"))
+                or (alert_sound == "radarcutin" and alert_type.startswith("radarcutin/"))
+            )
         )
         if self.recorded_cutin_sound:
             self.recorded_cutin_sound_t = event_t
@@ -3536,6 +3559,7 @@ def frame_to_state(frame: RouteReplayFrame) -> ClusterUiState:
         gear_text=frame.gear_text,
         cruise_gap=frame.cruise_gap,
         lfa_active=frame.lfa_active,
+        active_lane_line=frame.active_lane_line,
         left_signal=frame.left_signal,
         right_signal=frame.right_signal,
         left_blindspot=frame.left_blindspot,
@@ -3569,6 +3593,8 @@ def frame_to_state(frame: RouteReplayFrame) -> ClusterUiState:
         radar_points=frame.radar_points,
         corner_radar_supported=frame.corner_radar_supported,
         tpms=frame.tpms,
+        ev_mode_valid=frame.ev_mode_valid,
+        ev_mode_active=frame.ev_mode_valid and frame.ev_mode_active,
         planned_speed_kph=frame.planned_speed_kph,
         planned_accel_mps2=frame.planned_accel_mps2,
         planned_curvature_m_inv=frame.planned_curvature_m_inv,
@@ -3629,6 +3655,7 @@ def frame_to_state(frame: RouteReplayFrame) -> ClusterUiState:
         lateral_plan_curvature_rates=frame.lateral_plan_curvature_rates,
         display_speed_kph=frame.display_speed_kph,
         traffic_state=frame.traffic_state,
+        driving_mode=frame.driving_mode,
         recorded_cutin_active=frame.recorded_cutin_active,
         recorded_cutin_sound=frame.recorded_cutin_sound,
     )
@@ -3733,7 +3760,9 @@ def blend_frames(left: RouteReplayFrame, right: RouteReplayFrame, amount: float)
         gear_text=discrete.gear_text,
         cruise_gap=discrete.cruise_gap,
         traffic_state=discrete.traffic_state,
+        driving_mode=discrete.driving_mode,
         lfa_active=discrete.lfa_active,
+        active_lane_line=discrete.active_lane_line,
         left_signal=discrete.left_signal,
         right_signal=discrete.right_signal,
         left_blindspot=discrete.left_blindspot,
@@ -3771,6 +3800,8 @@ def blend_frames(left: RouteReplayFrame, right: RouteReplayFrame, amount: float)
         radar_points=discrete.radar_points,
         corner_radar_supported=discrete.corner_radar_supported,
         tpms=discrete.tpms,
+        ev_mode_valid=discrete.ev_mode_valid,
+        ev_mode_active=discrete.ev_mode_valid and discrete.ev_mode_active,
         planned_speed_kph=lerp_optional(left.planned_speed_kph, right.planned_speed_kph),
         planned_accel_mps2=lerp_optional(left.planned_accel_mps2, right.planned_accel_mps2),
         planned_curvature_m_inv=lerp_optional(left.planned_curvature_m_inv, right.planned_curvature_m_inv),
@@ -3856,8 +3887,11 @@ def lanes_for_frame(
         left_inner = frame.left_lane_offset + lane_grid_offset
         right_inner = frame.right_lane_offset + lane_grid_offset
 
-    left_inner_visible = frame.left_lane_visible
-    right_inner_visible = frame.right_lane_visible
+    # Model lane probabilities intentionally fade during a lane change. The
+    # animated grid owns visual continuity for that interval, so its current
+    # lane boundaries must remain visible while the grid moves.
+    left_inner_visible = frame.left_lane_visible or use_animated_lane_grid
+    right_inner_visible = frame.right_lane_visible or use_animated_lane_grid
     road_edge_shift = lane_grid_offset if use_animated_lane_grid else 0.0
     left_road_edge_offset = shifted_optional_offset(frame.left_road_edge_offset, road_edge_shift)
     right_road_edge_offset = shifted_optional_offset(frame.right_road_edge_offset, road_edge_shift)
@@ -3889,7 +3923,9 @@ def lanes_for_frame(
             )
             color = model_lane_color_for_index(index, frame.lane_change)
             style = model_lane_style_for_index(index)
-            visible = frame.extra_left_lane_visible
+            visible = frame.extra_left_lane_visible or (
+                use_animated_lane_grid and frame.lane_change == "left"
+            )
             width = 5
         elif index == 3:
             offset = model_lane_offset_for_index(
@@ -3902,7 +3938,9 @@ def lanes_for_frame(
             )
             color = model_lane_color_for_index(index, frame.lane_change)
             style = model_lane_style_for_index(index)
-            visible = frame.extra_right_lane_visible
+            visible = frame.extra_right_lane_visible or (
+                use_animated_lane_grid and frame.lane_change == "right"
+            )
             width = 5
         else:
             offset = model_lane_offset_for_index(
@@ -3950,7 +3988,7 @@ def lanes_for_frame(
                 left_outer,
                 left_outer_color,
                 "solid",
-                visible=frame.extra_left_lane_visible and lane_offset_inside_road_edges(
+                visible=(frame.extra_left_lane_visible or use_animated_lane_grid) and lane_offset_inside_road_edges(
                     left_outer,
                     left_road_edge_offset,
                     right_road_edge_offset,
@@ -4018,7 +4056,7 @@ def lanes_for_frame(
                 right_outer,
                 right_outer_color,
                 "dashed",
-                visible=frame.extra_right_lane_visible and lane_offset_inside_road_edges(
+                visible=(frame.extra_right_lane_visible or use_animated_lane_grid) and lane_offset_inside_road_edges(
                     right_outer,
                     left_road_edge_offset,
                     right_road_edge_offset,

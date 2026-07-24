@@ -1,6 +1,9 @@
 "use strict";
 
+import { dashcamReadStateStore } from "./dashcam_player_session.js";
+import { createLogsSegmentStatusTag } from "./player/components.js";
 import { loadScreenrecordVideos } from "./screenrecord.js";
+import { openRouteSummary } from "./route_summary/index.js";
 import {
   formatLogBytes,
   formatRelativeEpoch,
@@ -35,6 +38,9 @@ const DASHCAM_LOAD_AHEAD_VIEWPORTS = 1.5;
 const DASHCAM_ROUTE_WINDOW_OVERSCAN_VIEWPORTS = 1.25;
 let dashcamUploadActiveJobId = null;
 let dashcamUploadResumePromise = null;
+let dashcamReadStateLoadPromise = null;
+let dashcamReadStateWritePromise = Promise.resolve();
+let dashcamReadStateInteracted = false;
 
 const dashcamState = {
   initialized: false,
@@ -470,6 +476,51 @@ function formatDashcamTimeRange(startEpoch, endEpoch, options = {}) {
     : `${start.date} ${start.time} – ${end.date} ${end.time}`;
 }
 
+function dashcamPlayerGroup(entry, route) {
+  const start = dashcamDateParts(entry?.routeStartEpoch);
+  const end = dashcamDateParts(entry?.routeEndEpoch);
+  const sameDate = start && end && start.date === end.date;
+  return {
+    route,
+    title: entry?.title || dashcamRouteTitle(route),
+    dateLabel: sameDate ? start.date : "",
+    timeRange: start && end
+      ? (sameDate ? `${start.time} – ${end.time}` : `${start.date} ${start.time} – ${end.date} ${end.time}`)
+      : String(entry?.dateLabel || ""),
+    segmentCount: dashcamSegmentCountForRoute(entry),
+  };
+}
+
+function dashcamPlayerSegmentTimeLabel(entry, segment) {
+  const time = dashcamSegmentTime(entry, segment);
+  const start = dashcamDateParts(time?.startEpoch);
+  const end = dashcamDateParts(time?.endEpoch);
+  if (start && end) {
+    return start.date === end.date
+      ? `${start.time}–${end.time}`
+      : `${start.date} ${start.time}–${end.date} ${end.time}`;
+  }
+  return formatDashcamSegmentTimeLabel(entry, segment);
+}
+
+function dashcamPlayerSegment(entry, route, segment) {
+  const segmentIndex = dashcamSegmentIndex(segment);
+  const time = dashcamSegmentTime(entry, segment);
+  return Object.freeze({
+    id: segment,
+    name: `${getUIText("segment_label", "Segment")} ${segmentIndex}`,
+    timeLabel: dashcamPlayerSegmentTimeLabel(entry, segment),
+    title: `${dashcamRouteTitle(route)} · ${getUIText("segment_label", "Segment")} ${segmentIndex}`,
+    subtitle: formatDashcamTimeRange(time?.startEpoch, time?.endEpoch),
+    src: dashcamApiPath("video", segment),
+    thumbnailSrc: dashcamApiPath("thumbnail", segment),
+  });
+}
+
+function dashcamPlayerSegments(entry, route, segments) {
+  return (segments || []).map((segment) => dashcamPlayerSegment(entry, route, segment));
+}
+
 function dashcamSegmentTime(entry, segment) {
   const value = entry?.segmentTimes?.[segment];
   return value && typeof value === "object" ? value : null;
@@ -603,6 +654,78 @@ function dashcamSelectedForRoute(entry) {
   return dashcamSegmentsForRoute(entry).filter((segment) => dashcamState.selected.has(segment));
 }
 
+function dashcamSegmentReadStatusTag(segment) {
+  return createLogsSegmentStatusTag(
+    dashcamReadStateStore.statusFor(segment),
+    {
+      reading: getUIText("segment_reading", "Reading"),
+      recent: getUIText("segment_recently_read", "Recently viewed"),
+    },
+  );
+}
+
+function dashcamSegmentReadStatusHtml(segment) {
+  return dashcamSegmentReadStatusTag(segment)?.outerHTML || "";
+}
+
+function syncDashcamSegmentReadStatusUi() {
+  const host = document.getElementById("dashcamRoutes");
+  if (!host) return;
+  host.querySelectorAll(".dashcam-segment-tile[data-segment]").forEach((tile) => {
+    const statusHost = tile.querySelector(".dashcam-segment-read-status");
+    if (!statusHost) return;
+    const tag = dashcamSegmentReadStatusTag(tile.dataset.segment);
+    statusHost.replaceChildren(...(tag ? [tag] : []));
+    statusHost.hidden = !tag;
+  });
+}
+
+function persistDashcamRecentSegment(segment) {
+  const recentSegment = String(segment || "").trim();
+  if (!recentSegment) return Promise.resolve(null);
+  const write = dashcamReadStateWritePromise
+    .catch(() => null)
+    .then(() => postJson("/api/dashcam/read-state", { recentSegment }));
+  dashcamReadStateWritePromise = write;
+  return write;
+}
+
+function selectDashcamReadSegment(segment) {
+  dashcamReadStateInteracted = true;
+  const before = dashcamReadStateStore.snapshot();
+  const result = dashcamReadStateStore.select(segment);
+  const recentSegment = result.state.previousSegment;
+  if (
+    result.changed
+    && recentSegment
+    && recentSegment !== before.previousSegment
+  ) {
+    persistDashcamRecentSegment(recentSegment).catch(() => {});
+  }
+  return result;
+}
+
+function finishDashcamReadSegment() {
+  const result = dashcamReadStateStore.finish();
+  if (result.changed && result.state.previousSegment) {
+    persistDashcamRecentSegment(result.state.previousSegment).catch(() => {});
+  }
+  return result;
+}
+
+function loadDashcamReadState() {
+  if (dashcamReadStateLoadPromise) return dashcamReadStateLoadPromise;
+  dashcamReadStateLoadPromise = getJson("/api/dashcam/read-state")
+    .then((response) => {
+      if (!dashcamReadStateInteracted) {
+        dashcamReadStateStore.restoreRecent(response?.recentSegment);
+      }
+      return dashcamReadStateStore.snapshot();
+    })
+    .catch(() => dashcamReadStateStore.snapshot());
+  return dashcamReadStateLoadPromise;
+}
+
 function dashcamSegmentTileHtml(route, segment, segmentIndex, options = {}) {
   const entry = options.entry || (dashcamState.routes || []).find((item) => item.route === route);
   const compactSegments = options.compact === true;
@@ -610,6 +733,7 @@ function dashcamSegmentTileHtml(route, segment, segmentIndex, options = {}) {
   const routeAttr = escapeHtml(route);
   const segAttr = escapeHtml(segment);
   const timeLabel = escapeHtml(formatDashcamSegmentTimeLabel(entry, segment));
+  const readStatus = dashcamSegmentReadStatusHtml(segment);
   const checked = dashcamState.selected.has(segment) ? " checked" : "";
   const tileClass = [
     "dashcam-segment-tile",
@@ -626,7 +750,10 @@ function dashcamSegmentTileHtml(route, segment, segmentIndex, options = {}) {
       </label>
     </div>
     <div class="dashcam-segment-body">
-      <div class="dashcam-segment-badge">${timeLabel}</div>
+      <div class="dashcam-segment-topline">
+        <div class="dashcam-segment-badge">${timeLabel}</div>
+        <span class="dashcam-segment-read-status"${readStatus ? "" : " hidden"}>${readStatus}</span>
+      </div>
       <div class="dashcam-segment-name">${segAttr}</div>
     </div>
     <button class="dashcam-menu-btn" type="button" data-action="segment-menu" data-route="${routeAttr}" data-segment="${segAttr}" aria-label="${escapeHtml(getUIText("segment_menu", "Segment menu"))}" title="${escapeHtml(getUIText("segment_menu", "Segment menu"))}">
@@ -709,7 +836,7 @@ function dashcamRouteCardHtml(entry, index = 0, options = {}) {
           <span class="dashcam-selection-count">${escapeHtml(getUIText("selected_count", "{count} selected", { count: selected.length }))}</span>
           <button class="smallBtn" type="button" data-action="select-route" data-route="${routeAttr}" data-selected="${allSelected ? "1" : "0"}">${escapeHtml(selectLabel)}</button>
           <button class="smallBtn btn--filled" type="button" data-action="upload-selected" data-route="${routeAttr}" ${selected.length ? "" : "disabled"}>${escapeHtml(getUIText("upload_selected", "Upload selected"))}</button>
-          <button class="smallBtn dashcam-group-menu-btn" type="button" data-action="route-menu" data-route="${routeAttr}" aria-label="${escapeHtml(getUIText("group_menu", "Group menu"))}" title="${escapeHtml(getUIText("group_menu", "Group menu"))}">
+          <button class="smallBtn dashcam-group-menu-btn dashcam-group-menu-btn--row" type="button" data-action="route-menu" data-route="${routeAttr}" aria-label="${escapeHtml(getUIText("group_menu", "Group menu"))}" title="${escapeHtml(getUIText("group_menu", "Group menu"))}">
             <svg viewBox="0 0 24 24"><path fill="currentColor" d="M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2m12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2m-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2"/></svg>
           </button>
         </div>
@@ -1038,30 +1165,55 @@ function markDashcamScrollBusy(options = {}) {
 
 function openDashcamPlayer(route, segment) {
   const entry = (dashcamState.routes || []).find((item) => item.route === route);
+  const orderedSegments = mergeDashcamSegments(dashcamSegmentsForRoute(entry), [], "asc");
+  const readState = selectDashcamReadSegment(segment).state;
   const time = dashcamSegmentTime(entry, segment);
   const endEpoch = Number(time?.endEpoch || 0);
   const initialSubtitle = formatDashcamTimeRange(time?.startEpoch, endEpoch);
-  openLogsVideoPlayer(
-    `${dashcamRouteTitle(route)} · Segment ${dashcamSegmentIndex(segment)}`,
+  const playerController = openLogsVideoPlayer(
+    `${dashcamRouteTitle(route)} · ${getUIText("segment_label", "Segment")} ${dashcamSegmentIndex(segment)}`,
     dashcamApiPath("video", segment),
     {
       kind: "dashcam",
+      currentGroup: dashcamPlayerGroup(entry, route),
+      segments: dashcamPlayerSegments(entry, route, orderedSegments),
+      activeSegment: segment,
+      previousSegment: readState.previousSegment,
       subtitle: initialSubtitle,
-      subtitleForDuration: (duration) => {
+      subtitleForSegmentDuration: (target, duration) => {
+        const targetTime = dashcamSegmentTime(entry, target);
+        const targetEndEpoch = Number(targetTime?.endEpoch || 0);
+        const targetSubtitle = formatDashcamTimeRange(targetTime?.startEpoch, targetEndEpoch);
         const seconds = Number(duration || 0);
-        if (!Number.isFinite(seconds) || seconds <= 0 || endEpoch <= 0) return initialSubtitle;
-        return formatDashcamTimeRange(endEpoch - seconds, endEpoch);
+        if (!Number.isFinite(seconds) || seconds <= 0 || targetEndEpoch <= 0) return targetSubtitle;
+        return formatDashcamTimeRange(targetEndEpoch - seconds, targetEndEpoch);
       },
-      onSend: () => uploadDashcamSegments([segment], {
+      onSegmentSend: (target) => uploadDashcamSegments([target], {
         confirm: false,
         showProgress: false,
-        showResult: false,
-        toastDuration: 2600,
+        showResult: true,
+        showSuccessToast: false,
       }),
-      onMenu: ({ close } = {}) => showDashcamSegmentMenu(route, segment, { activePlayerClose: close }),
+      onSegmentMenu: (target, { close } = {}) => {
+        return showDashcamSegmentMenu(route, target, { activePlayerClose: close });
+      },
+      onSegmentChange: (target) => {
+        selectDashcamReadSegment(target);
+      },
+      onClose: () => {
+        finishDashcamReadSegment();
+      },
     },
   );
+  fetchAllDashcamSegmentNames(route).then((allSegments) => {
+    if (!playerController?.isOpen?.()) return;
+    const currentEntry = (dashcamState.routes || []).find((item) => item.route === route) || entry;
+    const completeSegments = mergeDashcamSegments(allSegments, orderedSegments, "asc");
+    playerController.updateSegments?.(dashcamPlayerSegments(currentEntry, route, completeSegments));
+  }).catch(() => {});
 }
+
+dashcamReadStateStore.subscribe(syncDashcamSegmentReadStatusUi);
 
 async function openDashcamDriveReplay(route, segment) {
   const requestId = ++dashcamState.replayLoadSeq;
@@ -1426,10 +1578,12 @@ async function uploadDashcamSegments(segments, options = {}) {
       uploaded: result.uploaded || 0,
       total: result.total || targets.length,
     });
-    showAppToast(message, {
-      tone: result.ok ? "default" : "error",
-      duration: Number(options.toastDuration) || 3600,
-    });
+    if (options.showSuccessToast !== false) {
+      showAppToast(message, {
+        tone: result.ok ? "default" : "error",
+        duration: Number(options.toastDuration) || 3600,
+      });
+    }
     progress.close();
     if (activityId && typeof endAppActivity === "function") {
       endAppActivity(activityId);
@@ -1729,16 +1883,19 @@ async function showDashcamRouteMenu(route) {
     message: dashcamRouteTitle(route),
     choiceLayout: "list",
     choices: [
+      { label: getUIText("route_summary", "주행요약"), value: "summary" },
       { label: `${getUIText("select_range", "Select range")}…`, value: "range" },
     ],
   });
-  if (selected === "range") await showDashcamRangeSelect(route);
+  if (selected === "summary") await openRouteSummary(route);
+  else if (selected === "range") await showDashcamRangeSelect(route);
 }
 
 export {
   cancelDashcamRouteRender,
   dashcamDefaultRouteHeight,
   dashcamLayoutKey,
+  loadDashcamReadState,
   dashcamSelectedForRoute,
   dashcamSortDirection,
   dashcamState,

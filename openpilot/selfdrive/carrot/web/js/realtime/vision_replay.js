@@ -324,7 +324,7 @@ window.CarrotVisionReplay = window.CarrotVisionReplay || (() => {
   }
 
   function seekReplayTo(seconds) {
-    if (!state.active || state.loading || !state.sourceKey || !videoEl) return;
+    if (!state.active || state.loading || !state.sourceKey || !videoEl) return false;
     const target = Math.max(0, Math.min(replayDuration(), Number(seconds) || 0));
     beginScrub();
     videoEl.currentTime = target;
@@ -332,6 +332,7 @@ window.CarrotVisionReplay = window.CarrotVisionReplay || (() => {
     endScrub();
     syncTransport();
     revealReplayControls();
+    return true;
   }
 
   async function navigateToSegment(segment) {
@@ -446,6 +447,63 @@ window.CarrotVisionReplay = window.CarrotVisionReplay || (() => {
     return currentSeconds;
   }
 
+  /* AR 자동 진단처럼 실제 replay 파이프라인을 순서대로 재생해야 하는 도구를 위한
+   * 최소 제어면. DOM 버튼을 대신 클릭하지 않고, 시작 전 상태를 스냅샷으로 보관한
+   * 뒤 수집 종료 시 그대로 복원한다. 일반 재생 UI는 이 API에 의존하지 않는다. */
+  function diagnosticPlaybackSnapshot() {
+    return Object.freeze({
+      active: state.active,
+      ready: state.ready,
+      loading: state.loading,
+      route: state.route || null,
+      segment: state.segment || null,
+      currentTime: Number(videoEl?.currentTime || 0),
+      duration: replayDuration(),
+      paused: videoEl?.paused !== false,
+      ended: videoEl?.ended === true,
+      playbackRate: Number(videoEl?.playbackRate || 1),
+    });
+  }
+
+  function setDiagnosticPlaybackRate(value) {
+    if (!videoEl) return false;
+    const rate = Number(value);
+    if (!Number.isFinite(rate) || rate <= 0) return false;
+    if (typeof transport?.setRate === "function") transport.setRate(rate);
+    else videoEl.playbackRate = rate;
+    syncTransport();
+    return true;
+  }
+
+  function playDiagnosticReplay() {
+    if (!state.active || !state.ready || state.loading || !videoEl) {
+      return Promise.reject(new Error("Replay is not ready for AR diagnostics"));
+    }
+    const result = videoEl.play?.();
+    schedulePlaybackTick();
+    syncTransport();
+    revealReplayControls();
+    return result && typeof result.then === "function" ? result : Promise.resolve();
+  }
+
+  async function restoreDiagnosticPlayback(snapshot = {}) {
+    if (!videoEl || !state.active) return false;
+    pauseReplayAtCurrentTime();
+    setDiagnosticPlaybackRate(snapshot.playbackRate || 1);
+    seekReplayTo(snapshot.currentTime || 0);
+    if (snapshot.paused === false) await playDiagnosticReplay().catch(() => {});
+    return true;
+  }
+
+  const diagnosticPlayback = Object.freeze({
+    snapshot: diagnosticPlaybackSnapshot,
+    pause: () => pauseReplayAtCurrentTime() !== null,
+    seek: seekReplayTo,
+    setRate: setDiagnosticPlaybackRate,
+    play: playDiagnosticReplay,
+    restore: restoreDiagnosticPlayback,
+  });
+
   function maybeGenerateFilmstrip() {
     const previewSource = state.previewSource || (!state.manifest?.clientMode ? state.sourceKey : "");
     if (!state.active || state.previewsRequested || !previewSource) return;
@@ -473,13 +531,40 @@ window.CarrotVisionReplay = window.CarrotVisionReplay || (() => {
     return record.frames;
   }
 
+  function presentAppliedState(result, options = {}) {
+    // A native `seeking` event may arrive after the explicit seek already
+    // rebuilt raw state. It still resets AR/overlay temporal state, so redraw
+    // that same snapshot immediately instead of leaving a paused replay blank
+    // until another compact record or video frame happens to arrive.
+    const presentFrame = options.presentFrame === true;
+    if (!result?.applied && !result?.reset && !result?.resetTemporal && !presentFrame) return false;
+    const replayFacade = window.DriveVisionFacade?.replay;
+    const canPresentFrame = typeof replayFacade?.renderVideoFrame === "function";
+    if (!canPresentFrame && result.resetTemporal) replayFacade?.resetTemporalState?.();
+    const rendered = replayFacade?.renderVideoFrame?.({
+      force: Boolean(result.reset || result.resetTemporal),
+      resetTemporal: Boolean(result.resetTemporal),
+      overlayDirty: options.overlayDirty ?? Boolean(result.applied || result.reset || result.resetTemporal),
+      hudDirty: options.hudDirty ?? Boolean(result.applied || result.reset || result.resetTemporal),
+      mediaTime: Number.isFinite(Number(options.mediaTime)) ? Number(options.mediaTime) : null,
+      reason: String(options.reason || "replay state applied"),
+    });
+    if (rendered) return true;
+    window.requestCarrotVisionRender?.({
+      force: Boolean(result.reset || result.resetTemporal),
+      overlayDirty: true,
+      hudDirty: true,
+      reason: String(options.reason || "replay state applied"),
+    });
+    return false;
+  }
+
   function applyAt(timeMs, options = {}) {
     if (!state.active || !state.records.length) return { applied: 0, reset: false, resetTemporal: false };
     const targetMs = Math.max(0, Number(timeMs) || 0);
     const reset = Boolean(options.reset || targetMs + 100 < state.lastTimeMs);
     const resetTemporal = Boolean(options.resetTemporal || reset);
     const render = options.render !== false;
-    if (resetTemporal) window.DriveVisionFacade?.replay?.resetTemporalState?.();
     if (reset) {
       state.nextRecord = 0;
       window.CarrotVisionRaw?.clearState?.({ render: false, reason: "replay seek" });
@@ -501,14 +586,22 @@ window.CarrotVisionReplay = window.CarrotVisionReplay || (() => {
       applied = Number(
         window.CarrotVisionRaw?.applyCompactFrames?.(Array.from(latestByService.values()), {
           reason: "recorded replay",
-          render,
+          // Replay presentation is synchronized below after the complete
+          // batch has been applied. Per-service render requests would race
+          // the visible video frame and bypass the shared presented channel.
+          render: false,
           flushHud: true,
         }),
       ) || 0;
-    } else if (reset && render) {
-      window.requestCarrotVisionRender?.({ reason: "replay seek" });
     }
-    return { applied, reset, resetTemporal };
+    const result = { applied, reset, resetTemporal };
+    if (render) {
+      presentAppliedState(result, {
+        mediaTime: targetMs / 1000,
+        reason: options.reason || (reset ? "replay seek" : "replay state applied"),
+      });
+    }
+    return result;
   }
 
   function playbackTick(_now, metadata = null) {
@@ -520,20 +613,18 @@ window.CarrotVisionReplay = window.CarrotVisionReplay || (() => {
       (Number.isFinite(mediaTime) ? mediaTime : Number(videoEl.currentTime || 0)) * 1000,
       { render: false },
     );
-    if (result.applied || result.reset) {
-      const rendered = window.DriveVisionFacade?.replay?.renderVideoFrame?.({
-        force: result.reset,
-        resetTemporal: result.resetTemporal,
-      });
-      if (!rendered) {
-        window.requestCarrotVisionRender?.({
-          force: result.reset,
-          overlayDirty: true,
-          hudDirty: true,
-          reason: "replay video frame",
-        });
-      }
-    }
+    // Every decoded video frame is a presentation event, even when no cereal
+    // service changed at exactly that instant. AR follows this clock; gating it
+    // on rlog mutations freezes the marker between sparse records and can leave
+    // a nominal 60-second diagnostic with only a short prefix.
+    const stateChanged = Boolean(result.applied || result.reset || result.resetTemporal);
+    presentAppliedState(result, {
+      presentFrame: true,
+      overlayDirty: stateChanged,
+      hudDirty: stateChanged,
+      mediaTime: Number.isFinite(mediaTime) ? mediaTime : Number(videoEl.currentTime || 0),
+      reason: "replay video frame",
+    });
     syncTransport();
     schedulePlaybackTick();
   }
@@ -1074,6 +1165,21 @@ window.CarrotVisionReplay = window.CarrotVisionReplay || (() => {
   return {
     isActive: () => state.active,
     isReady: () => state.active && state.ready,
+    status: () => Object.freeze({
+      active: state.active,
+      ready: state.ready,
+      loading: state.loading,
+      route: state.route || null,
+      segment: state.segment || null,
+      currentTime: Number(videoEl?.currentTime || 0),
+      duration: replayDuration(),
+      paused: videoEl?.paused !== false,
+      ended: videoEl?.ended === true,
+      playbackRate: Number(videoEl?.playbackRate || 1),
+      timelineReady: state.timelineReady,
+      services: Object.freeze({ ...(state.manifest?.services || {}) }),
+    }),
+    diagnosticPlayback,
     reportRenderable,
     shouldHoldFrameDuringSeek,
     start,

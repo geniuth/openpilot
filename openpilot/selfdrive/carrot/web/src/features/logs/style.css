@@ -651,7 +651,15 @@
   flex: 1;
 }
 
+.dashcam-segment-topline {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-xs);
+}
+
 .dashcam-segment-badge {
+  min-width: 0;
   display: inline-flex;
   align-items: center;
   min-height: 22px;
@@ -662,6 +670,20 @@
   color: var(--md-on-surface-var);
   font-size: 11px;
   font-weight: 850;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dashcam-segment-read-status {
+  min-width: 0;
+  display: inline-flex;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+.dashcam-segment-read-status[hidden] {
+  display: none;
 }
 
 .dashcam-segment-name {
@@ -701,6 +723,11 @@
 .dashcam-group-menu-btn svg {
   width: 18px;
   height: 18px;
+}
+
+.dashcam-group-menu-btn--row {
+  display: inline-flex;
+  margin-left: auto;
 }
 
 .logs-loading-list {
@@ -1080,6 +1107,17 @@
   z-index: 5;
 }
 
+/* The log player uses the same persistent previous/play/next transport as the
+   drive replay. Plyr's own centre overlay would duplicate that control. */
+.dashcam-player-frame .plyr__control--overlaid {
+  display: none !important;
+}
+
+.dashcam-player-transport {
+  z-index: 4;
+  pointer-events: auto;
+}
+
 .dashcam-player-frame .plyr:-webkit-full-screen,
 .dashcam-player-frame .plyr:fullscreen,
 .dashcam-player-frame .plyr.plyr--fullscreen-active {
@@ -1121,7 +1159,7 @@
   margin: auto;
 }
 
-.dashcam-player-overlay--dashcam .dashcam-player-dialog {
+.dashcam-player-overlay--dashcam .dashcam-player-dialog:not(.dashcam-player-dialog--browsable) {
   width: min(84vw, 760px);
   max-width: min(96vw, 920px);
   max-height: min(84vh, 760px);
@@ -1156,12 +1194,8 @@
   transition: opacity .2s ease, transform .2s ease;
 }
 
-.dashcam-player-overlay.is-controls-hidden:not(.is-menu-open):not(.is-action-open) .dashcam-player-top {
-  opacity: 0;
-  transform: translateY(-10px);
-}
-
 .dashcam-player-toast {
+  display: none;
   position: absolute;
   top: 50%;
   left: 50%;
@@ -1466,6 +1500,7 @@
     display: flex;
     flex-direction: column;
     padding-top: 8px;
+    padding-right: 0;
   }
 
   .dashcam-route-head {
@@ -1489,11 +1524,22 @@
     height: 100%;
     flex-direction: column;
     justify-content: center;
-    align-items: stretch;
+    align-items: center;
     gap: 6px;
-    overflow: hidden;
-    padding: 8px 8px 8px 10px;
+    box-sizing: border-box;
+    overflow-y: auto;
+    padding: 8px;
     border-left: 1px solid color-mix(in srgb, var(--md-outline-var) 38%, transparent);
+    scrollbar-width: none;
+    text-align: center;
+  }
+
+  .dashcam-selection-row::-webkit-scrollbar {
+    display: none;
+  }
+
+  .dashcam-selection-row .dashcam-group-menu-btn--row {
+    margin-left: 0;
   }
 
   .dashcam-segment-list {
@@ -1543,21 +1589,36 @@
 
   .dashcam-segment-tile--compact .dashcam-segment-body {
     min-width: 0;
-    display: flex;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
     align-items: center;
     gap: 8px;
   }
 
+  .dashcam-segment-tile--compact .dashcam-segment-topline {
+    display: contents;
+  }
+
   .dashcam-segment-tile--compact .dashcam-segment-badge {
-    flex: 0 0 auto;
+    grid-column: 1;
+    grid-row: 1;
     min-height: 20px;
     padding-inline: 7px;
     font-size: 10.5px;
   }
 
   .dashcam-segment-tile--compact .dashcam-segment-name {
+    min-width: 0;
+    grid-column: 2;
+    grid-row: 1;
     margin-top: 0;
     font-size: 12.5px;
+  }
+
+  .dashcam-segment-tile--compact .dashcam-segment-read-status {
+    grid-column: 3;
+    grid-row: 1;
+    margin-left: 0;
   }
 
   .dashcam-segment-tile--compact .dashcam-menu-btn {
@@ -1637,4 +1698,3 @@
     font-size: 12.5px;
   }
 }
-

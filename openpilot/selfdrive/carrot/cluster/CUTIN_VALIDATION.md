@@ -1,6 +1,6 @@
 # Cut-in Route Validation Set
 
-Last validated: 2026-07-19
+Last validated: 2026-07-22
 
 This document records the route-based regression set used for the S50 cut-in
 logic in `radard.py` and the standalone offline validation tools.
@@ -37,7 +37,7 @@ first activation with current radard and the deployed model using:
 ```powershell
 .\.venv\Scripts\python.exe `
   openpilot\selfdrive\carrot\validate_radar_lead_model.py `
-  --model openpilot\selfdrive\carrot\models\radar_lead_multitask.npz
+  --model openpilot\selfdrive\carrot\radar\models\radar_lead_multitask.npz
 ```
 
 ## Sequential Video Review
@@ -178,6 +178,20 @@ to open the next case. Only final `leadOne` and `leadTwo` are displayed by
 default; recorded `radarState`, raw radar points, and source-head candidates
 remain available through the display checkboxes.
 
+The model `leadOne`/`leadTwo` continuity graph remains visible by default. The
+current-radard circles and its two additional graph lines require a full legacy
+radard recomputation and are disabled by default. Enable that slower comparison
+only when needed:
+
+```powershell
+py -3.12 openpilot/selfdrive/carrot/radar_lead_validation_review.py --compare-radard
+```
+
+The `--hybrid` replay path directly executes the on-device
+`VisionModelRadarController`. The replay layer only adapts recorded radar points
+and `modelV2` into runtime-shaped inputs; it does not independently reimplement
+the final lead or cut-in policy.
+
 Review only positive or negative cases:
 
 ```powershell
@@ -199,6 +213,13 @@ first even though lead acquisition can still occur:
 - `carnival-5b-15-truck`: no model cut-in from 45-50 s.
 - `ioniq9-a7-22-truck`: `leadTwo` id 56 at 20.58 s and `leadOne` id 56 at
   22.74 s, but no model cut-in from 20-29 s.
+
+The production-controller regression run on 2026-07-22 passed 51 of 54
+maintained detect/clear windows. The remaining failures are the close Carnival
+cut-in completing without the required `leadOne` takeover and two Palisade C21
+right cut-ins that are still missed. Only the listed windows are labeled; new
+reports must be added to `cutin_validation_cases.json` before a later change can
+be called regression-safe.
 
 ## Unit Coverage
 

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -7,7 +8,15 @@ CLUSTER_DIR = Path(__file__).resolve().parents[1] / "cluster"
 sys.path.insert(0, str(CLUSTER_DIR))
 
 from cluster_live import OpenpilotLiveSource
-from cluster_route_replay import RawCornerObject, RouteLogParser, adjacent_route_log_path
+from cluster_models import ModelPathPoint
+from cluster_route_replay import (
+  RawCornerObject,
+  RouteLogParser,
+  adjacent_route_log_path,
+  blend_frames,
+  frame_to_state,
+  model_lead_detections_from_model_v2,
+)
 
 
 def corner_object(t, slot, object_id, age, x, y, vx, vy):
@@ -139,6 +148,24 @@ def test_recorded_cutin_prompt_is_timestamped_for_replay_alert():
   assert any(detection.cut_in for detection in frame.detected_vehicles)
 
 
+def test_dedicated_cutin_sound_is_timestamped_for_replay_alert():
+  parser = RouteLogParser(recompute_cutins=False)
+  corner_lead = radar_lead(2540)
+  parser._update_radar_state(SimpleNamespace(
+    leadOne=radar_lead(62, d_rel=60.0, y_rel=0.0),
+    leadTwo=corner_lead,
+    leadsCutIn=[corner_lead],
+  ), 1.0)
+
+  parser._update_selfdrive_state(SimpleNamespace(
+    alertSound="radarCutin",
+    alertType="radarCutin/warning",
+  ), 1.01)
+
+  assert parser.recorded_cutin_sound
+  assert parser.recorded_cutin_sound_t == 1.01
+
+
 def test_live_selfdrive_state_passes_event_timestamp():
   calls = []
   source = object.__new__(OpenpilotLiveSource)
@@ -150,6 +177,150 @@ def test_live_selfdrive_state_passes_event_timestamp():
   source._apply_service_update("selfdriveState", 12.5)
 
   assert calls == [(source.sm["selfdriveState"], 12.5)]
+
+
+def test_live_longitudinal_plan_passes_service_validity():
+  calls = []
+  source = object.__new__(OpenpilotLiveSource)
+  source.sm = {"longitudinalPlan": SimpleNamespace(myDrivingMode=2)}
+  source.parser = SimpleNamespace(
+    _update_longitudinal_plan=lambda data, valid: calls.append((data, valid)),
+  )
+  source._service_valid = lambda service: service != "longitudinalPlan"
+
+  source._apply_service_update("longitudinalPlan", 12.5)
+
+  assert calls == [(source.sm["longitudinalPlan"], False)]
+
+
+def test_controls_active_lane_line_reaches_cluster_state():
+  parser = RouteLogParser()
+  parser._update_controls_state(SimpleNamespace(activeLaneLine=True))
+
+  frame = parser._frame_from_car_state(SimpleNamespace(), 1.0)
+  state = frame_to_state(frame)
+
+  assert frame.active_lane_line is True
+  assert state.active_lane_line is True
+
+
+def test_ev_mode_reaches_cluster_only_when_carstate_marks_it_valid():
+  parser = RouteLogParser()
+
+  active = parser._frame_from_car_state(SimpleNamespace(evModeValid=True, evModeActive=True), 1.0)
+  engine = parser._frame_from_car_state(SimpleNamespace(evModeValid=True, evModeActive=False), 2.0)
+  invalid = parser._frame_from_car_state(SimpleNamespace(evModeValid=False, evModeActive=True), 3.0)
+  unsupported = parser._frame_from_car_state(SimpleNamespace(), 4.0)
+
+  assert (active.ev_mode_valid, active.ev_mode_active) == (True, True)
+  assert (engine.ev_mode_valid, engine.ev_mode_active) == (True, False)
+  assert (invalid.ev_mode_valid, invalid.ev_mode_active) == (False, False)
+  assert (unsupported.ev_mode_valid, unsupported.ev_mode_active) == (False, False)
+  assert (frame_to_state(active).ev_mode_valid, frame_to_state(active).ev_mode_active) == (True, True)
+  assert (frame_to_state(invalid).ev_mode_valid, frame_to_state(invalid).ev_mode_active) == (False, False)
+
+
+def test_ev_mode_is_preserved_as_discrete_state_during_replay_interpolation():
+  parser = RouteLogParser()
+  base = parser._frame_from_car_state(SimpleNamespace(), 0.0)
+  active = replace(base, t=0.0, ev_mode_valid=True, ev_mode_active=True)
+  engine = replace(base, t=1.0, ev_mode_valid=True, ev_mode_active=False)
+
+  assert blend_frames(active, engine, 0.49).ev_mode_active is True
+  assert blend_frames(active, engine, 0.50).ev_mode_active is False
+
+
+def test_driving_mode_reaches_cluster_only_for_known_values():
+  parser = RouteLogParser()
+
+  for mode in (1, 2, 3, 4):
+    parser._update_longitudinal_plan(SimpleNamespace(myDrivingMode=mode))
+    frame = parser._frame_from_car_state(SimpleNamespace(), float(mode))
+    assert frame.driving_mode == mode
+    assert frame_to_state(frame).driving_mode == mode
+
+  for invalid_mode in (0, -1, 5, None):
+    parser._update_longitudinal_plan(SimpleNamespace(myDrivingMode=invalid_mode))
+    frame = parser._frame_from_car_state(SimpleNamespace(), 10.0)
+    assert frame.driving_mode is None
+    assert frame_to_state(frame).driving_mode is None
+
+  parser._update_longitudinal_plan(SimpleNamespace())
+  assert parser._frame_from_car_state(SimpleNamespace(), 11.0).driving_mode is None
+
+  parser._update_longitudinal_plan(SimpleNamespace(myDrivingMode=2), valid=False)
+  assert parser._frame_from_car_state(SimpleNamespace(), 12.0).driving_mode is None
+
+
+def test_driving_mode_is_held_between_plan_updates_and_blended_discretely():
+  parser = RouteLogParser()
+  parser._update_longitudinal_plan(SimpleNamespace(myDrivingMode=1))
+  eco = parser._frame_from_car_state(SimpleNamespace(), 0.0)
+  held = parser._frame_from_car_state(SimpleNamespace(), 0.01)
+  high = replace(eco, t=1.0, driving_mode=4)
+
+  assert held.driving_mode == 1
+  assert blend_frames(eco, high, 0.49).driving_mode == 1
+  assert blend_frames(eco, high, 0.50).driving_mode == 4
+
+
+def test_lane_change_animation_keeps_target_floor_and_lane_grid_without_blinker():
+  parser = RouteLogParser()
+  base = parser._frame_from_car_state(SimpleNamespace(), 1.0)
+  lane_lines = tuple(
+    (
+      ModelPathPoint(0.0, lateral_m),
+      ModelPathPoint(30.0, lateral_m),
+    )
+    for lateral_m in (-5.4, -1.8, 1.8, 5.4)
+  )
+  frame = replace(
+    base,
+    lane_change="left",
+    lane_change_phase="changing",
+    lane_change_progress=0.5,
+    left_signal=False,
+    right_signal=False,
+    left_lane_visible=False,
+    right_lane_visible=False,
+    extra_left_lane_visible=False,
+    extra_right_lane_visible=False,
+    left_road_edge_offset=-2.0,
+    right_road_edge_offset=2.0,
+    model_lane_lines=lane_lines,
+  )
+
+  state = frame_to_state(frame)
+
+  assert state.highlight_lane == "left"
+  assert state.highlight_lane_offset == -1.0
+  assert state.ego_lane_offset == -0.5
+  assert [lane.offset for lane in state.lanes] == [-1.5, -0.5, 0.5, 1.5]
+  assert [lane.visible for lane in state.lanes] == [True, True, True, False]
+
+
+def model_lead(probability, distance=50.0):
+  return SimpleNamespace(
+    prob=probability,
+    x=(distance,),
+    y=(0.0,),
+    v=(15.0,),
+    a=(0.0,),
+    xStd=(1.0,),
+    yStd=(0.5,),
+  )
+
+
+def test_model_lead_display_hides_low_probability_candidates():
+  model = SimpleNamespace(
+    leadsV3=(model_lead(0.49), model_lead(0.50, 60.0)),
+    velocity=SimpleNamespace(x=(20.0,)),
+  )
+
+  detections = model_lead_detections_from_model_v2(model)
+
+  assert [d.label for d in detections] == ["M2"]
+  assert detections[0].probability == 0.50
 
 
 def test_live_calibration_height_is_not_overwritten_by_camera_odometry():
