@@ -514,7 +514,7 @@ def process_archive_results(client: socket.socket, pending_archives: list) -> No
 
 
 def run_stream(client: socket.socket) -> None:
-  from cereal import messaging
+  from openpilot.cereal import messaging
   from openpilot.common.params import Params
   from openpilot.selfdrive.selfdrived.alertmanager import set_offroad_alert
 
@@ -552,7 +552,7 @@ def run_stream(client: socket.socket) -> None:
 
     monitor = ClientHeartbeatMonitor(client, control)
     monitor.start()
-    params.put_bool("IsTakingSnapshot", True, block=True)
+    params.put_bool("IsTakingSnapshot", True)
     snapshot_flag_set = True
     set_offroad_alert("Offroad_IsTakingSnapshot", True)
 
@@ -618,7 +618,7 @@ def run_stream(client: socket.socket) -> None:
     if monitor is not None:
       monitor.stop()
     if snapshot_flag_set:
-      params.put_bool("IsTakingSnapshot", False, block=True)
+      params.put_bool("IsTakingSnapshot", False)
       set_offroad_alert("Offroad_IsTakingSnapshot", False)
     lease.release()
 
