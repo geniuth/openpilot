@@ -56,8 +56,9 @@ Select the body of a setting, outside its value control, to open its detail scre
 - Network or documentation processing failures do not disable viewing or changing the setting.
 - Korean and English Carrot Web sessions use their matching guide language.
 - Until a Chinese guide exists, Chinese titles and short descriptions remain Chinese while the detailed panel explicitly falls back to English.
-- `User Guide > Understanding Settings > All Settings` in the GitHub Wiki lists every
-  setting with the same menu hierarchy, order, and current-language title as Carrot Web.
+- In the GitHub Wiki sidebar, `User Guide > Understanding Settings > All Settings` follows
+  Carrot Web's Korean menu hierarchy and order. The central settings catalog remains the
+  multilingual Korean, English, and Chinese directory.
 
 The information box stays vertically below the existing setting box in both portrait and landscape layouts. Multiplier and default actions keep their existing position and behavior inside the setting box.
 
@@ -223,6 +224,8 @@ An APN label remaining in the `ShowRouteInfo` description refers to route-input 
 On Hyundai/Kia CAN-FD hybrids, the external HUD's green `EV` indicator is enabled only when ECAN `0xFA` and `0x230` are both present with DLC32. It decodes the four-bit hybrid power-flow mode in `0x230` and shows `EV` for the observed motor/regen modes 1, 2, and 6. The normal HUD shows it between vehicle speed and cruise-set speed; full navigation intentionally omits it. The indicator remains hidden for other mode values and when the capability or sample is missing, invalid, or stale.
 
 The normal external HUD also shows the current driving mode beside the traffic-state dot above vehicle speed. `MyDrivingMode` value `1` is a green Eco badge, `2` an orange Safe badge, `3` a white Normal badge, and `4` a red High badge. The badge is hidden for an unavailable, invalid, or stale `longitudinalPlan` and for values outside that range; full navigation omits it. The adjacent red or green dot is an independent model traffic-state indicator, not a driving-mode state.
+
+The normal and road camera HUDs use the same fixed TPMS vehicle diagram and position below the acceleration, steering, fuel, and DEF gauges. The whole display is hidden only when all four pressure values are unavailable; an individually missing value shows `--`. Pressures below 31 psi are red, and no surrounding card or outline is drawn. When external navigation is active or its dashboard is connected, a green `NAV` appears below the Wi-Fi icon instead of the former lower-right `NAVI` label. The center clock, EV indicator, and fuel/DEF gauges remain unchanged.
 
 ### Carrot Vision AR and replay navigation events
 
