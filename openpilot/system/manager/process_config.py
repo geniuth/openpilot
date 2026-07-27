@@ -219,6 +219,8 @@ procs = [
 
   # Wayon 360 라이브 스트리밍 서버 (config.json 존재 시 상시 기동, 오프로드 뷰어 접속 처리)
   PythonProcess("wayon_live", "openpilot.system.wayon_live_stream", wayon_remote_ready, restart_if_crash=True),
+  # Cloudflare 터널 supervisor 영구화 (재부팅 후에도 원격 라이브뷰 유지, 오프로드 전용은 스크립트가 처리)
+  PythonProcess("wayon_remote", "openpilot.system.wayon_remote", wayon_remote_ready, restart_if_crash=True),
 ]
 
 managed_processes = {p.name: p for p in procs}
