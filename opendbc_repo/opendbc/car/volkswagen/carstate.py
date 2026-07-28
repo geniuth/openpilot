@@ -7,6 +7,10 @@ from opendbc.car.volkswagen.values import DBC, CANBUS, NetworkLocation, RADAR_DI
 
 ButtonType = structs.CarState.ButtonEvent.Type
 
+# ID.4 Pro 사용가능 HV 배터리 용량[Wh]. Motor_16의 에너지량을 0~1 게이지로 환산할 때 쓴다.
+# (정확 용량은 BMS_04/MEB_HVEM_*(alt 버스)에 있으나 이 하네스엔 없어 공칭값 사용)
+MEB_USABLE_BATTERY_WH = 77000.0
+
 
 class CarState(CarStateBase):
   def __init__(self, CP):
@@ -332,6 +336,13 @@ class CarState(CarStateBase):
     ret.espDisabled = False
     ret.espActive   = False
 
+    # HV 배터리 잔량 (infiniteCable2 방식). Motor_16(PT 버스)의 BMS 에너지량[Wh]을
+    # ID.4 Pro 사용가능 용량으로 정규화해 0~1로 넣는다. BMS_04/MEB_HVEM_*(alt 버스)는
+    # 이 하네스에 없어 정확 용량/SOH는 못 받는다 -> 공칭 용량 기준 근사.
+    battery_wh = pt_cp.vl["Motor_16"]["MO_Energieinhalt_BMS"]
+    if battery_wh > 0:
+      ret.fuelGauge = min(1.0, max(0.0, battery_wh / MEB_USABLE_BATTERY_WH))
+
     self.frame += 1
     return ret
 
@@ -490,6 +501,7 @@ class CarState(CarStateBase):
       ("ESC_50", 50),       # From ESC (Yaw Rate, EPB, Motion State)
       ("Motor_51", 50),     # From ECM (TSK Status, ACC)
       ("Motor_14", 10),     # From ECM (제동등 스위치)
+      ("Motor_16", 10),     # From ECM (HV 배터리 에너지량 Wh)
       ("GRA_ACC_01", 33),   # From Gateway (ACC 버튼)
       ("Gateway_72", 10),   # From Gateway (도어)
       ("Airbag_02", 5),     # From 에어백 모듈 (안전벨트)

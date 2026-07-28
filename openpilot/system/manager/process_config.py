@@ -221,6 +221,8 @@ procs = [
   PythonProcess("wayon_live", "openpilot.system.wayon_live_stream", wayon_remote_ready, restart_if_crash=True),
   # Cloudflare 터널 supervisor 영구화 (재부팅 후에도 원격 라이브뷰 유지, 오프로드 전용은 스크립트가 처리)
   PythonProcess("wayon_remote", "openpilot.system.wayon_remote", wayon_remote_ready, restart_if_crash=True),
+  # ID.4 배터리/위치 텔레메트리 -> Wayon Cloud (앱의 배터리 잔량·주차위치 표시용)
+  PythonProcess("wayon_telemetry", "openpilot.system.wayon_vehicle_telemetry", wayon_remote_ready, restart_if_crash=True),
 ]
 
 managed_processes = {p.name: p for p in procs}
