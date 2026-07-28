@@ -94,7 +94,8 @@ def post_state(config: dict, payload: dict) -> bool:
 
 def main() -> None:
   params = Params()
-  sm = messaging.SubMaster(["carState", "liveLocationKalman"])
+  # carrot에는 liveLocationKalman이 없다 (gpsLocation / gpsLocationExternal 사용)
+  sm = messaging.SubMaster(["carState", "gpsLocation", "gpsLocationExternal"])
 
   last = load_last_state()
   last_battery_wh = last.get("battery_wh")
@@ -158,13 +159,16 @@ def main() -> None:
       "gps": {},
     }
 
-    if sm.valid.get("liveLocationKalman"):
-      llk = sm["liveLocationKalman"]
-      if llk.positionGeodetic.valid:
-        payload["gps"]["latitude"] = float(llk.positionGeodetic.value[0])
-        payload["gps"]["longitude"] = float(llk.positionGeodetic.value[1])
-      if llk.velocityCalibrated.valid:
-        payload["gps"]["speedMps"] = float(llk.velocityCalibrated.value[0])
+    for gps_service in ("gpsLocationExternal", "gpsLocation"):
+      if sm.valid.get(gps_service) and sm.seen.get(gps_service):
+        gps = sm[gps_service]
+        if gps.hasFix:
+          payload["gps"]["latitude"] = float(gps.latitude)
+          payload["gps"]["longitude"] = float(gps.longitude)
+          payload["gps"]["speedMps"] = float(gps.speed)
+          payload["gps"]["bearingDeg"] = float(gps.bearingDeg)
+          payload["gps"]["accuracyM"] = float(gps.horizontalAccuracy)
+          break
 
     if post_state(config, payload):
       last_upload_at = now
