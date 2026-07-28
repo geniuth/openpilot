@@ -189,21 +189,23 @@ A lower `AutoNaviSpeedDecelRate` begins slowing farther away. `AutoNaviSpeedSafe
 <a id="vehicle-hardware"></a>
 ## Vehicle and hardware
 
-These 15 settings describe the car, harness, and device hardware configuration. Do not enable them merely as a display experiment.
+These 14 settings describe the car, harness, and device hardware configuration. Do not enable them merely as a display experiment.
 
 | Group | Parameters | Purpose |
 |---|---|---|
 | Hyundai/Kia | `HyundaiCameraSCC`, `IsLdwsCar`, `HapticFeedbackWhenSpeedCamera` | SCC connection, LDWS behavior, and speed-event haptics |
 | CAN FD/HDA | `CanfdHDA2`, `CanfdDebug`, `HDPuse` | HDA2 selection, CAN FD diagnostics, and HDP |
-| Radar | `EnableRadarTracks`, `EnableCornerRadar`, `RadarLeadModelMode` | SCC radar, raw tracks, corner radar, and lead selection |
+| Radar | `EnableRadarTracks`, `EnableCornerRadar`, `CarrotRadarMode` | SCC radar, raw tracks, corner radar, and Carrot Radar processing |
 | Driver monitoring | `DisableDM`, `MuteDoor`, `MuteSeatbelt` | Driver monitoring and selected vehicle alerts |
 | Vehicle assistance | `MaxAngleFrames`, `SpeedFromPCM` | Steering-angle frames and stock-SCC speed control |
 | Device hardware | `HardwareC3xLite` | Speakerless C3X Lite audio and process configuration |
 
 > [!CAUTION]
-> Incorrect `HyundaiCameraSCC`, `CanfdHDA2`, `EnableRadarTracks`, `RadarLeadModelMode`, or `SpeedFromPCM` values can change vehicle identification, SCC, radar, or longitudinal behavior. Confirm the vehicle, model year, HDA generation, harness location, and whether stock ACC is retained.
+> Incorrect `HyundaiCameraSCC`, `CanfdHDA2`, `EnableRadarTracks`, `CarrotRadarMode`, or `SpeedFromPCM` values can change vehicle identification, SCC, radar, or longitudinal behavior. Confirm the vehicle, model year, HDA generation, harness location, and whether stock ACC is retained.
 
 See [Radar tracks and corner radar](radar.md) before changing radar modes.
+
+`CarrotRadarMode` continuously tracks vehicles with the front and corner radars to detect cut-ins, then matches camera and radar information in a new way to select the vehicle ahead. On vehicles with neither corner-radar nor radar-track support, it behaves the same as the existing mode. It can change acceleration and braking, so enable it only on the same vehicle after completing validation. The value is latched when the next OnRoad session starts, so end the current drive and restart the vehicle or reboot the device after changing it. The previous `RadarMotionMode` value is migrated to the new name once on the first startup after updating.
 
 `HardwareC3xLite` must remain off on standard C3 and C3X hardware. Enable it only on a C3X Lite, then reboot the device. The setting skips the unavailable amplifier so startup is not delayed by I2C retries, uses the GPIO buzzer for alerts, disables `micd`, `soundd`, and `loggerd`, and turns off `RecordAudio`. Normal route logging is unavailable while this hardware mode is enabled.
 
@@ -220,6 +222,8 @@ Display contains 33 settings. Most on-road display settings are easy to reverse;
 | External HUD | `ClusterHud` and related `ClusterHud*` settings | Supported TURZX HUD layout, camera, radar, encoder, and performance options |
 
 An APN label remaining in the `ShowRouteInfo` description refers to route-input state. It is not an indication that CarrotMan or CarrotLink is supported.
+
+`ClusterHudTheme=1` (Dark) renders the normal HUD's empty background in the same pure black used behind maps and while navigation is disconnected. Auto (`0`) uses the same dark palette from 18:00 to 06:00. The road, gauges, and regular information panels retain distinct dark shades for separation and readability.
 
 On Hyundai/Kia CAN-FD hybrids, the external HUD's green `EV` indicator is enabled only when ECAN `0xFA` and `0x230` are both present with DLC32. It decodes the four-bit hybrid power-flow mode in `0x230` and shows `EV` for the observed motor/regen modes 1, 2, and 6. The normal HUD shows it between vehicle speed and cruise-set speed; full navigation intentionally omits it. The indicator remains hidden for other mode values and when the capability or sample is missing, invalid, or stale.
 

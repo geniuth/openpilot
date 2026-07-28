@@ -15,6 +15,15 @@ except ModuleNotFoundError:
 
 WEBCAM = os.getenv("USE_WEBCAM") is not None
 CARROT_WEB_EXTERNAL = os.getenv("CARROT_WEB_EXTERNAL") == "1"
+_carrot_radar_mode_for_drive = 0
+
+
+def _carrot_radar_mode(started: bool, params: Params) -> int:
+  """Refresh off-road, then latch one radar publisher for the whole drive."""
+  global _carrot_radar_mode_for_drive
+  if not started:
+    _carrot_radar_mode_for_drive = params.get_int("CarrotRadarMode")
+  return _carrot_radar_mode_for_drive
 
 def driverview(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started or params.get_bool("IsDriverViewEnabled")
@@ -61,6 +70,17 @@ def always_run(started: bool, params: Params, CP: car.CarParams) -> bool:
 
 def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started
+
+
+def conventional_radard(started: bool, params: Params, CP: car.CarParams) -> bool:
+  mode = _carrot_radar_mode(started, params)
+  return started and mode != 1
+
+
+def dpath_radard(started: bool, params: Params, CP: car.CarParams) -> bool:
+  mode = _carrot_radar_mode(started, params)
+  return started and mode == 1
+
 
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
@@ -177,7 +197,8 @@ procs = [
   PythonProcess("plannerd", "openpilot.selfdrive.controls.plannerd", not_long_maneuver),
   PythonProcess("maneuversd", "openpilot.tools.longitudinal_maneuvers.maneuversd", long_maneuver),
   PythonProcess("lateral_maneuversd", "openpilot.tools.lateral_maneuvers.lateral_maneuversd", lat_maneuver),
-  PythonProcess("radard", "openpilot.selfdrive.controls.radard", only_onroad),
+  PythonProcess("radard", "openpilot.selfdrive.controls.radard", conventional_radard),
+  PythonProcess("radard_dpath", "openpilot.selfdrive.carrot.radar.radard_dpath", dpath_radard),
   PythonProcess("hardwared", "openpilot.system.hardware.hardwared", always_run),
   PythonProcess("modem", "openpilot.system.hardware.tici.modem", always_run, enabled=TICI),
   PythonProcess("tombstoned", "openpilot.system.tombstoned", always_run, enabled=not PC),

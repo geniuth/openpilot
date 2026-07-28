@@ -46,6 +46,22 @@ def test_c3x_lite_hardware_setting_is_exposed(settings, params):
   assert device_hardware["params"] == ["HardwareC3xLite"]
 
 
+def test_carrot_radar_mode_replaces_removed_model_mode(settings, params):
+  by_name = {p["name"]: p for p in params}
+  assert "RadarLeadModelMode" not in by_name
+  assert "RadarDPathMode" not in by_name
+  assert "RadarMotionMode" not in by_name
+  assert (by_name["CarrotRadarMode"]["min"], by_name["CarrotRadarMode"]["max"]) == (0, 1)
+  assert by_name["CarrotRadarMode"]["default"] == 0
+  assert by_name["CarrotRadarMode"]["control"] == "toggle"
+  assert by_name["CarrotRadarMode"]["risk"] == "high"
+  assert "재부팅" in by_name["CarrotRadarMode"]["descr"]
+  assert "restart the vehicle" in by_name["CarrotRadarMode"]["edescr"]
+  vehicle = next(category for category in settings["menu"] if category["id"] == "VEHICLE")
+  radar = next(group for group in vehicle["groups"] if group["id"] == "VEH_RADAR")
+  assert radar["params"] == ["EnableRadarTracks", "EnableCornerRadar", "CarrotRadarMode"]
+
+
 def test_parameter_names_are_unique(params):
   names = [p["name"] for p in params]
   assert len(names) == len(set(names))
