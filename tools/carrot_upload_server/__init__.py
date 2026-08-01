@@ -1,1 +1,0 @@
-"""Carrot public upload service."""

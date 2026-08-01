@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """ID.4(MEB) 차량 상태를 Wayon Cloud로 올린다.
 
-carState.fuelGauge(= Motor_16의 HV 배터리 에너지량 정규화)와 GPS를 주기적으로 POST해서
-휴대폰 앱이 배터리 잔량·주차위치를 볼 수 있게 한다. 충전 전력은 주차 중 배터리량 증가
-기울기로 추정한다(MEB_HVEM_01은 이 하네스에 없음).
+배터리 잔량·오도미터·외기온·12V 전압과 GPS를 주기적으로 POST해서 휴대폰 앱이
+차 상태를 볼 수 있게 한다.
+
+배터리는 CAN(Motor_16)에서 직접 디코딩한다. carState는 card 프로세스가 온로드에서만
+돌아 주차 중엔 비어 있어, 충전 중 감시가 되려면 CAN 직접 샘플링이어야 한다.
+충전 전력은 배터리량 증가 기울기로 추정한다(전용 신호 MEB_HVEM_01 수신 여부 미검증).
 
 - 주행 중: TELEMETRY_ONROAD_S 간격
 - 주차 중: TELEMETRY_OFFROAD_S 간격 + 배터리 변화 감지 시 즉시
@@ -28,6 +31,8 @@ TELEMETRY_OFFROAD_S = 600.0
 BATTERY_DELTA_TRIGGER_WH = 300.0
 # ID.4 Pro 사용가능 용량[Wh] (carstate의 MEB_USABLE_BATTERY_WH와 같은 값)
 USABLE_BATTERY_WH = 77000.0
+# ID.4 Pro 총 용량[Wh] (SOH = 현재 만충용량 / 이 값)
+NOMINAL_BATTERY_WH = 82000.0
 # 충전으로 판정할 최소 증가율[W]
 CHARGING_MIN_W = 300.0
 
@@ -60,12 +65,14 @@ def utc_now() -> str:
   return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def build_vehicle_block(battery_wh: float | None, charge_power_w: float | None) -> dict:
+def build_vehicle_block(battery_wh: float | None, charge_power_w: float | None,
+                        capacity_wh: float | None = None) -> dict:
   vehicle: dict = {}
+  usable = capacity_wh if (capacity_wh and capacity_wh > 0) else USABLE_BATTERY_WH
   if battery_wh is not None and battery_wh > 0:
     vehicle["battery_wh"] = round(battery_wh, 1)
-    vehicle["capacity_wh"] = USABLE_BATTERY_WH
-    vehicle["soc_percent"] = round(battery_wh / USABLE_BATTERY_WH * 100.0, 1)
+    vehicle["capacity_wh"] = round(usable, 0)
+    vehicle["soc_percent"] = round(min(100.0, battery_wh / usable * 100.0), 1)
   if charge_power_w is not None and charge_power_w >= CHARGING_MIN_W:
     vehicle["charging"] = True
     vehicle["charge_power_w"] = round(charge_power_w, 0)
@@ -79,7 +86,8 @@ def merge_last_known(vehicle: dict, last_known: dict) -> dict:
   주차 후에도 앱이 '주차 시점의 잔량/주행거리'를 보여주게 한다."""
   merged = dict(vehicle)
   fresh = False
-  for key in ("battery_wh", "capacity_wh", "soc_percent", "odometer_km", "outside_temp_c"):
+  for key in ("battery_wh", "capacity_wh", "soc_percent", "odometer_km", "outside_temp_c",
+              "soh_percent", "hv_voltage"):
     if merged.get(key) is None and last_known.get(key) is not None:
       merged[key] = last_known[key]
     elif merged.get(key) is not None and key in ("battery_wh", "odometer_km"):
@@ -92,25 +100,36 @@ def merge_last_known(vehicle: dict, last_known: dict) -> dict:
 
 
 def sample_vehicle_can(timeout_s: float = 4.0) -> dict:
-  """오도미터·외기온도를 CAN에서 짧게 샘플링한다.
+  """차량 값들을 CAN에서 짧게 샘플링한다.
 
-  carState에는 해당 필드가 없어 여기서 직접 디코딩한다 (주행 코드 무수정).
-  - bus0 Diagnose_01.KBI_Kilometerstand : 계기판 총 주행거리[km]
-  - bus1 Klima_Sensor_02.BCM1_Aussen_Temp_ungef : 외기온도[degC]
-  실차 rlog에서 두 메시지 모두 수신 확인됨 (2026-07).
+  carState는 card 프로세스가 온로드에서만 돌아 주차 중엔 비어 있다.
+  그래서 배터리까지 여기서 직접 디코딩해야 충전 중 모니터링이 된다 (주행 코드 무수정).
+
+  bus0
+  - Motor_16.MO_Energieinhalt_BMS      : HV 배터리 에너지량[Wh]  <- 잔량/충전 판정의 핵심
+  - Diagnose_01.KBI_Kilometerstand     : 계기판 총 주행거리[km]
+  bus1
+  - Klima_Sensor_02.BCM1_Aussen_Temp_ungef : 외기온도[degC]
+  - BMS_04.BMS_Kapazitaet_02           : 배터리 용량[Ah] -> 실제 용량/SOH (수신 여부 미검증)
+  - MEB_HVEM_01.Battery_Voltage        : HV 전압[V]      (수신 여부 미검증)
+
+  BMS_04/MEB_HVEM_01은 이 하네스에서 수신되는지 아직 확인 전이라, 값이 오면 쓰고
+  없으면 조용히 건너뛴다(공칭 용량으로 폴백).
   """
   result: dict = {}
   try:
     from opendbc.can import CANParser
-    cp0 = CANParser("vw_meb", [("Diagnose_01", 1)], 0)
-    cp1 = CANParser("vw_meb", [("Klima_Sensor_02", 1)], 1)
+    cp0 = CANParser("vw_meb", [("Motor_16", 10), ("Diagnose_01", 1)], 0)
+    cp1 = CANParser("vw_meb", [("Klima_Sensor_02", 1), ("BMS_04", 1), ("MEB_HVEM_01", 1)], 1)
   except Exception as exc:
     print(f"Wayon telemetry: CAN parser unavailable: {exc}", flush=True)
     return result
 
   sock = messaging.sub_sock("can", timeout=200)
   deadline = time.monotonic() + max(0.5, timeout_s)
-  while time.monotonic() < deadline and len(result) < 2:
+  hv_voltage = None
+  capacity_ah = None
+  while time.monotonic() < deadline:
     msgs = messaging.drain_sock(sock)
     if not msgs:
       continue
@@ -122,12 +141,36 @@ def sample_vehicle_can(timeout_s: float = 4.0) -> dict:
       break
 
     # vl은 미수신이어도 기본값 0을 주므로, vl_all(이번 update에서 실제 수신된 값들)로 판정한다
+    if cp0.vl_all["Motor_16"].get("MO_Energieinhalt_BMS"):
+      wh = cp0.vl["Motor_16"]["MO_Energieinhalt_BMS"]
+      if wh > 0:
+        result["battery_wh"] = float(wh)
     if cp0.vl_all["Diagnose_01"].get("KBI_Kilometerstand"):
       odo = cp0.vl["Diagnose_01"]["KBI_Kilometerstand"]
       if odo > 0:
         result["odometer_km"] = float(odo)
     if cp1.vl_all["Klima_Sensor_02"].get("BCM1_Aussen_Temp_ungef"):
       result["outside_temp_c"] = float(cp1.vl["Klima_Sensor_02"]["BCM1_Aussen_Temp_ungef"])
+    if cp1.vl_all["MEB_HVEM_01"].get("Battery_Voltage"):
+      v = cp1.vl["MEB_HVEM_01"]["Battery_Voltage"]
+      if v > 0:
+        hv_voltage = float(v)
+    if cp1.vl_all["BMS_04"].get("BMS_Kapazitaet_02"):
+      ah = cp1.vl["BMS_04"]["BMS_Kapazitaet_02"]
+      if ah > 0:
+        capacity_ah = float(ah)
+
+    if "battery_wh" in result and "odometer_km" in result and "outside_temp_c" in result:
+      break
+
+  # 실제 용량/SOH: BMS 용량[Ah] x HV 전압[V] = 현재 만충 용량[Wh]
+  if capacity_ah and hv_voltage:
+    capacity_wh = capacity_ah * hv_voltage
+    if 20000 < capacity_wh < 150000:  # 상식 범위 밖이면 스케일 해석이 틀린 것 -> 버림
+      result["capacity_wh"] = round(capacity_wh, 0)
+      result["soh_percent"] = round(capacity_wh / NOMINAL_BATTERY_WH * 100.0, 1)
+  if hv_voltage:
+    result["hv_voltage"] = round(hv_voltage, 1)
   return result
 
 
@@ -152,7 +195,7 @@ def post_state(config: dict, payload: dict) -> bool:
 def main() -> None:
   params = Params()
   # carrot에는 liveLocationKalman이 없다 (gpsLocation / gpsLocationExternal 사용)
-  sm = messaging.SubMaster(["carState", "gpsLocation", "gpsLocationExternal"])
+  sm = messaging.SubMaster(["carState", "gpsLocation", "gpsLocationExternal", "peripheralState"])
 
   last = load_last_state()
   last_battery_wh = last.get("battery_wh")
@@ -173,6 +216,8 @@ def main() -> None:
     onroad = params.get_bool("IsOnroad")
     now = time.monotonic()
 
+    # 배터리 잔량: 주행 중엔 carState(가벼움), 주차 중엔 CAN 직접 샘플링으로 얻는다.
+    # (card 프로세스가 온로드 전용이라 주차 중엔 carState가 비어 충전 감시가 안 됐다)
     battery_wh = None
     if sm.updated["carState"] and sm.valid["carState"]:
       gauge = sm["carState"].fuelGauge
@@ -199,13 +244,36 @@ def main() -> None:
     if now - last_upload_at < interval and not battery_moved:
       continue
 
-    vehicle = build_vehicle_block(battery_wh, charge_power_w)
-    # 오도미터/외기온도는 carState에 없어 CAN에서 직접 샘플링 (업로드 직전에만).
-    # 차가 꺼져 있으면 CAN이 없어 빈 dict가 온다.
-    vehicle.update(sample_vehicle_can())
+    # 배터리/오도미터/외기온·용량은 CAN에서 직접 샘플링 (업로드 직전에만).
+    # 차가 완전히 잠들면 CAN이 없어 빈 dict가 온다.
+    sampled = sample_vehicle_can()
+
+    # 주차 중엔 carState가 없으므로 CAN 샘플값이 배터리의 유일한 소스가 된다.
+    if sampled.get("battery_wh"):
+      battery_wh = sampled["battery_wh"]
+      # 충전 판정도 이 값으로 다시 계산 (증가 기울기)
+      if last_battery_at is not None and last_battery_wh is not None:
+        dt_h = (now - last_battery_at) / 3600.0
+        if dt_h > 0.02:
+          delta_wh = battery_wh - last_battery_wh
+          charge_power_w = delta_wh / dt_h if delta_wh > 0 else None
+      if last_battery_at is None or abs(battery_wh - (last_battery_wh or 0)) >= BATTERY_DELTA_TRIGGER_WH:
+        last_battery_wh, last_battery_at = battery_wh, now
+
+    vehicle = build_vehicle_block(battery_wh, charge_power_w, sampled.get("capacity_wh"))
+    for key in ("odometer_km", "outside_temp_c", "soh_percent", "hv_voltage"):
+      if sampled.get(key) is not None:
+        vehicle[key] = sampled[key]
+
+    # 12V 보조 배터리: 판다가 차량 전원선에서 측정한 입력 전압
+    if sm.valid.get("peripheralState") and sm.seen.get("peripheralState"):
+      mv = sm["peripheralState"].voltage
+      if mv and mv > 0:
+        vehicle["aux_voltage"] = round(mv / 1000.0, 2)
 
     # 이번에 새로 측정된 값이 있으면 '마지막 알려진 값'으로 저장
-    for key in ("battery_wh", "capacity_wh", "soc_percent", "odometer_km", "outside_temp_c"):
+    for key in ("battery_wh", "capacity_wh", "soc_percent", "odometer_km", "outside_temp_c",
+                "soh_percent", "hv_voltage", "aux_voltage"):
       if vehicle.get(key) is not None:
         last[key] = vehicle[key]
         last["measured_at"] = utc_now()
