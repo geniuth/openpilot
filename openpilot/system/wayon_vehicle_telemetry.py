@@ -36,6 +36,9 @@ NOMINAL_BATTERY_WH = 82000.0
 # 충전으로 판정할 최소 증가율[W]
 CHARGING_MIN_W = 300.0
 
+# can 구독 소켓 (재사용)
+_CAN_SOCK = None
+
 
 def read_config() -> dict:
   try:
@@ -99,33 +102,40 @@ def merge_last_known(vehicle: dict, last_known: dict) -> dict:
   return merged
 
 
-def sample_vehicle_can(timeout_s: float = 4.0) -> dict:
+def sample_vehicle_can(timeout_s: float = 6.0) -> dict:
   """차량 값들을 CAN에서 짧게 샘플링한다.
 
   carState는 card 프로세스가 온로드에서만 돌아 주차 중엔 비어 있다.
   그래서 배터리까지 여기서 직접 디코딩해야 충전 중 모니터링이 된다 (주행 코드 무수정).
 
-  bus0
+  주차/충전 중 실측(2026-08): 아래가 모두 bus1로 수신된다. 주행 중엔 bus0로 오므로
+  양쪽 버스를 다 파싱한다.
   - Motor_16.MO_Energieinhalt_BMS      : HV 배터리 에너지량[Wh]  <- 잔량/충전 판정의 핵심
+  - HVEM_02.HVEM_Nutzbare_Energie      : 가용 에너지[Wh] (Motor_16과 동일값으로 교차검증됨)
+  - MEB_HVEM_01.Battery_Voltage        : HV 전압[V]  (실측 369.2V)
+  - BMS_04.BMS_Kapazitaet_02           : 배터리 용량[Ah] -> 실제 용량/SOH
   - Diagnose_01.KBI_Kilometerstand     : 계기판 총 주행거리[km]
-  bus1
-  - Klima_Sensor_02.BCM1_Aussen_Temp_ungef : 외기온도[degC]
-  - BMS_04.BMS_Kapazitaet_02           : 배터리 용량[Ah] -> 실제 용량/SOH (수신 여부 미검증)
-  - MEB_HVEM_01.Battery_Voltage        : HV 전압[V]      (수신 여부 미검증)
-
-  BMS_04/MEB_HVEM_01은 이 하네스에서 수신되는지 아직 확인 전이라, 값이 오면 쓰고
-  없으면 조용히 건너뛴다(공칭 용량으로 폴백).
+  - Klima_Sensor_02.BCM1_Aussen_Temp_ungef : 외기온도[degC] (주행 중에만 수신)
   """
   result: dict = {}
+  # 같은 메시지가 주행 중엔 bus0, 주차/충전 중엔 bus1로 온다(실측). 양쪽 다 파싱한다.
+  MSGS = [("Motor_16", 2), ("HVEM_02", 10), ("MEB_HVEM_01", 100),
+          ("BMS_04", 2), ("Diagnose_01", 1), ("Klima_Sensor_02", 1)]
   try:
     from opendbc.can import CANParser
-    cp0 = CANParser("vw_meb", [("Motor_16", 10), ("Diagnose_01", 1)], 0)
-    cp1 = CANParser("vw_meb", [("Klima_Sensor_02", 1), ("BMS_04", 1), ("MEB_HVEM_01", 1)], 1)
+    parsers = [CANParser("vw_meb", MSGS, bus) for bus in (0, 1)]
   except Exception as exc:
     print(f"Wayon telemetry: CAN parser unavailable: {exc}", flush=True)
     return result
 
-  sock = messaging.sub_sock("can", timeout=200)
+  # 소켓을 매번 새로 열면 첫 호출(프로세스 기동 직후)에 연결 워밍업 때문에 아무것도 못 받는다.
+  # 한 번 만들어 재사용한다.
+  global _CAN_SOCK
+  if _CAN_SOCK is None:
+    _CAN_SOCK = messaging.sub_sock("can", timeout=200)
+    time.sleep(0.5)          # 구독 성립 대기
+    messaging.drain_sock(_CAN_SOCK)
+  sock = _CAN_SOCK
   deadline = time.monotonic() + max(0.5, timeout_s)
   hv_voltage = None
   capacity_ah = None
@@ -134,33 +144,35 @@ def sample_vehicle_can(timeout_s: float = 4.0) -> dict:
     if not msgs:
       continue
     frames = [(m.logMonoTime, [(f.address, f.dat, f.src) for f in m.can]) for m in msgs]
-    try:
-      cp0.update(frames)
-      cp1.update(frames)
-    except Exception:
-      break
+    for cp in parsers:
+      try:
+        cp.update(frames)
+      except Exception:
+        continue
 
-    # vl은 미수신이어도 기본값 0을 주므로, vl_all(이번 update에서 실제 수신된 값들)로 판정한다
-    if cp0.vl_all["Motor_16"].get("MO_Energieinhalt_BMS"):
-      wh = cp0.vl["Motor_16"]["MO_Energieinhalt_BMS"]
-      if wh > 0:
-        result["battery_wh"] = float(wh)
-    if cp0.vl_all["Diagnose_01"].get("KBI_Kilometerstand"):
-      odo = cp0.vl["Diagnose_01"]["KBI_Kilometerstand"]
-      if odo > 0:
-        result["odometer_km"] = float(odo)
-    if cp1.vl_all["Klima_Sensor_02"].get("BCM1_Aussen_Temp_ungef"):
-      result["outside_temp_c"] = float(cp1.vl["Klima_Sensor_02"]["BCM1_Aussen_Temp_ungef"])
-    if cp1.vl_all["MEB_HVEM_01"].get("Battery_Voltage"):
-      v = cp1.vl["MEB_HVEM_01"]["Battery_Voltage"]
-      if v > 0:
-        hv_voltage = float(v)
-    if cp1.vl_all["BMS_04"].get("BMS_Kapazitaet_02"):
-      ah = cp1.vl["BMS_04"]["BMS_Kapazitaet_02"]
-      if ah > 0:
-        capacity_ah = float(ah)
+      # vl은 미수신이어도 기본값 0을 주므로, vl_all(이번 update에서 실제 수신된 값)로 판정한다
+      wh = cp.vl_all["Motor_16"].get("MO_Energieinhalt_BMS") or \
+           cp.vl_all["HVEM_02"].get("HVEM_Nutzbare_Energie")
+      if wh:
+        v_wh = wh[-1] if isinstance(wh, (list, tuple)) else wh
+        if v_wh > 0:
+          result["battery_wh"] = float(v_wh)
+      if cp.vl_all["Diagnose_01"].get("KBI_Kilometerstand"):
+        odo = cp.vl["Diagnose_01"]["KBI_Kilometerstand"]
+        if odo > 0:
+          result["odometer_km"] = float(odo)
+      if cp.vl_all["Klima_Sensor_02"].get("BCM1_Aussen_Temp_ungef"):
+        result["outside_temp_c"] = float(cp.vl["Klima_Sensor_02"]["BCM1_Aussen_Temp_ungef"])
+      if cp.vl_all["MEB_HVEM_01"].get("Battery_Voltage"):
+        v = cp.vl["MEB_HVEM_01"]["Battery_Voltage"]
+        if v > 0:
+          hv_voltage = float(v)
+      if cp.vl_all["BMS_04"].get("BMS_Kapazitaet_02"):
+        ah = cp.vl["BMS_04"]["BMS_Kapazitaet_02"]
+        if ah > 0:
+          capacity_ah = float(ah)
 
-    if "battery_wh" in result and "odometer_km" in result and "outside_temp_c" in result:
+    if "battery_wh" in result and "odometer_km" in result:
       break
 
   # 실제 용량/SOH: BMS 용량[Ah] x HV 전압[V] = 현재 만충 용량[Wh]
