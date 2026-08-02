@@ -29,8 +29,9 @@ TELEMETRY_ONROAD_S = 30.0
 TELEMETRY_OFFROAD_S = 600.0
 # 주차 중 배터리량이 이만큼(Wh) 변하면 즉시 업로드 -> 충전 시작/종료를 빨리 반영
 BATTERY_DELTA_TRIGGER_WH = 300.0
-# ID.4 Pro 사용가능 용량[Wh] (carstate의 MEB_USABLE_BATTERY_WH와 같은 값)
-USABLE_BATTERY_WH = 77000.0
+# 잔량% 계산 분모. 차량 계기판 표시와 맞추기 위해 64kWh로 고정한다.
+# (BMS가 주는 실측 용량은 값이 계속 변해 계기판과 어긋난다 -> SOH 계산에만 쓴다)
+USABLE_BATTERY_WH = 64000.0
 # ID.4 Pro 총 용량[Wh] (SOH = 현재 만충용량 / 이 값)
 NOMINAL_BATTERY_WH = 82000.0
 # 충전으로 판정할 최소 증가율[W]
@@ -71,7 +72,8 @@ def utc_now() -> str:
 def build_vehicle_block(battery_wh: float | None, charge_power_w: float | None,
                         capacity_wh: float | None = None) -> dict:
   vehicle: dict = {}
-  usable = capacity_wh if (capacity_wh and capacity_wh > 0) else USABLE_BATTERY_WH
+  # 분모는 항상 고정값(계기판 일치). capacity_wh(BMS 실측)는 SOH 전용.
+  usable = USABLE_BATTERY_WH
   if battery_wh is not None and battery_wh > 0:
     vehicle["battery_wh"] = round(battery_wh, 1)
     vehicle["capacity_wh"] = round(usable, 0)
@@ -90,7 +92,8 @@ def merge_last_known(vehicle: dict, last_known: dict) -> dict:
   merged = dict(vehicle)
   fresh = False
   for key in ("battery_wh", "capacity_wh", "soc_percent", "odometer_km", "outside_temp_c",
-              "soh_percent", "hv_voltage"):
+              "soh_percent", "hv_voltage", "measured_capacity_wh",
+              "ac_on", "blower_volt", "blower_level", "seat_heat_left", "seat_heat_right", "recirc"):
     if merged.get(key) is None and last_known.get(key) is not None:
       merged[key] = last_known[key]
     elif merged.get(key) is not None and key in ("battery_wh", "odometer_km"):
@@ -120,7 +123,8 @@ def sample_vehicle_can(timeout_s: float = 6.0) -> dict:
   result: dict = {}
   # 같은 메시지가 주행 중엔 bus0, 주차/충전 중엔 bus1로 온다(실측). 양쪽 다 파싱한다.
   MSGS = [("Motor_16", 2), ("HVEM_02", 10), ("MEB_HVEM_01", 100),
-          ("BMS_04", 2), ("Diagnose_01", 1), ("Klima_Sensor_02", 1)]
+          ("BMS_04", 2), ("Diagnose_01", 1), ("Klima_Sensor_02", 1),
+          ("Klima_11", 5), ("Klima_12", 5)]
   try:
     from opendbc.can import CANParser
     parsers = [CANParser("vw_meb", MSGS, bus) for bus in (0, 1)]
@@ -172,18 +176,145 @@ def sample_vehicle_can(timeout_s: float = 6.0) -> dict:
         if ah > 0:
           capacity_ah = float(ah)
 
+      # --- 공조 상태 (2026-08 실차 확인: Klima_11=bus1, Klima_12=bus0) ---
+      if cp.vl_all["Klima_11"].get("KL_AC_Schalter") is not None:
+        result["ac_on"] = bool(cp.vl["Klima_11"]["KL_AC_Schalter"])
+      if cp.vl_all["Klima_12"].get("KL_Geblspng_Soll"):
+        volt = float(cp.vl["Klima_12"]["KL_Geblspng_Soll"])
+        if volt > 0:
+          result["blower_volt"] = round(volt, 2)
+          # 1.45V=꺼짐, 14V=최대. 0~10단으로 환산해 표시한다.
+          result["blower_level"] = max(0, min(10, round((volt - 1.45) / (14.0 - 1.45) * 10)))
+      for sig, key in (("KL_SIH_Soll_li", "seat_heat_left"), ("KL_SIH_Soll_re", "seat_heat_right")):
+        if cp.vl_all["Klima_12"].get(sig) is not None:
+          result[key] = int(cp.vl["Klima_12"][sig])
+      if cp.vl_all["Klima_12"].get("KL_Umluftklappe_Status") is not None:
+        result["recirc"] = int(cp.vl["Klima_12"]["KL_Umluftklappe_Status"])
+
     if "battery_wh" in result and "odometer_km" in result:
       break
 
   # 실제 용량/SOH: BMS 용량[Ah] x HV 전압[V] = 현재 만충 용량[Wh]
+  # 주의: 이 값은 온도/충전상태에 따라 세션마다 72~90kWh로 요동친다(실측). 즉 엄밀한 SOH가
+  # 아니라 '현재 가용 용량' 추정치다. 그래서 100%를 넘지 않게 자르고, 분모(잔량%)에는 쓰지 않는다.
   if capacity_ah and hv_voltage:
     capacity_wh = capacity_ah * hv_voltage
     if 20000 < capacity_wh < 150000:  # 상식 범위 밖이면 스케일 해석이 틀린 것 -> 버림
-      result["capacity_wh"] = round(capacity_wh, 0)
-      result["soh_percent"] = round(capacity_wh / NOMINAL_BATTERY_WH * 100.0, 1)
+      result["measured_capacity_wh"] = round(capacity_wh, 0)
+      result["soh_percent"] = round(min(100.0, capacity_wh / NOMINAL_BATTERY_WH * 100.0), 1)
   if hv_voltage:
     result["hv_voltage"] = round(hv_voltage, 1)
   return result
+
+
+def haversine_m(a: tuple, b: tuple) -> float:
+  """두 위경도 사이 거리[m]."""
+  import math
+  lat1, lon1 = a
+  lat2, lon2 = b
+  r = 6371000.0
+  p1, p2 = math.radians(lat1), math.radians(lat2)
+  dp = math.radians(lat2 - lat1)
+  dl = math.radians(lon2 - lon1)
+  h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+  return 2 * r * math.asin(min(1.0, math.sqrt(h)))
+
+
+class TripRecorder:
+  """주행 시작~종료를 기록해 Wayon Cloud에 올린다.
+
+  onroad 전환으로 시작/종료를 잡고, 주행 중 GPS를 샘플링해 경로와 거리를 만든다.
+  이게 없으면 앱의 '주행 이력'이 계속 비어 있다 (기존에 업로더가 아예 없었음).
+  """
+
+  MIN_POINT_GAP_S = 5.0      # 경로 점 최소 간격
+  MIN_TRIP_M = 300.0         # 이보다 짧으면 버림(주차장 이동 등)
+  MAX_POINTS = 720           # 한 트립 최대 점 수 (1시간 @5초)
+
+  def __init__(self):
+    self.active = False
+    self.started_at = None
+    self.route: list = []
+    self.distance_m = 0.0
+    self.last_point = None
+    self.last_sample_at = 0.0
+    self.trip_id = None
+
+  def start(self):
+    import uuid
+    self.active = True
+    self.started_at = utc_now()
+    self.route = []
+    self.distance_m = 0.0
+    self.last_point = None
+    self.last_sample_at = 0.0
+    self.trip_id = str(uuid.uuid4())
+    print("Wayon telemetry: trip started", flush=True)
+
+  def add_point(self, lat: float, lon: float, speed_mps: float | None, now: float):
+    if not self.active or now - self.last_sample_at < self.MIN_POINT_GAP_S:
+      return
+    self.last_sample_at = now
+    if self.last_point is not None:
+      d = haversine_m(self.last_point, (lat, lon))
+      if d < 2000:      # GPS 튐 방지
+        self.distance_m += d
+    self.last_point = (lat, lon)
+    if len(self.route) < self.MAX_POINTS:
+      point = {"latitude": round(lat, 6), "longitude": round(lon, 6), "t": utc_now()}
+      if speed_mps is not None:
+        point["speedMps"] = round(speed_mps, 2)
+      self.route.append(point)
+
+  def finish(self, config: dict, device_id: str) -> bool:
+    """주행 종료 -> 업로드. 성공/실패와 무관하게 상태는 초기화한다."""
+    if not self.active:
+      return False
+    self.active = False
+    if self.distance_m < self.MIN_TRIP_M or len(self.route) < 2:
+      print(f"Wayon telemetry: trip discarded ({self.distance_m:.0f}m)", flush=True)
+      return False
+
+    ended_at = utc_now()
+    from datetime import datetime
+    try:
+      t0 = datetime.strptime(self.started_at, "%Y-%m-%dT%H:%M:%SZ")
+      t1 = datetime.strptime(ended_at, "%Y-%m-%dT%H:%M:%SZ")
+      duration_s = max(0, int((t1 - t0).total_seconds()))
+    except Exception:
+      duration_s = 0
+
+    payload = {
+      "id": self.trip_id,
+      "deviceId": device_id,
+      "startedAt": self.started_at,
+      "endedAt": ended_at,
+      "durationS": duration_s,
+      "distanceM": round(self.distance_m, 1),
+      "route": self.route,
+    }
+    ok = post_json(config, "/api/trips", payload)
+    print(f"Wayon telemetry: trip upload {'ok' if ok else 'FAILED'} "
+          f"({self.distance_m / 1000:.2f}km, {len(self.route)}pts)", flush=True)
+    return ok
+
+
+def post_json(config: dict, path: str, payload: dict) -> bool:
+  endpoint = str(config.get("endpoint") or "").rstrip("/")
+  token = str(config.get("token") or "")
+  if not endpoint or not token:
+    return False
+  try:
+    response = requests.post(
+      f"{endpoint}{path}",
+      json=payload,
+      headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+      timeout=(10, 30),
+    )
+    return 200 <= response.status_code < 300
+  except requests.RequestException as exc:
+    print(f"Wayon telemetry: POST {path} failed: {exc}", flush=True)
+    return False
 
 
 def post_state(config: dict, payload: dict) -> bool:
@@ -214,6 +345,8 @@ def main() -> None:
   last_battery_at = None  # monotonic, 이번 실행에서만 사용
   last_upload_at = 0.0
   charge_power_w = None
+  trip = TripRecorder()
+  onroad_prev = None
 
   print("Wayon telemetry: started", flush=True)
 
@@ -227,6 +360,27 @@ def main() -> None:
 
     onroad = params.get_bool("IsOnroad")
     now = time.monotonic()
+
+    dongle_id = params.get("DongleId")
+    if isinstance(dongle_id, bytes):
+      dongle_id = dongle_id.decode("utf-8", "replace")
+    device_id = str(config.get("device_id") or dongle_id or "unknown")
+
+    # --- 주행 기록: onroad 전환으로 시작/종료 ---
+    if onroad_prev is not None and onroad != onroad_prev:
+      if onroad:
+        trip.start()
+      else:
+        trip.finish(config, device_id)
+    onroad_prev = onroad
+
+    if onroad and trip.active:
+      for svc in ("gpsLocationExternal", "gpsLocation"):
+        if sm.valid.get(svc) and sm.seen.get(svc):
+          g = sm[svc]
+          if g.hasFix:
+            trip.add_point(float(g.latitude), float(g.longitude), float(g.speed), now)
+            break
 
     # 배터리 잔량: 주행 중엔 carState(가벼움), 주차 중엔 CAN 직접 샘플링으로 얻는다.
     # (card 프로세스가 온로드 전용이라 주차 중엔 carState가 비어 충전 감시가 안 됐다)
@@ -273,19 +427,23 @@ def main() -> None:
         last_battery_wh, last_battery_at = battery_wh, now
 
     vehicle = build_vehicle_block(battery_wh, charge_power_w, sampled.get("capacity_wh"))
-    for key in ("odometer_km", "outside_temp_c", "soh_percent", "hv_voltage"):
+    for key in ("odometer_km", "outside_temp_c", "soh_percent", "hv_voltage", "measured_capacity_wh",
+                "ac_on", "blower_volt", "blower_level", "seat_heat_left", "seat_heat_right", "recirc"):
       if sampled.get(key) is not None:
         vehicle[key] = sampled[key]
 
     # 12V 보조 배터리: 판다가 차량 전원선에서 측정한 입력 전압
     if sm.valid.get("peripheralState") and sm.seen.get("peripheralState"):
       mv = sm["peripheralState"].voltage
-      if mv and mv > 0:
+      # 차가 잠들면 판다가 자체 대기전원(~5V)을 보고한다. 12V계 실측으로 볼 수 있는
+      # 범위(9V 이상)일 때만 채택한다.
+      if mv and mv >= 9000:
         vehicle["aux_voltage"] = round(mv / 1000.0, 2)
 
     # 이번에 새로 측정된 값이 있으면 '마지막 알려진 값'으로 저장
     for key in ("battery_wh", "capacity_wh", "soc_percent", "odometer_km", "outside_temp_c",
-                "soh_percent", "hv_voltage", "aux_voltage"):
+                "soh_percent", "hv_voltage", "aux_voltage", "measured_capacity_wh",
+                "ac_on", "blower_volt", "blower_level", "seat_heat_left", "seat_heat_right", "recirc"):
       if vehicle.get(key) is not None:
         last[key] = vehicle[key]
         last["measured_at"] = utc_now()
