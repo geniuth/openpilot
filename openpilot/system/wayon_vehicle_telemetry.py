@@ -343,7 +343,7 @@ def main() -> None:
   last = load_last_state()
   last_battery_wh = last.get("battery_wh")
   last_battery_at = None  # monotonic, 이번 실행에서만 사용
-  last_upload_at = 0.0
+  last_upload_at = None   # None = 아직 한 번도 안 올림 -> 즉시 업로드
   charge_power_w = None
   trip = TripRecorder()
   onroad_prev = None
@@ -407,7 +407,9 @@ def main() -> None:
       battery_wh is not None and last.get("battery_wh") is not None
       and abs(battery_wh - float(last["battery_wh"])) >= BATTERY_DELTA_TRIGGER_WH
     )
-    if now - last_upload_at < interval and not battery_moved:
+    # 부팅 직후엔 monotonic이 작아 'now - 0 < interval'이 참이 되어 첫 업로드가
+    # 최대 10분 지연되던 문제가 있었다. 첫 회는 무조건 올린다.
+    if last_upload_at is not None and now - last_upload_at < interval and not battery_moved:
       continue
 
     # 배터리/오도미터/외기온·용량은 CAN에서 직접 샘플링 (업로드 직전에만).
