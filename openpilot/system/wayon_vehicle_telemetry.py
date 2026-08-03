@@ -30,10 +30,8 @@ TELEMETRY_OFFROAD_S = 600.0
 # 주차 중 배터리량이 이만큼(Wh) 변하면 즉시 업로드 -> 충전 시작/종료를 빨리 반영
 BATTERY_DELTA_TRIGGER_WH = 300.0
 # 잔량% 계산 분모. 차량 계기판 표시와 맞추기 위해 64kWh로 고정한다.
-# (BMS가 주는 실측 용량은 값이 계속 변해 계기판과 어긋난다 -> SOH 계산에만 쓴다)
+# (BMS가 주는 실측 용량은 값이 계속 변해 계기판과 어긋난다)
 USABLE_BATTERY_WH = 64000.0
-# ID.4 Pro 총 용량[Wh] (SOH = 현재 만충용량 / 이 값)
-NOMINAL_BATTERY_WH = 82000.0
 # 충전으로 판정할 최소 증가율[W]
 CHARGING_MIN_W = 300.0
 
@@ -92,7 +90,7 @@ def merge_last_known(vehicle: dict, last_known: dict) -> dict:
   merged = dict(vehicle)
   fresh = False
   for key in ("battery_wh", "capacity_wh", "soc_percent", "odometer_km", "outside_temp_c",
-              "soh_percent", "hv_voltage", "measured_capacity_wh",
+              "hv_voltage", "measured_capacity_wh",
               "ac_on", "blower_volt", "blower_level", "seat_heat_left", "seat_heat_right", "recirc"):
     if merged.get(key) is None and last_known.get(key) is not None:
       merged[key] = last_known[key]
@@ -194,14 +192,15 @@ def sample_vehicle_can(timeout_s: float = 6.0) -> dict:
     if "battery_wh" in result and "odometer_km" in result:
       break
 
-  # 실제 용량/SOH: BMS 용량[Ah] x HV 전압[V] = 현재 만충 용량[Wh]
-  # 주의: 이 값은 온도/충전상태에 따라 세션마다 72~90kWh로 요동친다(실측). 즉 엄밀한 SOH가
-  # 아니라 '현재 가용 용량' 추정치다. 그래서 100%를 넘지 않게 자르고, 분모(잔량%)에는 쓰지 않는다.
+  # 측정 용량: BMS 용량[Ah] x HV 전압[V]
+  # 주의: SOH(열화율)가 아니다. BMS가 온도/충전상태에 따라 그때그때 다시 추정하는 값이라
+  # 세션마다 72~90kWh로 요동친다(실측, 164Ah <-> 196Ah). 열화율로 환산하면 며칠 만에
+  # 88% -> 100%처럼 말이 안 되는 변화가 나오므로 측정값 그대로만 올린다.
+  # 잔량%의 분모로도 쓰지 않는다(USABLE_BATTERY_WH 고정값 사용).
   if capacity_ah and hv_voltage:
     capacity_wh = capacity_ah * hv_voltage
     if 20000 < capacity_wh < 150000:  # 상식 범위 밖이면 스케일 해석이 틀린 것 -> 버림
       result["measured_capacity_wh"] = round(capacity_wh, 0)
-      result["soh_percent"] = round(min(100.0, capacity_wh / NOMINAL_BATTERY_WH * 100.0), 1)
   if hv_voltage:
     result["hv_voltage"] = round(hv_voltage, 1)
   return result
@@ -429,7 +428,7 @@ def main() -> None:
         last_battery_wh, last_battery_at = battery_wh, now
 
     vehicle = build_vehicle_block(battery_wh, charge_power_w, sampled.get("capacity_wh"))
-    for key in ("odometer_km", "outside_temp_c", "soh_percent", "hv_voltage", "measured_capacity_wh",
+    for key in ("odometer_km", "outside_temp_c", "hv_voltage", "measured_capacity_wh",
                 "ac_on", "blower_volt", "blower_level", "seat_heat_left", "seat_heat_right", "recirc"):
       if sampled.get(key) is not None:
         vehicle[key] = sampled[key]
@@ -444,7 +443,7 @@ def main() -> None:
 
     # 이번에 새로 측정된 값이 있으면 '마지막 알려진 값'으로 저장
     for key in ("battery_wh", "capacity_wh", "soc_percent", "odometer_km", "outside_temp_c",
-                "soh_percent", "hv_voltage", "aux_voltage", "measured_capacity_wh",
+                "hv_voltage", "aux_voltage", "measured_capacity_wh",
                 "ac_on", "blower_volt", "blower_level", "seat_heat_left", "seat_heat_right", "recirc"):
       if vehicle.get(key) is not None:
         last[key] = vehicle[key]
