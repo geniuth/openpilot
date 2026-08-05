@@ -2,10 +2,14 @@ from opendbc.can import CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.interfaces import CarStateBase
 from opendbc.car.common.conversions import Conversions as CV
-from opendbc.car.volkswagen.values import DBC, CANBUS, NetworkLocation, TransmissionType, GearShifter, \
+from opendbc.car.volkswagen.values import DBC, CANBUS, NetworkLocation, RADAR_DISABLE_STATE, TransmissionType, GearShifter, \
                                                       CarControllerParams, VolkswagenFlags
 
 ButtonType = structs.CarState.ButtonEvent.Type
+
+# ID.4 Pro 사용가능 HV 배터리 용량[Wh]. Motor_16의 에너지량을 0~1 게이지로 환산할 때 쓴다.
+# (정확 용량은 BMS_04/MEB_HVEM_*(alt 버스)에 있으나 이 하네스엔 없어 공칭값 사용)
+MEB_USABLE_BATTERY_WH = 77000.0
 
 
 class CarState(CarStateBase):
@@ -39,6 +43,19 @@ class CarState(CarStateBase):
     elif self.frame - self.cruise_recovery_timer < recovery_frames_max:
       fault = False
     return fault
+
+  @staticmethod
+  def _meb_lane_line(code: int) -> int:
+    # MEB_Camera_01 차선 종류 코드 -> carrot leftLaneLine/rightLaneLine 값 (색*10+종류).
+    # bit3=점선, bit4=실선. MEB는 색 미방송 -> 흰색(1) 고정. 0x00=차선없음 -> 0 (현대 무정보 기본값과 동일).
+    if code == 0:
+      return 0
+    t = code & 0x18
+    if t == 0x08:
+      return 10  # 흰 점선
+    if t == 0x10:
+      return 11  # 흰 실선 (빗금 안전지대 경계 포함)
+    return 12    # 판정불가(종류 2=미상) -> LaneLineCheck 시 차단측
 
   def update_button_enable(self, buttonEvents: list[structs.CarState.ButtonEvent]):
     if not self.CP.pcmCruise:
@@ -258,12 +275,23 @@ class CarState(CarStateBase):
     ret.stockFcw = False
     ret.stockAeb = False
 
+    # DISABLE_RADAR: 부팅 시 레이더 무력화(interface.init)가 실패하면 롱컨 폴트를 유발하므로 표시
+    ret.radarDisableFailed = RADAR_DISABLE_STATE["error"] and bool(self.CP.flags & VolkswagenFlags.DISABLE_RADAR)
+
     self.acc_type = 2  # ACC stop and go
     self.eps_stock_values = pt_cp.vl["LH_EPS_03"]
     # 정전식 핸들 터치(KLR_01) stock 값 - Emergency Assist 핸즈온 pacification용
     self.klr_stock_values = pt_cp.vl["KLR_01"] if self.CP.flags & VolkswagenFlags.STOCK_KLR_PRESENT else {}
     # Travel Assist 가용성 (순정 TA_01) - TA_01 송신 게이트 = 스티어링휠 버튼 LED/핸들 아이콘 (infiniteCable2 방식)
     self.travel_assist_available = bool(cam_cp.vl["TA_01"]["Travel_Assist_Available"])
+
+    # 순정 카메라 좌/우 차선 종류 (MEB_Camera_01, 카메라 리버싱 10차 확정):
+    # byte47=좌/byte63=우, bit3(0x08)=점선, bit4(0x10)=실선, 0x00=차선없음, 그 외=판정불가.
+    # carrot leftLaneLine 규약(현대 CAM_0x2a4와 동일) = 색*10 + 종류(0점선/1실선/2미상).
+    # MEB는 색 미방송 -> 흰색(1) 고정. LaneLineCheck 켜면 실선/미상쪽 자동 차선변경 차단.
+    if not (self.CP.flags & VolkswagenFlags.MEB_GEN2):  # MK2는 0x183 존재 미확인이라 제외
+      ret.leftLaneLine = self._meb_lane_line(int(cam_cp.vl["MEB_Camera_01"]["Lane_Left_Type"]))
+      ret.rightLaneLine = self._meb_lane_line(int(cam_cp.vl["MEB_Camera_01"]["Lane_Right_Type"]))
 
     # ESP 홀드 (정차 확인): infiniteCable2와 동일하게 ESC_50.Motion_State == 3(완전정지) 사용.
     # 기존 Standstill(1비트)은 Motion_State(2비트)의 하위 1비트만 읽어 정차 판정 시점이
@@ -307,6 +335,13 @@ class CarState(CarStateBase):
     # ESP 상태
     ret.espDisabled = False
     ret.espActive   = False
+
+    # HV 배터리 잔량 (infiniteCable2 방식). Motor_16(PT 버스)의 BMS 에너지량[Wh]을
+    # ID.4 Pro 사용가능 용량으로 정규화해 0~1로 넣는다. BMS_04/MEB_HVEM_*(alt 버스)는
+    # 이 하네스에 없어 정확 용량/SOH는 못 받는다 -> 공칭 용량 기준 근사.
+    battery_wh = pt_cp.vl["Motor_16"]["MO_Energieinhalt_BMS"]
+    if battery_wh > 0:
+      ret.fuelGauge = min(1.0, max(0.0, battery_wh / MEB_USABLE_BATTERY_WH))
 
     self.frame += 1
     return ret
@@ -466,6 +501,7 @@ class CarState(CarStateBase):
       ("ESC_50", 50),       # From ESC (Yaw Rate, EPB, Motion State)
       ("Motor_51", 50),     # From ECM (TSK Status, ACC)
       ("Motor_14", 10),     # From ECM (제동등 스위치)
+      ("Motor_16", 10),     # From ECM (HV 배터리 에너지량 Wh)
       ("GRA_ACC_01", 33),   # From Gateway (ACC 버튼)
       ("Gateway_72", 10),   # From Gateway (도어)
       ("Airbag_02", 5),     # From 에어백 모듈 (안전벨트)
@@ -487,6 +523,9 @@ class CarState(CarStateBase):
     cam_messages = [
       ("TA_01", 10 if gen2 else 50),  # Travel Assist 상태 (GEN2 실측 10Hz)
     ]
+    if not gen2:
+      # 순정 카메라 차선 정보 (좌/우 종류·횡위치, MK1 실측 25Hz. MK2는 존재 미확인이라 제외)
+      cam_messages += [("MEB_Camera_01", 25)]
 
     if CP.flags & VolkswagenFlags.STOCK_EA_PRESENT:
       cam_messages += [("EA_01", 2 if gen2 else 10), ("EA_02", 2 if gen2 else 10)]  # EA HUD (GEN2 실측 2Hz)

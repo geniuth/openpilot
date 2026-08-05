@@ -104,6 +104,9 @@ class CarControllerParams:
         Button(structs.CarState.ButtonEvent.Type.accelCruise, "GRA_ACC_01", "GRA_Tip_Hoch", [1]),
         Button(structs.CarState.ButtonEvent.Type.decelCruise, "GRA_ACC_01", "GRA_Tip_Runter", [1]),
         Button(structs.CarState.ButtonEvent.Type.gapAdjustCruise, "GRA_ACC_01", "GRA_Verstellung_Zeitluecke", [3]),
+        # 핸들 Travel Assist 버튼 -> lfaButton: openpilot이 순정 TA를 대체해 놀고 있는 버튼.
+        # carrot cruise.py의 lfaButton 핸들러가 상시조향 토글로 처리 (LfaButtonMode=0 기본).
+        Button(structs.CarState.ButtonEvent.Type.lfaButton, "GRA_ACC_01", "GRA_TravelAssist", [1]),
       ]
       # 메인 스위치 종류에 따라 cancel 매핑 분리 (infiniteCable2 방식):
       # - 모멘터리(getastet) 메인버튼: 메인버튼(GRA_Hauptschalter)을 cancel로 사용
@@ -186,6 +189,7 @@ class WMI(StrEnum):
 class VolkswagenSafetyFlags(IntFlag):
   LONG_CONTROL = 1
   ALT_CRC_VARIANT_1 = 2  # MEB GEN2(2024+) 신형 CRC (infiniteCable2 동일 비트)
+  DISABLE_RADAR = 4      # 카메라 하네스 롱컨: AEB/레이더 대체 메시지 tx 허용 (panda safety)
 
 
 class VolkswagenFlags(IntFlag):
@@ -199,6 +203,12 @@ class VolkswagenFlags(IntFlag):
   MEB = 16
   MEB_GEN2 = 128
   MQB_EVO = 256  # referenced by MEB longitudinal (mebcan); not set for ID.4 MK1
+  DISABLE_RADAR = 512  # 카메라 하네스 롱컨: 순정 레이더를 프로그래밍 세션에 가두고 openpilot이 대체 (미검증)
+
+
+# DISABLE_RADAR init 훅(interface.py)과 carstate 사이의 상태 공유:
+# 부팅 시 레이더 무력화 실패하면 error=True -> carstate가 radarDisableFailed로 올림
+RADAR_DISABLE_STATE: dict[str, bool] = {"error": False}
 
 
 @dataclass

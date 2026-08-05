@@ -1,6 +1,6 @@
 import numpy as np
 from opendbc.can import CANPacker
-from opendbc.car import Bus, DT_CTRL, apply_driver_steer_torque_limits, structs
+from opendbc.car import Bus, DT_CTRL, apply_driver_steer_torque_limits, make_tester_present_msg, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.lateral import apply_std_curvature_limits
@@ -47,6 +47,10 @@ class CarController(CarControllerBase):
     self.lead_limit_disp = False
     self.lead_limit_cnt = 0
 
+    # DISABLE_RADAR: 레이더 무력화 후 대체 메시지 송신 상태
+    self.radar_disabled_warning_timer = 0
+    self.hide_ea_error = False
+    self.hold_release_latch = False  # 정차잠금 해제 래치 (경사로 롤백/HMS 디더링 방지)
 
   def update(self, CC, CS, now_nanos):
     actuators = CC.actuators
@@ -161,12 +165,28 @@ class CarController(CarControllerBase):
 
     # **** Acceleration Controls ******************************************** #
 
-    if self.CP.openpilotLongitudinalControl:
+    # DISABLE_RADAR 무력화 실패 시(radarDisableFailed) openpilot ACC 송신 중단 - 살아있는
+    # 순정 레이더와 충돌 방지 (infiniteCable2와 동일 가드).
+    if self.CP.openpilotLongitudinalControl and not CS.out.radarDisableFailed:
       if self.frame % self.CCP.ACC_CONTROL_STEP == 0:
         if self.CP.flags & VolkswagenFlags.MEB:
           stopping = actuators.longControlState == LongCtrlState.stopping
-          starting = actuators.longControlState == LongCtrlState.starting and CS.out.vEgo <= self.CP.vEgoStarting
           accel = float(np.clip(actuators.accel, self.CCP.ACCEL_MIN, self.CCP.ACCEL_MAX) if CC.enabled else 0)
+          # 앞차를 따라 스르륵 정차하면 플래너가 완전정지(stopping)를 안 잡고 "pid"에 머무는데,
+          # 이때 차가 스스로 ESP 홀드를 걸면 기존 (lcs==starting) 조건으로는 ACC_Anfahren(출발요청)이
+          # 영영 안 나가 차가 홀드에 갇힌다(앞차 출발해도 안 감). 정차 잠금 중 openpilot이 가속하려
+          # 하면(accel>0) 출발요청을 내보내 잠금을 푼다. (HKG는 accel 직접명령이라 이 핸드셰이크가 없음)
+          want_go = (actuators.longControlState == LongCtrlState.starting and CS.out.vEgo <= self.CP.vEgoStarting) \
+                    or (actuators.longControlState == LongCtrlState.pid and CS.esp_hold_confirmation and accel > 0.0)
+          # 경사로 롤백 방지: 정차잠금 상태에선 accel이 0.2 m/s^2 이상 걸린 뒤에만 해제를 시작
+          # (미세 가속값에 잠금이 풀려 토크 공백 동안 뒤로 밀리는 것 방지. 정상 출발은
+          # startAccel=0.8이라 첫 프레임 통과 = 지연 없음). 한번 해제를 시작하면 가속의지가
+          # 있는 한 유지(래치) - 문턱 부근에서 HOLD/RELEASE가 깜빡이는 디더링 방지.
+          if not want_go:
+            self.hold_release_latch = False
+          elif not CS.esp_hold_confirmation or accel >= 0.2:
+            self.hold_release_latch = True
+          starting = want_go and self.hold_release_latch
 
           # override / disable ramp handling to avoid EPB error at low speed (infiniteCable2)
           long_override = CC.cruiseControl.override or CS.out.gasPressed
@@ -193,11 +213,26 @@ class CarController(CarControllerBase):
           can_sends.extend(self.CCS.create_acc_accel_control(self.packer_pt, CANBUS.pt, CS.acc_type, CC.longActive, accel,
                                                              acc_control, stopping, starting, CS.esp_hold_confirmation))
 
-      #if self.aeb_available:
-      #  if self.frame % self.CCP.AEB_CONTROL_STEP == 0:
-      #    can_sends.append(self.CCS.create_aeb_control(self.packer_pt, False, False, 0.0))
-      #  if self.frame % self.CCP.AEB_HUD_STEP == 0:
-      #    can_sends.append(self.CCS.create_aeb_hud(self.packer_pt, False, False))
+    # **** Radar disable (카메라 하네스 롱컨) ******************************** #
+    # 순정 레이더를 프로그래밍 세션에 가둔 뒤, openpilot이 레이더 대체 메시지를 송신한다.
+    # AWV_03(AEB 제어)/MEB_AWV_01(AEB HUD)/Strukturen_01(빈 레이더 오브젝트) + 0x700 Tester Present.
+    # 순정 AEB/FCW/EA 비활성. 부팅 시 무력화 실패(radarDisableFailed)면 송신 안 함.
+    if (self.CP.flags & VolkswagenFlags.DISABLE_RADAR) and self.CP.openpilotLongitudinalControl and not CS.out.radarDisableFailed:
+      if self.CP.flags & VolkswagenFlags.MEB:
+        if self.radar_disabled_warning_timer < 600:  # 비활성 경고 HUD를 몇 초간 표시
+          self.radar_disabled_warning_timer += 1
+        else:
+          self.hide_ea_error = True  # 몇 초 후 EA 에러 블록
+
+        if self.frame % self.CCP.AEB_CONTROL_STEP == 0:
+          can_sends.append(make_tester_present_msg(0x700, CANBUS.pt, suppress_response=True))  # 프로그래밍 세션 유지
+          can_sends.append(self.CCS.create_aeb_control(self.packer_pt, CANBUS.pt))  # AEB 제어 (1Hz)
+
+        if self.frame % self.CCP.AEB_HUD_STEP == 0:
+          can_sends.append(self.CCS.create_aeb_hud(self.packer_pt, CANBUS.pt, self.radar_disabled_warning_timer < 600))  # AEB HUD (5Hz)
+
+        if self.frame % 4 == 0:
+          can_sends.append(self.CCS.create_radar_objects(self.packer_pt, CANBUS.pt))  # 빈 레이더 오브젝트 (25Hz)
 
     # **** HUD Controls ***************************************************** #
 
@@ -213,7 +248,7 @@ class CarController(CarControllerBase):
         can_sends.append(self.CCS.create_lka_hud_control(self.packer_pt, CANBUS.pt, CS.ldw_stock_values, CC.latActive,
                                                          CS.out.steeringPressed, hud_alert, hud_control))
 
-    if self.frame % self.CCP.ACC_HUD_STEP == 0 and self.CP.openpilotLongitudinalControl:
+    if self.frame % self.CCP.ACC_HUD_STEP == 0 and self.CP.openpilotLongitudinalControl and not CS.out.radarDisableFailed:
       if self.CP.flags & VolkswagenFlags.MEB:
         long_override = CC.cruiseControl.override or CS.out.gasPressed
         # MEB 계기판 충돌경고(빨간 앞차 심볼 + 비프 + "Break!") 상시 숨김 - ID.4 선택 시 자동 적용.

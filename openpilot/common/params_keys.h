@@ -348,6 +348,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"PathOffset", {PERSISTENT, INT, "0"}},
     {"CameraYawTrimDeg", {PERSISTENT, INT, "0"}},
 
+    // VW MEB(ID.4) 카메라 하네스 롱컨: 순정 레이더 무력화 (미검증, 순정 AEB/FCW/EA 상실)
+    {"MebDisableRadar", {PERSISTENT, INT, "0"}},
+
     {"LateralTorqueCustom", {PERSISTENT, INT, "0"}},
     {"LateralTorqueAccelFactor", {PERSISTENT, INT, "2500"}},
     {"LateralTorqueFriction", {PERSISTENT, INT, "100"}},

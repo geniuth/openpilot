@@ -1,9 +1,12 @@
-from opendbc.car import get_safety_config, structs
+import time
+from opendbc.car import get_safety_config, structs, uds
+from opendbc.car.carlog import carlog
+from opendbc.car.isotp_parallel_query import IsoTpParallelQuery
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.volkswagen.carcontroller import CarController
 from opendbc.car.volkswagen.carstate import CarState
 from opendbc.car.volkswagen.radar_interface import RadarInterface
-from opendbc.car.volkswagen.values import CAR, NetworkLocation, TransmissionType, VolkswagenFlags, VolkswagenSafetyFlags
+from opendbc.car.volkswagen.values import CANBUS, CAR, NetworkLocation, RADAR_DISABLE_STATE, TransmissionType, VolkswagenFlags, VolkswagenSafetyFlags
 
 
 class CarInterface(CarInterfaceBase):
@@ -108,16 +111,29 @@ class CarInterface(CarInterfaceBase):
       ret.lateralTuning.pid.kpV = [0.6]
       ret.lateralTuning.pid.kiV = [0.2]
 
+    # DISABLE_RADAR(카메라 하네스 롱컨): MEB + 카메라 하네스에서 MebDisableRadar 파라미터가 켜지면
+    # 순정 레이더를 프로그래밍 세션에 가두고 openpilot이 AEB/레이더 메시지를 대체한다 (미검증).
+    # 순정 AEB/FCW/EA를 잃는 대가로 카메라 하네스 롱컨을 가능하게 함. 게이트웨이 하네스는 불필요.
+    if (ret.flags & VolkswagenFlags.MEB) and ret.networkLocation == NetworkLocation.fwdCamera and not docs:
+      try:
+        from openpilot.common.params import Params
+        if Params().get_int("MebDisableRadar") > 0:
+          ret.flags |= VolkswagenFlags.DISABLE_RADAR.value
+      except Exception:
+        pass
+
     # Global longitudinal tuning defaults, can be overridden per-vehicle
-    # MEB longitudinal is supported on the gateway harness (stock radar/AEB stay active, no radar-disable
-    # needed). Camera-harness MEB long would require DISABLE_RADAR support (not ported), so keep it gateway-only.
-    ret.alphaLongitudinalAvailable = ret.networkLocation == NetworkLocation.gateway or docs
+    # MEB 롱컨: 게이트웨이 하네스(순정 레이더/AEB 유지) 또는 카메라 하네스+DISABLE_RADAR에서 가능.
+    ret.alphaLongitudinalAvailable = ret.networkLocation == NetworkLocation.gateway or \
+                                     bool(ret.flags & VolkswagenFlags.DISABLE_RADAR) or docs
 
     # MQB는 carrot 원본과 동일하게 alpha_long만으로 활성(카메라 하네스 MQB 롱컨 유지).
-    # MEB만 게이트웨이 하네스 필요(카메라 하네스 MEB 롱컨은 레이더 무력화 미지원).
+    # MEB는 게이트웨이 하네스 또는 카메라 하네스+DISABLE_RADAR 필요.
     if alpha_long and (ret.alphaLongitudinalAvailable or not (ret.flags & VolkswagenFlags.MEB)):
       ret.openpilotLongitudinalControl = True
       ret.safetyConfigs[0].safetyParam |= VolkswagenSafetyFlags.LONG_CONTROL.value
+      if ret.flags & VolkswagenFlags.DISABLE_RADAR:
+        ret.safetyConfigs[0].safetyParam |= VolkswagenSafetyFlags.DISABLE_RADAR.value
       if ret.transmissionType == TransmissionType.manual:
         ret.minEnableSpeed = 4.5
 
@@ -144,3 +160,74 @@ class CarInterface(CarInterfaceBase):
       ret.longitudinalTuning.kiV = [0.4, 0.]
 
     return ret
+
+  # **** DISABLE_RADAR: 순정 레이더 무력화 (카메라 하네스 롱컨) ****
+  # infiniteCable2 실코드 이식. 부팅 시 레이더(0x757)를 프로그래밍 세션에 가둬 송신을 멈추고,
+  # carcontroller가 대체 AEB/레이더 메시지를 보낸다. 순정 AEB/FCW/EA 상실. 미검증 - 테스터 필요.
+  @staticmethod
+  def init(CP, can_recv, can_send):
+    if CP.openpilotLongitudinalControl and (CP.flags & VolkswagenFlags.DISABLE_RADAR) and (CP.flags & VolkswagenFlags.MEB):
+      RADAR_DISABLE_STATE["error"] = False
+      # 엔진 On 상태에서는 프로그래밍 세션 요청이 거부됨(레이더 소생 불가) -> 시도하지 않음
+      if CarInterface._is_engine_state_allowed_meb(can_recv):
+        carlog.warning("Trying to disable the radar")
+        if not CarInterface._radar_communication_control(CP, can_recv, can_send):
+          RADAR_DISABLE_STATE["error"] = True
+      else:
+        RADAR_DISABLE_STATE["error"] = True
+        carlog.warning("The radar can not be disabled (engine on)")
+
+  @staticmethod
+  def _radar_communication_control(CP, can_recv, can_send):
+    # 레이더(0x757)를 프로그래밍 세션에 가둬 송신 중지. 기능주소 0x700로 Tester Present.
+    bus = CANBUS.pt
+    addr_radar, addr_diag, rx_offset = 0x757, 0x700, 0x6A
+    retry, timeout = 3, 0.5
+
+    tp_req  = bytes([uds.SERVICE_TYPE.TESTER_PRESENT, 0x00])
+    tp_resp = bytes([uds.SERVICE_TYPE.TESTER_PRESENT + 0x40, 0x00])
+    ext_diag_req  = bytes([uds.SERVICE_TYPE.DIAGNOSTIC_SESSION_CONTROL, uds.SESSION_TYPE.EXTENDED_DIAGNOSTIC])
+    ext_diag_resp = bytes([uds.SERVICE_TYPE.DIAGNOSTIC_SESSION_CONTROL + 0x40, uds.SESSION_TYPE.EXTENDED_DIAGNOSTIC])
+    flash_req  = bytes([uds.SERVICE_TYPE.DIAGNOSTIC_SESSION_CONTROL, uds.SESSION_TYPE.PROGRAMMING])
+
+    for i in range(retry):
+      try:
+        # Tester Present
+        query = IsoTpParallelQuery(can_send, can_recv, bus, [(addr_radar, None)], [tp_req], [tp_resp], rx_offset, functional_addrs=[addr_diag])
+        if not query.get_data(timeout):
+          carlog.warning(f"Tester Present returned no data on attempt {i+1}")
+          continue
+        # Extended Diagnostic Session
+        query = IsoTpParallelQuery(can_send, can_recv, bus, [(addr_radar, None)], [ext_diag_req], [ext_diag_resp], rx_offset)
+        if not query.get_data(timeout):
+          carlog.warning(f"Radar extended session returned no data on attempt {i+1}")
+          continue
+        # Programming Session (응답 대기 없이 즉시 - 크루즈 폴트 방지 위해 바로 대체 송신 시작)
+        query = IsoTpParallelQuery(can_send, can_recv, bus, [(addr_radar, None)], [flash_req], [b''], rx_offset)
+        query.get_data(0)
+        carlog.warning(f"Radar disabled by programming session on attempt {i+1}")
+        return True
+      except Exception as e:
+        carlog.error(f"Radar disable exception on attempt {i+1}: {repr(e)}")
+        continue
+
+    carlog.error("Radar disable failed")
+    return False
+
+  @staticmethod
+  def _is_engine_state_allowed_meb(can_recv, timeout: float = 0.5) -> bool:
+    # 안전장치: Motor_54(0x14C)의 Engine_On으로 프로그래밍 세션 가능 여부 판정
+    end_time = time.monotonic() + timeout
+    while time.monotonic() < end_time:
+      packets = can_recv(wait_for_one=True) or []
+      for packet in packets:
+        for msg in packet:
+          if msg.address != 0x14C:
+            continue
+          engine_on = bool((msg.dat[9] >> 5) & 0x01)
+          if engine_on:
+            carlog.warning("Engine state is not allowed: Engine_On=True")
+            return False
+          return True
+    carlog.warning("Engine state unknown")
+    return True

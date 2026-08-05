@@ -1054,6 +1054,17 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.NO_ENTRY: NoEntryAlert("Vehicle Sensors Calibrating"),
   },
 
+  # VW MEB DISABLE_RADAR: 순정 레이더 무력화 실패 시 인게이지 차단 (infiniteCable2와 동일)
+  EventName.radarDisableFailed: {
+    ET.NO_ENTRY: NoEntryAlert("Radar Deactivation Failed"),
+    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("Radar Deactivation Failed"),
+    ET.PERMANENT: Alert(
+      "Radar Deactivation Failed",
+      "Retry during ignition",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.HIGH, VisualAlert.none, AudibleAlert.warningImmediate, .1),
+  },
+
   EventName.personalityChanged: {
     ET.WARNING: personality_changed_alert,
   },

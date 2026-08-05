@@ -622,6 +622,23 @@
           ]
         }
       ]
+    },
+    {
+      "id": "TEST",
+      "ko": "테스트",
+      "en": "Test",
+      "zh": "测试",
+      "groups": [
+        {
+          "id": "MEB_TEST",
+          "ko": "ID.4 테스트",
+          "en": "ID.4 Test",
+          "zh": "ID.4 测试",
+          "params": [
+            "MebDisableRadar"
+          ]
+        }
+      ]
     }
   ],
   "params": [
@@ -3621,6 +3638,22 @@
           "Speed automatic"
         ]
       }
+    },
+    {
+      "group": "ID4계기판",
+      "name": "MebDisableRadar",
+      "title": "카메라하네스 롱컨/레이더무력화(0)",
+      "descr": "1=순정 레이더를 무력화하고 openpilot이 롱컨(가감속) 수행\n0=끔\n⚠️ 카메라 하네스 전용·미검증·순정 AEB/FCW/긴급조향 상실\n복구는 시동 재점화. ID.4 전용",
+      "egroup": "ID4 Cluster",
+      "etitle": "Camera-harness long / radar disable(0)",
+      "edescr": "1=knock out stock radar so openpilot does longitudinal. Camera-harness only, UNVERIFIED, disables stock AEB/FCW/EA. Recover by ignition cycle.",
+      "cgroup": "ID4仪表",
+      "ctitle": "Radar disable long(0)",
+      "min": 0,
+      "max": 1,
+      "default": 0,
+      "unit": 1,
+      "cdescr": "1=disable stock radar for camera-harness longitudinal (unverified)"
     }
   ]
 }

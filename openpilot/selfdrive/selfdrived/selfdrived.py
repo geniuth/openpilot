@@ -245,6 +245,10 @@ class SelfdriveD:
       car_events = self.car_events.update(CS, self.CS_prev, self.sm['carControl']).to_msg()
       self.events.add_from_msg(car_events)
 
+      # VW MEB DISABLE_RADAR: 순정 레이더 무력화 실패 시 인게이지 차단 (infiniteCable2와 동일)
+      if CS.radarDisableFailed:
+        self.events.add(EventName.radarDisableFailed)
+
       if self.CP.notCar:
         # wait for everything to init first
         if self.sm.frame > int(2. / DT_CTRL) and self.initialized:
