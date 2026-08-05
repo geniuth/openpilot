@@ -84,6 +84,21 @@ class DebugPlotSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class TripReportState:
+    duration_s: float = 0.0
+    moving_time_s: float = 0.0
+    distance_m: float = 0.0
+    average_speed_kph: float = 0.0
+    max_speed_kph: float = 0.0
+    max_accel_mps2: float = 0.0
+    max_decel_mps2: float = 0.0
+    auto_ratio_percent: float = 0.0
+    hard_accel_count: int = 0
+    hard_brake_count: int = 0
+    hard_corner_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class NaviItemMeta:
     sequence: int
     source_timestamp_ms: int
@@ -338,6 +353,15 @@ class TpmsInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class ClusterAlert:
+    text1: str
+    text2: str = ""
+    size: int = 0
+    status: int = 0
+    alert_type: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class ClusterUiState:
     speed_kph: float
     accel_mps2: float
@@ -391,6 +415,7 @@ class ClusterUiState:
     route_overlay: RouteOverlay | None = None
     live_debug: LiveDebugInfo | None = None
     debug_plot: DebugPlotSnapshot | None = None
+    trip_report: TripReportState | None = None
     navi_debug: NaviDebugInfo | None = None
     navi_live: NaviLiveState | None = None
     navi_dashboard: NaviDashboardState | None = None
@@ -460,6 +485,10 @@ class ClusterUiState:
     git_status: GitBranchStatus | None = None
     actual_fps: float | None = None
     cluster_core_usage_text: str | None = None
+    cpu_usage_percent: float | None = None
+    cpu_temp_c: float | None = None
+    memory_used_percent: float | None = None
+    disk_used_percent: float | None = None
     network_address: str | None = None
     network_connected: bool = False
     external_nav_active: bool = False
@@ -476,6 +505,7 @@ class ClusterUiState:
     cruise_override_color_mode: int = 0
     recorded_cutin_active: bool = False
     recorded_cutin_sound: bool = False
+    alert: ClusterAlert | None = None
 
 
 @dataclass(frozen=True, slots=True)

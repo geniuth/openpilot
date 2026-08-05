@@ -35,6 +35,12 @@ html:not([data-carrot-mini-hud="1"]) #carrotMiniHud { display:none !important; }
   --chud-weight:900;
   --chud-white:#fff; --chud-carrot:#14bc68; --chud-limit:#de4840; --chud-amber:#f4ac36; --chud-stroke:#05090c;
   --chud-muted:#96a0ac;
+  /* 코너 온도바: 높이를 토큰으로 정의해 좌하단 존이 정확히 그만큼 올라간다.
+   * (line-height:1 이라 높이 = 글자 크기 + 상하 패딩) */
+  --chud-devtemp-font:clamp(12px,2cqw,20px);
+  --chud-devtemp-pad-block:clamp(2px,0.5cqw,5px);
+  --chud-devtemp-pad-inline:clamp(5px,1.2cqw,11px);
+  --chud-devtemp-height:calc(var(--chud-devtemp-font) + var(--chud-devtemp-pad-block) * 2);
 }
 .chud::before,.chud::after{
   content:"";position:absolute;left:0;right:0;z-index:0;pointer-events:none;
@@ -57,10 +63,24 @@ html:not([data-carrot-mini-hud="1"]) #carrotMiniHud { display:none !important; }
  * (제한속도 중심 ≈ tl패딩+상단아이콘행+gap+표지반높이 → 아래 clamp가 그 밴드 중심을 추종) */
 .chud-zone--tc{left:50%;top:0;transform:translateX(-50%);padding:clamp(8px,2cqw,20px);
   padding-top:clamp(54px,11cqw,108px);gap:clamp(10px,3cqw,26px)}
-.chud-zone--bl{left:0;bottom:0;padding:clamp(10px,3cqw,30px);
+/* 온도바 높이만큼 들어올린다(패딩 대신 bottom 앵커 — degradation의 padding 단축
+ * 지정이 예약분을 덮어쓰지 못한다). */
+.chud-zone--bl{left:0;bottom:var(--chud-devtemp-height);padding:clamp(10px,3cqw,30px);
   flex-direction:column;align-items:flex-start;gap:clamp(6px,1.2cqw,12px)}
 .chud-zone--br{right:clamp(98px,11cqw,122px);bottom:0;padding:clamp(10px,3cqw,30px)}
 .chud-row{display:flex;align-items:center;gap:clamp(8px,1.6cqw,18px)}
+/* 코너 스트립 — 화면 모서리에 완전 밀착(인셋 0). 존과 같은 z-index지만 DOM에서
+ * 먼저 오므로 겹칠 때 항상 다른 HUD 아래에 깔린다. 배경 그라디언트보다는 위. */
+.chud-corner{position:absolute;z-index:1;display:flex;pointer-events:none}
+.chud-corner--bl{left:0;bottom:0}
+
+/* 기기 CPU 온도 — 완전 검은 바 + 흰 글자. 좁아져도 숨기지 않는다. */
+.chud-devtemp{
+  font-family:var(--chud-font);font-weight:var(--chud-weight);
+  font-size:var(--chud-devtemp-font);line-height:1;
+  padding:var(--chud-devtemp-pad-block) var(--chud-devtemp-pad-inline);
+  color:var(--chud-white);background:#000;
+  font-variant-numeric:tabular-nums;letter-spacing:.01em;white-space:nowrap}
 
 /* accel/steer 게이지 */
 .chud-gauge-column{display:grid;grid-template-columns:minmax(0,1fr);gap:0}
@@ -99,12 +119,13 @@ html:not([data-carrot-mini-hud="1"]) #carrotMiniHud { display:none !important; }
 .chud-tlight-halo{opacity:.28}
 .chud-tlight-dot{stroke:rgba(255,255,255,.85);stroke-width:3}
 
-/* LFA 당근 — 클러스터 동작: 활성 풀컬러 / 비활성 회색 + 조향각 회전 */
-.chud-lfa{position:relative;display:flex;align-items:center;justify-content:center}
-/* 레인 날개(폭 2x)가 뜰 때만 그 오버행(각 변 휠 절반)을 패딩으로 예약 →
- * 옆 위젯과 겹치거나 좌측으로 삐져나가지 않는다(휠 위치는 중앙 유지). */
-.chud-lfa.has-lane{padding-inline:clamp(14px,2.8cqw,28px)}
-.chud-lfa-img{position:relative;z-index:1;height:clamp(28px,5.6cqw,56px);width:clamp(28px,5.6cqw,56px);display:block;object-fit:contain;
+/* LFA 아이콘의 flex 점유 폭은 모드와 무관하게 휠 크기로 고정한다.
+ * 2x 레인 날개는 absolute overflow로만 그려 옆 Wi-Fi/시계가 움직이지 않는다. */
+.chud-lfa{position:relative;display:flex;align-items:center;justify-content:center;
+  --chud-lfa-size:clamp(28px,5.6cqw,56px);--chud-lfa-lane-width:clamp(56px,11.2cqw,112px);
+  --chud-lfa-armed-opacity:.48;--chud-lfa-active-opacity:.78;
+  width:var(--chud-lfa-size);height:var(--chud-lfa-size);flex:0 0 auto}
+.chud-lfa-img{position:relative;z-index:1;height:var(--chud-lfa-size);width:var(--chud-lfa-size);display:block;object-fit:contain;
   transform-origin:50% 50%;transition:transform .12s linear,filter .2s,opacity .2s;
   filter:drop-shadow(0 2px 5px rgba(0,0,0,.55))}
 .chud-lfa:not(.is-active) .chud-lfa-img{opacity:.5;filter:grayscale(.7) drop-shadow(0 2px 5px rgba(0,0,0,.55))}
@@ -112,13 +133,17 @@ html:not([data-carrot-mini-hud="1"]) #carrotMiniHud { display:none !important; }
  * 휠 뒤에 깔리고 좌우로 삐져나온다. 색=배경(활성 초록/비활성 muted), 모양=mask(JS가 URL 주입). */
 .chud-lfa-lane{position:absolute;left:50%;top:50%;
   transform:translate(-50%,-56%);pointer-events:none;z-index:0;
-  width:clamp(56px,11.2cqw,112px);height:clamp(28px,5.6cqw,56px);
-  background-color:var(--chud-muted);
+  width:var(--chud-lfa-lane-width);height:var(--chud-lfa-size);
+  background-color:var(--chud-muted);opacity:0;visibility:hidden;
   -webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;
   -webkit-mask-position:center;mask-position:center;
   -webkit-mask-size:contain;mask-size:contain;
-  filter:drop-shadow(0 2px 5px rgba(0,0,0,.5))}
-.chud-lfa.is-active .chud-lfa-lane{background-color:var(--chud-carrot)}
+  filter:drop-shadow(0 2px 5px rgba(0,0,0,.5));
+  transition:opacity .18s ease-out,background-color .18s ease-out,visibility 0s linear .18s}
+.chud-lfa.has-lane .chud-lfa-lane{opacity:var(--chud-lfa-armed-opacity);visibility:visible;transition-delay:0s}
+.chud-lfa.is-lane-active .chud-lfa-lane{opacity:var(--chud-lfa-active-opacity)}
+.chud-lfa.is-lane-active.is-active .chud-lfa-lane{background-color:var(--chud-carrot);opacity:1}
+@media (prefers-reduced-motion:reduce){.chud-lfa-lane{transition:none}}
 
 /* WiFi */
 .chud-wifi{height:clamp(24px,4.8cqw,48px);width:clamp(24px,4.8cqw,48px);display:block;color:#fff;
@@ -176,9 +201,7 @@ html:not([data-carrot-mini-hud="1"]) #carrotMiniHud { display:none !important; }
  * 커진 결과가 다른 존을 침범하면 layout.js가 낮은 우선순위부터 제거한다. */
 @container chud (max-width:520px){
   .chud-gauge,.chud-level{width:clamp(44px,16cqw,64px)}
-  .chud-lfa-img{width:clamp(32px,12cqw,46px);height:clamp(32px,12cqw,46px)}
-  .chud-lfa-lane{width:clamp(64px,24cqw,92px);height:clamp(32px,12cqw,46px)}
-  .chud-lfa.has-lane{padding-inline:clamp(16px,6cqw,23px)}
+  .chud-lfa{--chud-lfa-size:clamp(32px,12cqw,46px);--chud-lfa-lane-width:clamp(64px,24cqw,92px)}
   .chud-wifi{width:clamp(28px,10cqw,40px);height:clamp(28px,10cqw,40px)}
   .chud-clock{font-size:clamp(28px,10cqw,40px);height:clamp(28px,10cqw,40px)}
   .chud-limit{width:clamp(52px,16cqw,68px)}

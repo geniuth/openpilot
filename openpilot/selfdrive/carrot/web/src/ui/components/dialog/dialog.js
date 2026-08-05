@@ -1,4 +1,10 @@
 import { createFocusTrap as createDefaultFocusTrap } from "./focus_trap.js";
+import {
+  createAppProgressView,
+  normalizeAppProgressState,
+} from "../progress/progress.js";
+
+export { normalizeAppProgressState };
 
 export const APP_DIALOG_CLOSE_DELAY = 180;
 
@@ -9,6 +15,7 @@ export const APP_DIALOG_VARIANT_CLASSES = Object.freeze([
   "app-dialog--choice-value-grid",
   "app-dialog--form",
   "app-dialog--input",
+  "app-dialog--progress",
 ]);
 
 const MODAL_SURFACE_IDS = Object.freeze([
@@ -23,6 +30,33 @@ function choiceText(choice) {
   return String(choice.label ?? "").trim();
 }
 
+function choiceHeading(choice) {
+  if (!choice || typeof choice !== "object") return "";
+  return String(choice.heading ?? "").trim();
+}
+
+function isChoiceItem(choice) {
+  return Boolean(choice) && !choiceHeading(choice) && (choice.label != null || Boolean(choice.labelHtml));
+}
+
+// Split choices into sections. A `{ heading }` entry opens a section and the
+// choices after it belong to it, so an ungrouped list stays a single section
+// with no heading and renders exactly as before.
+export function appDialogChoiceGroups(choices) {
+  const groups = [];
+  for (const choice of Array.isArray(choices) ? choices : []) {
+    const heading = choiceHeading(choice);
+    if (heading) {
+      groups.push({ heading, items: [] });
+      continue;
+    }
+    if (!isChoiceItem(choice)) continue;
+    if (!groups.length) groups.push({ heading: "", items: [] });
+    groups[groups.length - 1].items.push(choice);
+  }
+  return groups.filter((group) => group.items.length > 0);
+}
+
 export function inferAppDialogChoiceLayout(choices, options = {}) {
   const explicit = String(options.choiceLayout || options.choiceKind || "").trim();
   if (explicit === "grid" || explicit === "value-grid" || explicit === "values") return "value-grid";
@@ -34,6 +68,14 @@ export function inferAppDialogChoiceLayout(choices, options = {}) {
       && /^[+-]?(?:\d+|\d+\.\d+|[A-Za-z]{1,4})$/.test(text);
   });
   return shortValueChoices ? "value-grid" : "list";
+}
+
+export function appDialogChoiceLayout(groups, options = {}) {
+  const items = Array.isArray(groups) ? groups.flatMap((group) => group.items || []) : [];
+  if (!items.length) return "";
+  // Section headings need stacked rows; a value grid has no room for them.
+  if (groups.some((group) => Boolean(group?.heading))) return "list";
+  return inferAppDialogChoiceLayout(items, options);
 }
 
 export function appDialogChoiceColumns(count, options = {}) {
@@ -183,9 +225,34 @@ export function createDialogController(environment = {}) {
     resolveDialogState(activeDialog, result);
   }
 
-  function cancelAppDialog() {
-    if (!activeDialog || activeDialog.submitting) return;
-    resolveDialogState(activeDialog, dialogCancelResult(activeDialog));
+  async function cancelAppDialog() {
+    const state = activeDialog;
+    if (!state || state.submitting || state.canceling) return;
+    if (typeof state.onCancel !== "function") {
+      resolveDialogState(state, dialogCancelResult(state));
+      return;
+    }
+    state.canceling = true;
+    if (appDialogCancel) {
+      appDialogCancel.disabled = true;
+      appDialogCancel.textContent = state.cancelingLabel;
+    }
+    try {
+      await state.onCancel();
+      if (state.closeOnCancel && activeDialog === state && !state.closing) {
+        resolveDialogState(state, dialogCancelResult(state));
+      }
+    } catch (error) {
+      if (activeDialog !== state || state.closing) return;
+      state.canceling = false;
+      if (appDialogCancel) {
+        appDialogCancel.disabled = false;
+        appDialogCancel.textContent = state.cancelLabel;
+      }
+      if (typeof target.showAppToast === "function") {
+        target.showAppToast(error?.message || String(error), { tone: "error", duration: 3600 });
+      }
+    }
   }
 
   async function confirmAppDialog() {
@@ -259,12 +326,11 @@ export function createDialogController(environment = {}) {
     const cancelLabel = options.cancelLabel || text("cancel", "Cancel");
     const defaultActionLabel = options.defaultActionLabel || "";
     const hasDefaultAction = mode === "prompt" && Boolean(defaultActionLabel);
-    const choices = Array.isArray(options.choices)
-      ? options.choices.filter((choice) => choice && (choice.label != null || choice.labelHtml))
-      : [];
+    const choiceGroups = appDialogChoiceGroups(options.choices);
+    const choices = choiceGroups.flatMap((group) => group.items);
     const hasChoices = choices.length > 0;
     const isChoice = mode === "choice" || hasChoices;
-    const choiceLayout = hasChoices ? inferAppDialogChoiceLayout(choices, options) : "";
+    const choiceLayout = appDialogChoiceLayout(choiceGroups, options);
     const showCancel = mode !== "alert" && options.showCancel !== false;
 
     resetPresentation();
@@ -323,7 +389,7 @@ export function createDialogController(environment = {}) {
       } else {
         appDialogChoices.style.removeProperty("--app-dialog-choice-columns");
       }
-      for (const choice of choices) {
+      const createChoiceButton = (choice) => {
         const button = documentRoot.createElement("button");
         button.type = "button";
         let buttonClass = choice.danger
@@ -338,8 +404,29 @@ export function createDialogController(environment = {}) {
         if (choice.labelHtml) button.innerHTML = choice.labelHtml;
         else button.textContent = String(choice.label);
         button.addEventListener("click", () => resolveAppDialog(choice.value));
-        appDialogChoices.appendChild(button);
-      }
+        return button;
+      };
+
+      choiceGroups.forEach((group, index) => {
+        if (!group.heading) {
+          for (const choice of group.items) appDialogChoices.appendChild(createChoiceButton(choice));
+          return;
+        }
+        // A labelled section: screen readers announce the heading as the group
+        // name instead of it reading as one more choice in the list.
+        const section = documentRoot.createElement("div");
+        section.className = "app-dialog__choiceGroup";
+        section.setAttribute("role", "group");
+        const headingId = `appDialogChoiceHeading${index}`;
+        section.setAttribute("aria-labelledby", headingId);
+        const heading = documentRoot.createElement("div");
+        heading.id = headingId;
+        heading.className = "app-dialog__choiceHeading";
+        heading.textContent = group.heading;
+        section.appendChild(heading);
+        for (const choice of group.items) section.appendChild(createChoiceButton(choice));
+        appDialogChoices.appendChild(section);
+      });
     }
 
     if (appDialogInputWrap && appDialogInput) {
@@ -372,9 +459,14 @@ export function createDialogController(environment = {}) {
         mode,
         serial: ++dialogSerial,
         onSubmit: options.onSubmit,
+        onCancel: options.onCancel,
+        closeOnCancel: options.closeOnCancel !== false,
         submitting: false,
+        canceling: false,
         closing: false,
         confirmLabel,
+        cancelLabel,
+        cancelingLabel: options.cancelingLabel || text("canceling", "Canceling..."),
         submittingLabel: options.submittingLabel || text("saving", "Saving..."),
         lastFocus: inheritedLastFocus || documentRoot.activeElement || null,
         focusTrap: null,
@@ -428,11 +520,70 @@ export function createDialogController(environment = {}) {
     });
   }
 
+  function openAppProgressDialog(options = {}) {
+    const completion = openAppDialog({
+      mode: "choice",
+      title: options.title,
+      message: " ",
+      cancelLabel: options.cancelLabel,
+      cancelingLabel: options.cancelingLabel,
+      onCancel: options.onCancel,
+      closeOnCancel: false,
+    });
+    const state = activeDialog;
+    appDialog?.classList?.add("app-dialog--progress");
+    if (appDialogBody) appDialogBody.style.flex = "0 0 auto";
+    const progressView = createAppProgressView(documentRoot, options);
+    if (appDialogBody && progressView) appDialogBody.replaceChildren(progressView.element);
+
+    const isCurrent = () => Boolean(state && activeDialog === state && !state.closing);
+    const controller = {
+      completion,
+      setCancelHandler(handler) {
+        if (!isCurrent()) return;
+        state.onCancel = typeof handler === "function" ? handler : null;
+        if (appDialogCancel) {
+          appDialogCancel.hidden = !state.onCancel;
+          appDialogCancel.setAttribute("aria-hidden", state.onCancel ? "false" : "true");
+        }
+      },
+      setCanceling(active) {
+        if (!isCurrent() || !appDialogCancel) return;
+        state.canceling = Boolean(active);
+        appDialogCancel.disabled = state.canceling;
+        appDialogCancel.textContent = state.canceling ? state.cancelingLabel : state.cancelLabel;
+      },
+      setMessage(value) {
+        if (isCurrent()) progressView?.setMessage(value);
+      },
+      setProgressState(value) {
+        if (isCurrent()) progressView?.setProgressState(value);
+      },
+      setProgress(value) {
+        controller.setProgressState(value);
+      },
+      setSummary(value) {
+        if (isCurrent()) progressView?.setSummary(value);
+      },
+      close() {
+        if (isCurrent()) resolveDialogState(state, true);
+        return completion;
+      },
+    };
+    controller.setMessage(options.message);
+    controller.setProgressState(options.progressState ?? options.progress);
+    controller.setSummary(options.summary);
+    controller.setCancelHandler(options.onCancel);
+    return Object.freeze(controller);
+  }
+
   function appConfirm(message, options = {}) {
     return openAppDialog({
       mode: "confirm",
       title: options.title,
       message,
+      messageHtml: options.messageHtml,
+      html: options.html,
       confirmLabel: options.confirmLabel,
       cancelLabel: options.cancelLabel,
     });
@@ -500,6 +651,7 @@ export function createDialogController(environment = {}) {
 
   return Object.freeze({
     openAppDialog,
+    openAppProgressDialog,
     appAlert,
     appConfirm,
     appPrompt,

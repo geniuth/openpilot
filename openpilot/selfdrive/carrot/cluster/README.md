@@ -121,8 +121,9 @@ keep the default slice setting for normal tests. The
 hardware V4L2 rate-control default remains `--usb-h264-rate-control vbr-cfr`;
 `cbr-cfr` made frequent small blocks and `--usb-h264-realtime-priority` landed
 between VBR-CFR and CBR-CFR, so keep both off for normal tests. The
-ffmpeg/libx264 path remains available as a known-good comparison path. Build
-the native library before hardware testing:
+ffmpeg/libx264 path remains available as a known-good comparison path. Normal
+TICI (`larch64`) SCons builds include both native bridges. To rebuild only
+those targets before hardware testing:
 
 ```bash
 scons system/loggerd/libcluster_h264_encoder_bridge.so
@@ -216,7 +217,21 @@ available and falls back to the `imageio-ffmpeg` package from requirements:
 python -m pip install -r selfdrive/carrot/cluster/requirements.txt
 python selfdrive/carrot/cluster_replay_usb.py /data/media/0/realdata/0000012e--f190807d64--36 --duration 60
 python selfdrive/carrot/cluster_replay_usb.py /data/media/0/realdata/0000012e--f190807d64--36/rlog.zst --fps 20 --usb-brightness 80
+python selfdrive/carrot/cluster_replay_usb.py /data/media/0/realdata/0000012e--f190807d64--36 --trip-report
 ```
+
+From a Windows checkout whose repository root contains the `openpilot`
+directory, use:
+
+```powershell
+.venv\Scripts\python.exe openpilot\selfdrive\carrot\cluster_replay_usb.py W:\routes\vehicle\segment\rlog.zst --output both
+```
+
+The default `--corner-source live` displays the `liveTracks` actually
+published by the device. Use `--corner-source stable` to reconstruct
+physically continuous corner tracks from raw CAN, or `--corner-source raw` to
+show the untracked CAN slots. Comparing `live` and `stable` is useful when a
+recorded cluster display is missing a corner object.
 
 Use `--route-overlay full` for a larger replay debug panel, or
 `--output usb --route-overlay off` when only the USB panel should be driven.
@@ -270,9 +285,9 @@ are fixed at startup. Set `CLUSTER_AUTORUN_FPS` only for fixed test overrides;
 rendering only while openpilot is onroad, and `1`, `2`, and `3` keep the
 always-on debug behavior after power-up. In live input only, `2` also keeps the
 top UI icons visible when source data is missing, and `3` also shows the navi
-debug UI before navi data has arrived. When output is gated off,
-`cluster_autorun` sends TURZX brightness `0` so a stale HUD frame does not
-remain visible.
+debug UI before navi data has arrived. Normal mode checks the onroad gate every
+100 ms; when output is gated off, `cluster_autorun` sends TURZX brightness `0`
+so a stale HUD frame does not remain visible.
 The autorun watcher normalizes locale before this dim-only USB path too, so
 vendor USB initialization does not fail before the renderer is launched.
 Manager autostart always configures the cluster process through openpilot's
@@ -294,9 +309,37 @@ USB; stale access units are dropped and reported instead of failing the run.
 When `--usb-brightness` is omitted, USB launches follow `ClusterHudBrightness`:
 `0` auto follows live `wideRoadCameraState.exposureValPercent` after samples are
 available, falling back to `deviceState.screenBrightnessPercent`; `1` through
-`100` are fixed brightness percentages.
-Brightness commands use no-ACK command `14` during USB initialization and when
-the resolved brightness changes.
+`100` are fixed brightness percentages. `ClusterHudOrientation` supports `0`
+(0 degrees) and `2` (180 degrees); values `1` and `3` are ignored. The existing
+web settings UI stores both Params without a custom slider path. The running
+HUD checks the stored brightness and orientation every 100 ms. Brightness
+applies without restarting. A managed H.264 orientation change exits cleanly
+and autorun relaunches immediately. The new stream uses the captured
+`10, 111, 112, 13, 14, 52, 102, 15, 17` setup sequence, including the selected
+raw orientation in command `13`.
+
+Changed display settings follow the capture-derived command procedure:
+
+- Brightness: command `10` (sync), wait about 20 ms, then command `14` with
+  byte 8 set to `int(percent / 100 * 102)`.
+- Screen rotation: command `10` (sync), wait about 20 ms, then command `13`
+  with byte 8 set to supported raw orientation `0` or `2`.
+
+The sync and setting write are one USB-locked transaction so an image frame
+cannot split the pair. Both runtime writes are nonblocking on TICI; pending
+responses are drained by the next bounded USB operation, so a missing sync ACK
+cannot terminate the HUD. Initial orientation is stored locally before USB
+open and carried by H.264 setup command `13`. H.264 startup waits for each captured
+setup delay, uses captured finalizer command `52` instead of the
+reference-library command `41`, clears the 464x1920 overlay, then applies FPS
+and queries the chunk size. Setup writes remain nonblocking on TICI and drain
+pending responses before subsequent writes; waiting synchronously for every
+ACK prevented the H.264 stream from starting. Shutdown sends command `123`
+followed by two bounded command-`122` status drains before releasing USB. The
+panel does not visibly apply command `13` during an active H.264 stream, so
+managed H.264 uses the automatic restart described above.
+`--usb-h264-orientation` remains a separate diagnostic option controlling
+encoder/render geometry.
 
 The launcher defaults to `--input live`, subscribes to openpilot cereal services,
 and renders live `carState`, `modelV2`, `radarState`, `liveTracks`,
@@ -361,10 +404,12 @@ missing, invalid, or stale longitudinal plans hide the badge. The red and
 green traffic-state icons share the slot immediately to its left and remain
 independent of driving mode. Full navigation mode omits both speed-mode
 indicators.
-The normal and road camera HUDs use the same fixed TPMS diagram below the
-acceleration, steering, fuel, and DEF gauges. It remains hidden only when all
-four pressure values are unavailable; individual missing values show `--`, and
-values below 31 psi are red. The surrounding area stays transparent. When
+The normal and road camera HUDs use the same fixed toy-car TPMS diagram below
+the acceleration, steering, fuel, and DEF gauges. Its transparent PNG is loaded
+into one GPU texture at renderer startup, then each unchanged-size live pressure
+value is drawn inside its corresponding enlarged tire. It remains hidden only
+when all four pressure values are unavailable; individual missing values show
+`--`, and values below 31 psi are red. The surrounding area stays transparent. When
 external navigation is active or its dashboard is connected, the green `NAV`
 status appears below the Wi-Fi icon instead of the former lower-right `NAVI`
 label. The center clock, EV indicator, and fuel/DEF gauges are unchanged.
@@ -406,20 +451,75 @@ intermediate copy. They also report the availability of `async_pbo` and
 `auto` falls back to ffmpeg, the run uses the software RGBA pipe.
 Changing this setting while the HUD is running makes the current HUD process
 exit so `cluster_autorun` can relaunch it with the new encoder choice.
-`ClusterHudScreenMode` controls optional debug views: `0` default, `1` shows
-the live debug panel with grouped `LIVE DELAY`, `LIVE TORQUE`, `STEERING`, and
-`LATERAL PLAN` rows, `2` shows the system information panel with memory and CPU
-core usage, `3` shows a large debug graph selected by `ShowPlotMode` with the
-driving scene disabled, and `4`
-shows the same graph in the right-side panel while keeping the driving scene.
-`5` shows the external navigation receiver debug panel while keeping the
-driving scene.
+`ClusterHudScreenMode` controls the right-side content. `-1` uses the entire
+display for either 3D camera view, suppresses information panels, and balances
+the clock, side gauges, TPMS, traffic image, turn signals, and status footer
+across the full width. In road-camera view it behaves exactly like mode `0`.
+Mode `0` is the default mode that switches between navigation and the driving
+report. While onroad, shifting into park (`P`) temporarily gives the completed
+driving report priority over active navigation; leaving park restores navigation
+immediately. Explicit modes such as report mode `5` and navigation mode `6`
+remain fixed. Mode `1` shows the live debug panel with grouped `LIVE DELAY`, `LIVE TORQUE`,
+`STEERING`, and `LATERAL PLAN` rows, `2` is the system-debug slot rendering commit
+`c0a6773f794a5e4e86aeca8e14515232abc26b1b`'s mode-0 default system screen,
+`3` shows a large debug graph selected by `ShowPlotMode` with the driving scene
+disabled, and `4` shows the same graph in the information panel while keeping
+the driving scene. Mode `4` keeps the acceleration, steering, fuel, and DEF
+gauges immediately to the left of the graph instead of near the center of the
+driving view; the gauge block follows the graph when the panel layout is
+swapped, while TPMS remains with the driving view.
+`5` shows the driving report in the information panel while keeping the driving scene. The
+report uses a large trip/event summary card and a separate system-load card
+with four 2-by-2 circular gauges. A lower target plots stored calibration pitch
+vertically and yaw horizontally around the calibrated center while retaining
+the numeric angles. In managed live input, trip statistics remain stopped until
+`deviceState.started` is true, reset and start on that transition, freeze
+immediately when it becomes false, and reset again at the next onroad start.
+Replay and direct parser inputs retain their existing accumulation behavior.
+The same mode can be validated with
+`cluster_replay_usb.py ROUTE --trip-report`.
+`ClusterHudPanelLayout=0` keeps the driving view on the left and the current
+information panel on the right. Value `1` swaps the two regions without
+restarting the HUD. The information region includes screen-mode debug panels,
+the driving report, route diagnostics, and live navigation, including panels
+made visible by `ClusterHudDebug`. Full-screen graph and navigation modes are
+not rearranged. Route replay can validate the swapped layout with
+`cluster_replay_usb.py ROUTE --trip-report --panel-layout driving-right`.
+The renderer polls `LanguageSetting` and `IsMetric` about once per second.
+Korean (`ko`) and English (`en`) localize driving-report, driving-mode, and
+navigation status labels; unsupported language values fall back to English.
+Metric mode renders speed/distance as `km/h`, `m`, and `km`, while imperial
+mode converts the same internal kph/metre state to `mph`, `ft`, and `mi`.
+Vehicle speed, cruise/override/limit values, navigation, radar labels, and the
+trip report all use the selected units; acceleration and temperature remain
+`m/s²` and `°C`. Route replay defaults to Korean/metric and can validate the
+other presentation with
+`cluster_replay_usb.py ROUTE --trip-report --language en --imperial`.
+In default screen mode (`0`), the trip report is shown while no live navigation
+is being received and the navigation panel returns automatically when reception
+starts. System-debug mode (`2`) reproduces the reference commit's mode-0 system
+screen and does not use the current automatic report fallback. It keeps the
+navigation/disconnected-system panel whenever a navigation dashboard exists,
+and falls back to the route overlay only when no navigation panel source exists.
+Fullscreen-3D mode (`-1`) never reserves a navigation/report panel in either 3D
+camera view, even when Navi data is available. Switching to road-camera view
+re-enables the complete mode-0 panel selection and panel-layout behavior.
+Left-edge HUD items keep their normal margins, right-edge gauges and TPMS keep
+their small-3D-view right margins at the physical display edge, and the clock,
+world, and turn signals use the full-display center axis.
+Mode `5` keeps the branch, network address, and
+frame-rate status in the lower-left camera area while omitting the lower-right
+core-usage text that would overlap the report. In road-camera view, ungrouped radar detections are projected
+as small transparent rounded source-colored markers, while detected vehicles
+are enclosed by larger transparent rounded frames using their existing
+detection colors. Vehicle frames use a single low-segment outline, ignore noisy
+radar-derived yaw when calculating their screen width, and are discarded before
+drawing when an incomplete or edge-clipped projection would create a stretched
+frame.
 Mode `3` also hides the speed, accel, clock, turn-signal, and git HUD so the
 large graph uses the available center/right height with only a small margin.
 Mode `4` keeps the driving HUD and uses the maximum right-side panel height with
-the same margin. Mode `5` draws the received navigation route through the
-normal planned-path renderer when route coordinates and current ego GPS are
-available. Modes `1`, `2`, `3`, `4`, and `5` suppress the route overlay so the
+the same margin. Modes `1`, `2`, `3`, `4`, and `5` suppress the route overlay so the
 selected debug view remains visible.
 `ClusterHudRadarInfo` controls world radar/vehicle speed and distance labels:
 `0` off, `1` speed for vehicle boxes only, `2` speed and distance for vehicle

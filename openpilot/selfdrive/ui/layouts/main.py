@@ -1,7 +1,6 @@
 import time
 import pyray as rl
 from enum import IntEnum
-import openpilot.cereal.messaging as messaging
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.selfdrive.ui.layouts.sidebar import Sidebar, SIDEBAR_WIDTH
 from openpilot.selfdrive.ui.layouts.home import HomeLayout
@@ -9,6 +8,7 @@ from openpilot.selfdrive.ui.layouts.settings.settings import SettingsLayout, Pan
 from openpilot.selfdrive.ui.onroad.augmented_road_view import AugmentedRoadView
 from openpilot.selfdrive.ui.carrot_param_cache import TimedSnapshotCache, read_screen_record
 from openpilot.selfdrive.ui.ui_state import device, ui_state
+from openpilot.selfdrive.ui.widgets.carrot_web_dialog import CarrotWebDialog
 from openpilot.system.ui.widgets import Widget
 from openpilot.selfdrive.ui.layouts.onboarding import OnboardingWindow
 
@@ -22,8 +22,6 @@ class MainState(IntEnum):
 class MainLayout(Widget):
   def __init__(self):
     super().__init__()
-
-    self._pm = messaging.PubMaster(['bookmarkButton'])
 
     self._sidebar = Sidebar()
     self._current_mode = MainState.HOME
@@ -100,12 +98,18 @@ class MainLayout(Widget):
 
   def _render(self, _):
     self._handle_onroad_transition()
+    if ui_state.started:
+      cluster_hud_connected = ui_state.params.get_bool("ClusterHudConnected")
+      self._layouts[MainState.ONROAD].set_cluster_hud_connected(
+        cluster_hud_connected,
+        ui_state.show_camera_with_cluster,
+      )
     self._render_main_content()
     self._handle_carrot_record_cmd(ui_state.sm)
 
   def _setup_callbacks(self):
     self._sidebar.set_callbacks(on_settings=self._on_settings_clicked,
-                                on_flag=self._on_bookmark_clicked,
+                                on_carrot_web=lambda: gui_app.push_widget(CarrotWebDialog()),
                                 open_settings=lambda: self.open_settings(PanelType.TOGGLES))
     self._layouts[MainState.HOME]._setup_widget.set_open_settings_callback(lambda: self.open_settings(PanelType.FIREHOSE))
     self._layouts[MainState.HOME].set_settings_callback(lambda: self.open_settings(PanelType.TOGGLES))
@@ -148,11 +152,6 @@ class MainLayout(Widget):
 
   def _on_settings_clicked(self):
     self.open_settings(PanelType.DEVICE)
-
-  def _on_bookmark_clicked(self):
-    user_bookmark = messaging.new_message('bookmarkButton')
-    user_bookmark.valid = True
-    self._pm.send('bookmarkButton', user_bookmark)
 
   def _on_onroad_clicked(self):
     self._sidebar.set_visible(not self._sidebar.is_visible)

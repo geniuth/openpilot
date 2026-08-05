@@ -32,6 +32,7 @@ def simulator_command(
   position: str,
   front_only: bool,
   motion_mode: str | None = None,
+  sensitivity: int | None = None,
 ) -> list[str]:
   command = [
     sys.executable,
@@ -47,6 +48,8 @@ def simulator_command(
   ]
   if probability is not None:
     command.extend(("--prob", str(probability)))
+  if sensitivity is not None:
+    command.extend(("--sensitivity", str(sensitivity)))
   for item in group:
     command.extend(("--validation-case", str(item["id"])))
   if front_only:
@@ -73,8 +76,16 @@ def parse_args() -> argparse.Namespace:
     type=float,
     default=None,
     help=(
-      "one-run normalized path-proximity threshold override; "
-      + "otherwise use the slider's saved value"
+      "advanced one-run probability threshold override"
+    ),
+  )
+  parser.add_argument(
+    "--sensitivity",
+    type=int,
+    default=None,
+    help=(
+      "Carrot Radar CUT-IN sensitivity 0..5; otherwise use the validation "
+      + "UI's saved level"
     ),
   )
   parser.add_argument("--front-only", action="store_true")
@@ -92,6 +103,8 @@ def main() -> int:
   args = parse_args()
   if args.prob is not None and not 0.0 <= args.prob <= 1.0:
     raise SystemExit("--prob must be between 0.00 and 1.00")
+  if args.sensitivity is not None and not 0 <= args.sensitivity <= 5:
+    raise SystemExit("--sensitivity must be between 0 and 5")
   if args.front_only and args.motion_mode not in (None, "front"):
     raise SystemExit("--front-only conflicts with --motion-mode normal")
   payload = json.loads(args.cases.read_text(encoding="utf-8"))
@@ -142,6 +155,7 @@ def main() -> int:
       f"{index}/{len(groups)}",
       args.front_only,
       args.motion_mode,
+      args.sensitivity,
     )
     result = subprocess.run(command, check=False)
     if result.returncode != 0:

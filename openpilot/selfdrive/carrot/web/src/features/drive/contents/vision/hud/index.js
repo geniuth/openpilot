@@ -12,8 +12,10 @@ import { createSpeedPanel } from "./widgets/speed_panel.js";
 import { createSpeedLimitSign } from "./widgets/speed_limit_sign.js";
 import { createDriveModeBadge } from "./widgets/drive_mode.js";
 import { createClock } from "./widgets/clock.js";
+import { createDeviceTemp } from "./widgets/device_temp.js";
 import { createWifiIcon } from "./widgets/wifi_icon.js";
 import { createLfaIcon } from "./widgets/lfa_icon.js";
+import { resolveLaneModeFields } from "../lane_mode.js";
 import { createAccelGauge } from "./widgets/accel_gauge.js";
 import { createSteerGauge } from "./widgets/steer_gauge.js";
 import { createTurnSignal } from "./widgets/turn_signal.js";
@@ -52,6 +54,11 @@ export function mapPayload(p = {}) {
     : (p.gear == null ? null : String(p.gear).trim().toUpperCase().slice(0, 2));
   const override = p.cruiseOverride && typeof p.cruiseOverride === "object" ? p.cruiseOverride : null;
   const overrideKph = override != null ? num(override.kph) : null;
+  const laneMode = resolveLaneModeFields({
+    requested: p.laneModeRequested,
+    planned: p.laneModePlanned,
+    controlled: p.activeLaneLine,
+  });
   return {
     speed: toUnit(speed),
     // 크루즈 off면 0/음수로 오므로 숨김
@@ -61,7 +68,10 @@ export function mapPayload(p = {}) {
     speedLimit: limit != null && limit > 0 ? toUnit(limit) : null,
     // 클러스터 패리티: EV 텔테일 / LFA 레인 초록 날개 / 크루즈 오버라이드(감속=주황·eco=초록)
     evActive: p.evActive === true,
-    activeLaneLine: p.activeLaneLine === true,
+    activeLaneLine: laneMode.controlled,
+    laneModeRequested: laneMode.requested,
+    laneModePlanned: laneMode.planned,
+    laneModePresentation: laneMode.presentation,
     cruiseOverride: overrideKph != null && overrideKph > 0
       ? { kph: toUnit(overrideKph), label: override.label == null ? "" : String(override.label), mode: num(override.mode) ?? 0 }
       : null,
@@ -78,6 +88,8 @@ export function mapPayload(p = {}) {
     trafficState: num(p.trafficState),
     networkConnected: p.networkConnected,
     clock: p.clock,
+    // 가장 뜨거운 코어(네이티브 패리티). 평균값만 오는 경로가 있어 폴백을 둔다.
+    cpuTemp: num(p.cpuTempMaxC ?? p.cpuTempC),
   };
 }
 
@@ -106,6 +118,7 @@ export function createHudOverlay(doc) {
   });
   const tpms = createTpmsBadge(doc);
   const turn = createTurnSignal(doc);
+  const devTemp = createDeviceTemp(doc);
 
   const zoneTL = el(doc, "div", { class: "chud-zone chud-zone--tl" }, [
     el(doc, "div", { class: "chud-row" }, [lfa.el, wifi.el, clock.el]),
@@ -118,7 +131,10 @@ export function createHudOverlay(doc) {
   ]);
   const zoneBL = el(doc, "div", { class: "chud-zone chud-zone--bl" }, [speed.el]);
   const zoneBR = el(doc, "div", { class: "chud-zone chud-zone--br" }, [tpms.el]);
-  root.append(zoneTL, zoneTC, zoneTR, zoneBL, zoneBR);
+  // 코너 스트립은 존이 아니다: 인셋 0으로 화면 모서리에 밀착하고, 존보다 먼저
+  // 붙어 같은 z-index에서 항상 다른 HUD 아래에 깔린다. degradation 대상도 아니다.
+  const cornerBL = el(doc, "div", { class: "chud-corner chud-corner--bl" }, [devTemp.el]);
+  root.append(cornerBL, zoneTL, zoneTC, zoneTR, zoneBL, zoneBR);
   const layoutZones = {
     topLeft: zoneTL,
     topCenter: turn.el,
@@ -127,7 +143,7 @@ export function createHudOverlay(doc) {
     bottomRight: zoneBR,
   };
 
-  const widgets = [lfa, wifi, clock, limit, speed, driveMode, accel, steer, fuel, def, tpms, turn];
+  const widgets = [lfa, wifi, clock, limit, speed, driveMode, accel, steer, fuel, def, tpms, turn, devTemp];
   const suppressions = new Set();
   let visibilitySignature = "";
   let layoutObserver = null;
@@ -168,8 +184,6 @@ export function createHudOverlay(doc) {
       data.speedLimit != null && data.speedLimit > 0,
       data.leftBlinker,
       data.rightBlinker,
-      // 레인 날개는 LFA 폭을 바꾸므로 등장/소멸 시 재배치 판정이 필요하다.
-      data.activeLaneLine,
       data.fuelGauge != null && data.fuelGauge > 0 && data.fuelGauge <= 1,
       data.ureaGauge != null && data.ureaGauge > 0 && data.ureaGauge <= 1,
     ].join(":");

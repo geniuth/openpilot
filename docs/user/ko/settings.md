@@ -97,13 +97,13 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 
 ## 전체 설정 지도
 
-현재 `carrot-wip`의 `carrot_settings.json`에는 **166개 파라미터**가 있으며, 모든 항목이 아래 메뉴에 연결되어 있습니다.
+현재 `carrot-wip`의 `carrot_settings.json`에는 **171개 파라미터**가 있으며, 모든 항목이 아래 메뉴에 연결되어 있습니다.
 
 | 대분류 | 항목 수 | 중분류 |
 |---|---:|---|
 | 주행 제어 | 107 | 시작·오토, 버튼·프리셋, 차량 조향, 속도·감속, 크루즈·차간 |
-| 차량·하드웨어 | 15 | 현대·기아, CANFD·HDA, 레이더, 운전자 모니터링, 차량 보조, 기기 하드웨어 |
-| 화면 표시 | 33 | 정보 표시, 경로 표시, 밝기·주행화면, 외부 HUD |
+| 차량·하드웨어 | 16 | 현대·기아, CANFD·HDA, 레이더, 운전자 모니터링, 차량 보조, 기기 하드웨어 |
+| 화면 표시 | 37 | 정보 표시, 경로 표시, 밝기·주행화면, 외부 HUD |
 | 시스템 | 11 | 녹화·전원, 네트워크·지도, 사운드, 소프트웨어 |
 
 ## 주행 제어
@@ -150,6 +150,8 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 
 `SteerActuatorDelay`는 높을수록 더 일찍 조향하도록 보상하고, `LatSmoothSec`는 높을수록 부드러워지는 대신 반응이 늦어질 수 있습니다. 두 값을 동시에 바꾸면 원인을 구분하기 어렵습니다.
 
+`SteerRatioRate`의 기본값 `100%`는 학습된 조향비를 그대로 적용합니다. `CustomSR=0`일 때 사용되며, 저장된 비율이 허용 범위(`30~200%`)를 벗어나면 안전하게 `100%`로 대체됩니다.
+
 `LateralTorqueCustom`과 `CustomSteer*` 계열은 차량의 기본 조향 튜닝과 안전 제한에 영향을 줄 수 있는 고급 항목입니다. 차종별 검증값과 복구 방법이 없으면 변경하지 마세요.
 
 ### 속도·감속 — 18개
@@ -193,24 +195,25 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 <a id="vehicle-hardware"></a>
 ## 차량·하드웨어
 
-차량·하드웨어 15개 항목은 차종, 하네스와 기기 하드웨어 구성을 결정하는 설정입니다. 화면 표시 설정처럼 시험 삼아 켜면 안 됩니다.
+차량·하드웨어 16개 항목은 차종, 하네스와 기기 하드웨어 구성을 결정하는 설정입니다. 화면 표시 설정처럼 시험 삼아 켜면 안 됩니다.
 
 | 중분류 | 파라미터 | 용도 |
 |---|---|---|
 | 현대·기아 | `HyundaiCameraSCC`, `IsLdwsCar`, `HapticFeedbackWhenSpeedCamera` | SCC 연결 방식, LDWS 차량과 카메라 구간 햅틱 |
 | CANFD·HDA | `CanfdHDA2`, `CanfdDebug`, `HDPuse` | HDA2 차량과 CAN FD 디버그·HDP 기능 |
-| 레이더 | `EnableRadarTracks`, `EnableCornerRadar`, `CarrotRadarMode` | SCC 레이더, 레이더 트랙, 코너 레이더와 당근레이더 처리 |
+| 레이더 | `EnableRadarTracks`, `EnableCornerRadar`, `CarrotRadarMode`, `CarrotRadarCutInSensitivity` | SCC 레이더, 레이더 트랙, 코너 레이더와 당근레이더 처리·컷인 감도 |
 | 운전자 모니터링 | `DisableDM`, `MuteDoor`, `MuteSeatbelt` | 운전자 모니터링과 일부 차량 경고음 처리 |
 | 차량 보조 | `MaxAngleFrames`, `SpeedFromPCM` | 최대 조향각 관련 프레임과 순정 SCC 속도 제어 방식 |
 | 기기 하드웨어 | `HardwareC3xLite` | 스피커가 없는 C3X Lite의 알림음과 프로세스 구성 |
 
 > [!CAUTION]
-> `HyundaiCameraSCC`, `CanfdHDA2`, `EnableRadarTracks`, `CarrotRadarMode`, `SpeedFromPCM`은 잘못 설정하면 차량 인식, SCC, 레이더와 가감속 동작이 달라질 수 있습니다. 차종, 연식, HDA 구성, 하네스 연결 위치와 순정 ACC 사용 여부를 확인한 뒤 변경하세요.
+> `HyundaiCameraSCC`, `CanfdHDA2`, `EnableRadarTracks`, `CarrotRadarMode`, `CarrotRadarCutInSensitivity`, `SpeedFromPCM`은 잘못 설정하면 차량 인식, SCC, 레이더와 가감속 동작이 달라질 수 있습니다. 차종, 연식, HDA 구성, 하네스 연결 위치와 순정 ACC 사용 여부를 확인한 뒤 변경하세요.
 
 - `HyundaiCameraSCC`: 현대·기아 차량의 롱컨, 크루즈 동기화와 CAN FD 배선 구성에 따라 모드가 달라집니다.
 - `CanfdHDA2`: HDA2 차량에서만 활성화합니다.
 - `EnableRadarTracks`: SCC 사용부터 레이더 트랙과 저속 SCC 조합까지 여러 모드가 있으므로 차량별 검증이 필요합니다.
 - `CarrotRadarMode`: 전방·코너 레이더로 차량의 움직임을 계속 추적해 끼어드는 차량을 감지하고, 카메라 영상과 레이더 정보를 새로운 방식으로 맞춰 앞차를 선택합니다. 코너 레이더와 레이더 트랙 기능이 모두 없는 차량에서는 기존 방식과 동일하게 동작합니다. 가감속 동작이 달라질 수 있으므로 검증을 마친 동일 차량에서만 켭니다. 변경값은 다음 OnRoad가 시작될 때 고정되므로, 변경 후 현재 주행을 끝내고 차량을 재시동하거나 기기를 재부팅해야 적용됩니다. 기존 `RadarMotionMode` 값은 업데이트 후 처음 시작할 때 새 이름으로 한 번 자동 이관됩니다.
+- `CarrotRadarCutInSensitivity`: 당근레이더모드 전용 CUT-IN 감도입니다. `0`은 사용 안 함, `1`은 둔감, `3`은 보통(기본값), `5`는 아주 민감이며 `2`와 `4`는 중간 단계입니다. 단계 `1`~`5`는 실제 측정 움직임이 각각 `0.50`, `0.40`, `0.35`, `0.25`, `0.20초` 계속될 때 확정하며, 물리 미래 예측시간은 5.0초로 고정합니다. 전방 레이더의 최근 실측 이력에서 0.50m 이상 강한 단방향 진입이 확인되면 timestamp 양자화로 확정을 놓치지 않도록 최대 20Hz 레이더 한 프레임만 반영하며, 작은 인접 차로 흔들림에는 적용하지 않습니다. 기존 레이더모드와 `EnableCornerRadar`에는 영향을 주지 않습니다. 다음 OnRoad 시작 때 읽으므로 변경 후 차량을 재시동하거나 기기를 재부팅해야 적용됩니다.
 - `DisableDM`: 운전자 모니터링을 비활성화할 수 있는 안전 관련 항목이며 재부팅이 필요합니다.
 - `SpeedFromPCM`: 비롱컨 순정 SCC의 버튼 스패밍과 커브·카메라 감속 방식에 영향을 줍니다.
 
@@ -219,21 +222,45 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 <a id="display"></a>
 ## 화면 표시
 
-화면 표시에는 33개 항목이 있습니다. 일반 화면 항목은 비교적 되돌리기 쉽지만, 외부 HUD는 별도 하드웨어와 성능 설정을 포함합니다.
+화면 표시에는 37개 항목이 있습니다. 일반 화면 항목은 비교적 되돌리기 쉽지만, 외부 HUD는 별도 하드웨어와 성능 설정을 포함합니다.
 
 | 중분류 | 파라미터 | 용도 |
 |---|---|---|
 | 정보 표시 | `ShowDebugUI`, `ShowTpms`, `ShowDateTime`, `ShowPathEnd`, `ShowDeviceState`, `ShowLaneInfo`, `ShowRadarInfo`, `ShowRouteInfo`, `ShowPlotMode` | 주행 화면의 디버그, 타이어, 시간, 차선, 레이더와 경로 정보 |
 | 경로 표시 | `ShowPathMode`, `ShowPathColor`, `ShowPathColorCruiseOff`, `ShowPathModeLane`, `ShowPathColorLane` | 레인리스·레인모드·크루즈 OFF 상태의 경로 모양과 색상 |
-| 밝기·주행화면 | `ShowCustomBrightness`, `ShowModelView` | 주행 중 밝기와 카메라·모델 표시 조합 |
-| 외부 HUD·기본 | `ClusterHud`, `ClusterHudBrightness`, `ClusterHudMirror`, `ClusterHudTheme`, `ClusterNaviMapTheme`, `ClusterNaviMapType`, `ClusterNaviMapFps` | TURZX 외부 HUD, 밝기, 미러링과 지도 테마 |
-| 외부 HUD·화면·카메라 | `ClusterHudEncoder`, `ClusterHudLiveFps`, `ClusterHudScreenMode`, `ClusterHudCameraViewMode` | 인코더, 전송 FPS와 화면·카메라 구성 |
+| 밝기·주행화면 | `ShowCustomBrightness`, `ShowModelView`, `ShowCameraWithCluster` | 주행 중 밝기, 카메라·모델 표시 조합과 외부 HUD 연결 중 본체 카메라 표시 |
+| 외부 HUD·기본 | `ClusterHud`, `ClusterHudBrightness`, `ClusterHudOrientation`, `ClusterHudMirror`, `ClusterHudTheme`, `ClusterNaviMapTheme`, `ClusterNaviMapType`, `ClusterNaviMapFps` | TURZX 외부 HUD, 밝기, 화면 회전, 미러링과 지도 테마 |
+| 외부 HUD·화면·카메라 | `ClusterHudEncoder`, `ClusterHudLiveFps`, `ClusterHudScreenMode`, `ClusterHudPanelLayout`, `ClusterHudCameraViewMode` | 인코더, 전송 FPS와 화면·카메라·좌우 패널 구성 |
 | 외부 HUD·레이더 표시 | `ClusterHudRadarInfo`, `ClusterHudRadarDisplay`, `ClusterHudRadarSourceColor` | 외부 HUD의 레이더 정보와 색상 |
 | 외부 HUD·성능·디버그 | `ClusterHudCoreMode`, `ClusterHudPriority`, `ClusterHudDebug` | CPU 코어, 프로세스 우선순위와 진단 정보 |
 
 `ShowRouteInfo` 설명에 남아 있는 APN 표기는 경로 정보 입력 상태를 뜻합니다. 이를 CarrotMan 또는 CarrotLink 지원 안내로 해석하면 안 됩니다.
 
-`ShowCustomBrightness=0`은 주변 밝기에 따른 자동 조절이고, `ShowModelView`는 카메라와 모델 표시 조합을 선택합니다. `ClusterHud` 계열은 지원되는 외부 HUD를 연결한 경우에만 사용하세요.
+`ShowCustomBrightness=0`은 주변 밝기에 따른 자동 조절이고, `ShowModelView`는 카메라와 모델 표시 조합을 선택합니다. `ShowCameraWithCluster=0`은 외부 HUD 연결 중 본체 카메라를 숨기는 기존 기본 동작이고, `1`은 본체 카메라 영상을 표시합니다. `ClusterHud` 계열은 지원되는 외부 HUD를 연결한 경우에만 사용하세요.
+
+`ClusterHudBrightness=0`은 카메라 노출값을 따르는 자동 밝기이고, `1~100`은 고정 밝기입니다. `ClusterHudOrientation`은 `0`(0도)과 `2`(180도)만 지원하며 `1`, `3`은 무시합니다. 실행 중인 TURZX 프로세스는 두 저장값을 100ms마다 확인합니다. 밝기는 실행 중 적용되고, 관리형 H.264의 회전값이 바뀌면 HUD가 자동 재시작되어 캡처와 동일한 스트림 설정 절차로 적용됩니다.
+
+`ClusterHudPanelLayout=0`은 `ClusterHudCameraViewMode`가 선택한 주행 화면을 왼쪽에, 화면 모드·디버그·내비 상태에 따라 선택되는 정보 패널을 오른쪽에 배치합니다. `1`은 두 영역을 서로 바꿔 정보 패널을 왼쪽에, 주행 화면을 오른쪽에 표시합니다. 실행 중 약 1초 안에 적용되며 재시작하지 않습니다. 전체화면 그래프와 전체화면 내비처럼 좌우 영역이 없는 모드는 바뀌지 않습니다. `ClusterHudDebug`은 HUD 상시 출력과 디버그 UI·내비 입력을 강제로 켜는 설정이며, 그 결과 표시되는 디버그·내비 정보 패널도 선택한 좌우 배치를 따릅니다.
+
+외부 HUD가 USB로 연결된 동안 `ShowCameraWithCluster=0`이면 일반 C3/C3X와 mici의 본체 주행 화면은 검은 배경으로 전환하고 카메라 영상과 모델 경로 렌더링을 생략합니다. `1`이면 이 연결 전용 억제를 해제해 본체 카메라 영상과 기존 주행화면 렌더 경로를 사용합니다. 값은 주행 중에도 최대 약 5초 안에 반영됩니다. 어느 값에서도 속도·제한속도·운전자 상태·경고·주행 상태 테두리 등 본체 HUD는 계속 표시되며, 외부 HUD 연결이 끊기면 이 옵션은 화면에 영향을 주지 않습니다. `0`에서도 `camerad`와 모델 입력은 계속 동작하고 본체 화면의 중복 렌더링만 줄입니다.
+
+`ClusterHudScreenMode`의 최종 화면 구성은 다음과 같습니다.
+
+- `-1`은 카메라 뷰 `0`, `1`의 3D 화면에서만 정보 패널과 월드 이동을 제거하고 전체 폭을 사용합니다. 왼쪽 HUD는 기존 여백을 유지하고, 오른쪽 게이지·TPMS는 물리 화면 오른쪽 여백에 맞추며, 시계·월드·방향지시등은 전체 화면 중앙축을 사용합니다. 로드카메라 뷰 `2`에서는 내비 유무에 따른 자동 주행 리포트와 `ClusterHudPanelLayout`까지 `0`과 완전히 동일하게 동작합니다.
+- `0`은 기본 화면입니다. 내비가 수신되면 내비 패널을, 수신되지 않으면 주행 리포트를 자동으로 표시합니다.
+- `1`은 라이브 지연·토크·조향·횡방향 계획을 묶은 일반 디버그 패널입니다.
+- `2`는 기준 시스템 화면입니다. 현재 `0`의 자동 주행 리포트 전환은 사용하지 않고, 내비 상태가 있으면 내비 또는 `NAVI DISCONNECTED` 패널을 유지하며 내비 소스가 없을 때만 경로 오버레이로 폴백합니다.
+- `3`은 주행 장면을 끄고 `ShowPlotMode` 그래프를 크게 표시합니다.
+- `4`는 주행 장면을 유지한 채 정보 패널에 같은 그래프를 표시합니다. 가속·조향·연료·요소수 게이지는 중앙이 아니라 그래프 바로 왼쪽에 18px 간격으로 붙고, 좌우 패널을 바꿔도 그래프와 함께 이동합니다. TPMS는 주행 화면 쪽 위치를 유지합니다.
+- `5`는 주행 리포트를 항상 표시합니다.
+
+`ClusterHudScreenMode=5`는 정보 패널에 실시간 주행 리포트를 표시합니다. 기본 화면 모드(`0`)에서도 실시간 내비가 수신되지 않는 동안에는 이 리포트가 자동으로 표시되고, 수신이 시작되면 내비 패널로 돌아갑니다. 넓은 카드에는 주행 시간·거리·평균/최고 속도·자동주행 비율·최대 가감속·급가감속/급코너 횟수를 큰 글씨로 표시합니다. 작은 카드는 CPU·온도·메모리·디스크 사용량을 2×2 원형 게이지로 표시하고, 하단 타깃은 저장된 디바이스 피치(P)와 요(Y)를 정상 중심점 대비 상하·좌우 방향으로 시각화하면서 각도 숫자도 함께 표시합니다. 주행 화면 아래에는 브랜치·네트워크 주소·프레임률 상태를 계속 표시하고, 리포트와 겹치는 코어 사용량 문구만 생략합니다. 로드카메라 화면에서는 감지 차량을 내부가 투명한 라운드 사각 프레임으로 감싸고 기존 감지 색상을 테두리에 적용합니다. 그룹화되지 않은 레이더 감지점은 같은 방식의 작은 소스 색상 표식으로 표시합니다. 차량 프레임은 가벼운 단일 테두리로 그리고, 화면 경계에서 일부만 투영되거나 레이더 방위값 때문에 비정상적으로 길어지는 프레임은 표시하지 않습니다.
+
+외부 HUD는 기기의 `LanguageSetting`을 따라 주행 리포트, 주행 모드와 내비 상태 문구를 한글(`ko`) 또는 영어(`en`)로 실시간 전환합니다. 중국어를 포함한 그 밖의 언어값은 영문으로 표시합니다. `IsMetric`이 켜져 있으면 현재/설정/제한 속도, 내비, 레이더 라벨과 주행 리포트를 `km/h`, `m`, `km`로 표시하고, 꺼져 있으면 `mph`, `ft`, `mi`로 변환합니다. 가속도와 온도는 각각 `m/s²`, `°C`를 유지합니다. 두 설정은 약 1초마다 확인하므로 HUD를 다시 시작하지 않아도 적용됩니다.
+
+기본 화면과 로드카메라 화면의 TPMS는 같은 위치에 표시됩니다. 기존 압력 글자 크기는 유지하며, 네 압력값을 단순한 장난감 자동차의 큰 바퀴 안에 각각 배치합니다. 네 값이 모두 없을 때만 전체가 숨겨지고, 일부 값만 없으면 해당 바퀴에 `--`를 표시하며 31 psi 미만은 빨간색으로 표시합니다.
+
+속도 표시 옆의 주행 모드 문구는 배경과 테두리 없이 속도 숫자의 마지막 자리 위에 확대 표시합니다. 연비는 녹색, 안전은 주황색, 일반은 흰색, 고속은 빨간색입니다. 기어 배지도 내부 배경 없이 글자와 테두리만 표시합니다. 왼쪽 위의 조향/LFA·Wi-Fi·시계는 화면 가장자리 및 아이콘 사이 여백을 넓히고, 제한속도 표지는 약간 왼쪽으로 배치합니다.
 
 `ClusterHudTheme=1`(다크)은 일반 HUD의 빈 배경을 지도와 `NAVI DISCONNECTED` 상태 영역에 사용하는 것과 같은 순수 검정으로 표시합니다. 자동(`0`)도 18:00~06:00에는 같은 다크 팔레트를 사용합니다. 도로, 게이지와 일반 정보 패널은 구분과 가독성을 위해 서로 다른 어두운 음영을 유지합니다.
 
@@ -287,7 +314,7 @@ Carrot Vision에는 `carrot_settings.json` 카탈로그와 별도로 **AR 표시
 ### 차량 구성을 확인해야 하는 설정
 
 - `HyundaiCameraSCC`, `CanfdHDA2`
-- `EnableRadarTracks`, `EnableCornerRadar`, `CarrotRadarMode`
+- `EnableRadarTracks`, `EnableCornerRadar`, `CarrotRadarMode`, `CarrotRadarCutInSensitivity`
 - `SpeedFromPCM`, `DisableMinSteerSpeed`
 - `LateralTorqueCustom`, `CustomSteer*`
 - `DisableDM`

@@ -86,6 +86,9 @@ class DPathRadarD:
         params.get_int("EnableCornerRadar"),
       ),
       enable_radar_tracks=params.get_int("EnableRadarTracks"),
+      cut_in_sensitivity=params.get_int(
+        "CarrotRadarCutInSensitivity",
+      ),
       front_radar_measurement_delay_s=float(CP.radarDelay),
     )
     self.params = params
@@ -94,7 +97,8 @@ class DPathRadarD:
 
   def update(self, sm: messaging.SubMaster, rr: car.RadarData) -> None:
     self.radar_state_valid = sm.all_checks()
-    self.radar_state = log.RadarState.new_message()
+    # Reuse the builder like conventional radard. Reallocating every 20 Hz
+    # frame is measurable on device and does not change any published field.
     self.radar_state.mdMonoTime = sm.logMonoTime["modelV2"]
     self.radar_state.carStateMonoTime = sm.logMonoTime["carState"]
     self.radar_state.radarErrors = rr.errors

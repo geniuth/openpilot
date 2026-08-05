@@ -18,21 +18,28 @@ from openpilot.selfdrive.carrot.radar.tools.radar_lead_simulator import (
   Selection,
   SimulatorUI,
   candidate_track_id,
+  confirmed_cutin_overlap_at,
+  corner_radar_display_points,
   front_only_frames,
   front_radar_display_points,
   is_position_only_reference,
   lead_continuity_segments,
+  lead_one_rgb,
+  load_validation_lookahead,
   load_validation_motion_mode,
   load_validation_probability,
+  load_validation_sensitivity,
   motion_points_at_model_time,
   preferred_radar_motion_sensor,
   radar_trajectory_series,
   resolve_validation_cases,
   save_validation_motion_mode,
   save_validation_probability,
+  save_validation_sensitivity,
   trajectory_history_display_y,
   trajectory_model_review_events,
   update_validation_case_label,
+  vision_lead_continuity_segments,
 )
 from openpilot.selfdrive.carrot.radar.tools.radar_lead_validation_review import (
   group_cases_by_log,
@@ -218,6 +225,7 @@ def test_cutin_confirmation_survives_out_to_in_path_transition() -> None:
   frames = [
     frame(
       (
+        point(10, 30.0, 0.0),
         replace(
           point(
             1010,
@@ -270,16 +278,35 @@ def test_front_only_frames_preserve_non_corner_inputs_and_leads() -> None:
 def test_front_radar_display_toggle_uses_only_measured_front_points() -> None:
   current = frame((
     point(10, 30.0, 0.2),
-    point(11, -9.0, 0.2),
-    point(12, 121.0, 0.2),
-    point(13, 20.0, 0.2, measured=False),
+      point(11, -9.0, 0.2),
+      point(12, 121.0, 0.2),
+      point(14, 131.0, 0.2),
+      point(13, 20.0, 0.2, measured=False),
     point(1010, 20.0, 2.0, source="corner235"),
     point(0, 20.0, 0.0, source="scc"),
   ))
 
   assert [
     value.track_id for value in front_radar_display_points(current)
-  ] == [10, 11]
+  ] == [10, 11, 12]
+
+
+def test_corner_radar_display_includes_all_measured_points_in_range() -> None:
+  current = frame((
+    point(1001, 20.0, 0.2, source="corner235"),
+      point(1002, 85.0, 1.0, source="corner235"),
+      point(1003, 121.0, 0.2, source="corner235"),
+      point(1005, 131.0, 0.2, source="corner235"),
+    point(
+      1004, 30.0, 0.2,
+      source="corner235", measured=False,
+    ),
+    point(10, 20.0, 0.0, source="frontRadar"),
+  ))
+
+  assert [
+    value.track_id for value in corner_radar_display_points(current)
+  ] == [1001, 1002, 1003]
 
 
 def test_corner_motion_is_preferred_for_whole_log_when_available() -> None:
@@ -466,6 +493,21 @@ def test_validation_runner_uses_saved_probability_when_not_overridden(tmp_path) 
   assert "--prob" not in command
 
 
+def test_validation_runner_forwards_device_sensitivity_override(tmp_path) -> None:
+  command = simulator_command(
+    [{"id": "case-a"}],
+    tmp_path,
+    tmp_path / "cases.json",
+    None,
+    "1/1",
+    False,
+    sensitivity=4,
+  )
+
+  assert command[command.index("--sensitivity") + 1] == "4"
+  assert "--lookahead-s" not in command
+
+
 def test_predictor_event_pause_seeks_to_first_unhandled_marker() -> None:
   ui = object.__new__(SimulatorUI)
   ui.times = (0.0, 0.1, 0.2, 0.3)
@@ -513,11 +555,11 @@ def test_birds_eye_radar_positive_left_is_drawn_left_of_ego() -> None:
   assert left_x < center_x < right_x
 
 
-def test_birds_eye_distance_axis_covers_minus_30_to_120m() -> None:
+def test_birds_eye_distance_axis_covers_minus_30_to_130m() -> None:
   ui = object.__new__(SimulatorUI)
   rect = SimpleNamespace(x=0.0, y=0.0, width=200.0, height=200.0)
 
-  _, top_y = ui._screen(rect, 120.0, 0.0)
+  _, top_y = ui._screen(rect, 130.0, 0.0)
   _, ego_y = ui._screen(rect, 0.0, 0.0)
   _, bottom_y = ui._screen(rect, -30.0, 0.0)
 
@@ -543,6 +585,65 @@ def test_lead_continuity_breaks_on_missing_frames_and_track_id_changes() -> None
     [10],
     [11],
   ]
+
+
+def test_vision_only_lead_one_uses_blue_instead_of_radar_orange() -> None:
+  assert lead_one_rgb(-1) == (72, 145, 255)
+  assert lead_one_rgb(56) == (246, 142, 55)
+  assert lead_one_rgb(None) == (246, 142, 55)
+
+
+def test_lead_continuity_splits_vision_and_radar_color_segments() -> None:
+  frames = [frame((), time_s=index * 0.1) for index in range(2)]
+  selections = (
+    Selection(
+      Candidate(
+        -1, 1.0, "vision L1",
+        d_rel=30.0, y_rel=0.1, v_lead=0.0,
+      ),
+      None,
+    ),
+    Selection(
+      Candidate(
+        41, 1.0, "radar L1",
+        d_rel=29.5, y_rel=0.2, v_lead=0.1,
+      ),
+      None,
+    ),
+  )
+
+  segments = lead_continuity_segments(frames, selections, "lead_one")
+
+  assert [[point[2] for point in segment] for segment in segments] == [
+    [-1],
+    [41],
+  ]
+
+
+def test_vision_lead_graph_uses_point_four_probability_threshold() -> None:
+  probabilities = (0.40, 0.39, 0.80)
+  frames = [
+    replace(
+      frame((), time_s=index * 0.1),
+      model_leads=(ModelLead(
+        probability,
+        31.52 + index,
+        0.0,
+        20.0,
+        0.0,
+        1.0,
+        0.5,
+        1.0,
+      ),),
+    )
+    for index, probability in enumerate(probabilities)
+  ]
+
+  segments = vision_lead_continuity_segments(frames)
+
+  assert len(segments) == 2
+  assert segments[0][0] == pytest.approx((0.0, 30.0, 0.40))
+  assert segments[1][0] == pytest.approx((0.2, 32.0, 0.80))
 
 
 def test_lead_continuity_joins_physical_stationary_track_handoff() -> None:
@@ -586,13 +687,19 @@ def test_lead_graph_and_seek_bar_share_one_time_axis() -> None:
     ),
   )
 
-  timeline, panel, _, _, continuity = ui._layout_rects(1440, 1080)
+  timeline, panel, video, radar_map, continuity = ui._layout_rects(1440, 1080)
   continuity_axis = ui._continuity_time_axis_rect(continuity)
 
   assert timeline.x == pytest.approx(continuity_axis.x)
   assert timeline.width == pytest.approx(continuity_axis.width)
   assert timeline.width == pytest.approx(1360.0)
   assert continuity.width == pytest.approx(1416.0)
+  assert continuity.height == pytest.approx(290.0)
+  assert continuity.y == pytest.approx(701.0)
+  assert video.height == pytest.approx(340.5)
+  assert radar_map.height == pytest.approx(332.5)
+  assert radar_map.height > continuity.height
+  assert panel.y + panel.height == pytest.approx(693.0)
   assert panel.y + panel.height < continuity.y
 
 
@@ -640,7 +747,32 @@ def test_validation_probability_is_saved_outside_the_repository(tmp_path) -> Non
   }
 
 
-def test_validation_probability_applies_immediately_from_cached_history(
+def test_validation_sensitivity_is_saved_outside_repository(
+  tmp_path,
+) -> None:
+  settings = tmp_path / "radar_validation.json"
+
+  assert load_validation_sensitivity(settings) == 3
+  settings.write_text(json.dumps({
+    "corner_lookahead_s": 4.5,
+    "front_lookahead_s": 3.5,
+  }), encoding="utf-8")
+
+  save_validation_sensitivity(4, settings)
+
+  assert load_validation_sensitivity(settings) == 4
+  assert load_validation_lookahead(
+    settings, sensor="corner",
+  ) == pytest.approx(5.0)
+  assert load_validation_lookahead(
+    settings, sensor="front",
+  ) == pytest.approx(5.0)
+  assert json.loads(settings.read_text(encoding="utf-8")) == {
+    "cut_in_sensitivity": 4,
+  }
+
+
+def test_validation_corner_sensitivity_applies_from_cached_physical_history(
   tmp_path,
 ) -> None:
   frames = [
@@ -650,22 +782,48 @@ def test_validation_probability_applies_immediately_from_cached_history(
     )
     for index in range(5)
   ]
-  selector = RadarMotionShadowSelector(frames, decision_threshold=0.50)
+  selector = RadarMotionShadowSelector(
+    frames,
+    cut_in_sensitivity=3,
+    motion_sensor="corner",
+  )
   ui = SimulatorUI(
     frames,
     selector,
     "test",
     tmp_path / "rlog.zst",
-    display_threshold=0.50,
+    cut_in_sensitivity=3,
     settings_path=tmp_path / "radar_validation.json",
   )
-  ui._request_probability(0.42)
+  lead_one_outputs = selector.lead_one_outputs
+  trajectories = selector.trajectories
+  ui._request_sensitivity(4)
 
-  assert ui.selector.decision_threshold == pytest.approx(0.42)
-  assert ui.status.startswith("경로 근접 감도 0.42 적용 완료")
+  assert ui.selector.cut_in_sensitivity == 4
+  assert ui.selector.maximum_lookahead_s == pytest.approx(5.0)
+  assert ui.selector.lead_one_outputs is lead_one_outputs
+  assert ui.selector.trajectories is not trajectories
+  assert ui.selector.motion_sensitivity.confirmation_s == pytest.approx(0.25)
+  assert ui.status.startswith("CUT-IN 감도 4 민감")
+  assert load_validation_sensitivity(
+    tmp_path / "radar_validation.json",
+  ) == 4
 
 
-def test_validation_mode_toggle_uses_and_saves_front_probability(
+def test_confirmed_cutin_colors_complete_continuous_overlap() -> None:
+  prediction = SimpleNamespace(
+    current_path_occupancy=False,
+    predicted_path_overlap_start_s=1.5,
+    predicted_path_overlap_s=3.5,
+  )
+
+  assert not confirmed_cutin_overlap_at(prediction, 1.0)
+  assert confirmed_cutin_overlap_at(prediction, 1.5)
+  assert confirmed_cutin_overlap_at(prediction, 4.0)
+  assert confirmed_cutin_overlap_at(prediction, 5.0)
+
+
+def test_validation_mode_toggle_uses_same_sensitivity_and_fixed_horizon(
   tmp_path,
 ) -> None:
   frames = [
@@ -678,23 +836,25 @@ def test_validation_mode_toggle_uses_and_saves_front_probability(
   settings = tmp_path / "radar_validation.json"
   selector = RadarMotionShadowSelector(
     frames,
-    decision_threshold=0.30,
+    cut_in_sensitivity=3,
+    motion_sensor="corner",
   )
   ui = SimulatorUI(
     frames,
     selector,
     "test",
     tmp_path / "rlog.zst",
-    display_threshold=0.30,
+    cut_in_sensitivity=3,
     settings_path=settings,
-    sensor_probabilities={"corner": 0.30, "front": 0.67},
   )
 
   ui._request_motion_mode("front")
 
   assert ui.motion_mode == "front"
   assert ui.selector.motion_sensor == "front"
+  assert ui.selector.cut_in_sensitivity == 3
   assert ui.selector.decision_threshold == pytest.approx(0.67)
+  assert ui.selector.maximum_lookahead_s == pytest.approx(5.0)
   assert load_validation_motion_mode(settings) == "front"
 
 
