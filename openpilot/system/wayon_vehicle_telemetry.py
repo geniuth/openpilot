@@ -232,7 +232,7 @@ class TripRecorder:
 
   def __init__(self):
     self.active = False
-    self.started_at = None
+    self.started_mono = None
     self.route: list = []
     self.distance_m = 0.0
     self.last_point = None
@@ -242,7 +242,11 @@ class TripRecorder:
   def start(self):
     import uuid
     self.active = True
-    self.started_at = utc_now()
+    # 시작 시각을 벽시계로 찍지 않는다. 차가 깨어나 onroad 가 되는 시점엔 아직
+    # 시간 동기화 전이라 RTC 가 몇 달 전을 가리킬 수 있다(실측: 2026-03-24 로 시작된
+    # 134일짜리 트립). 대신 monotonic 으로 경과시간만 재고, 종료 시점의 (그때는
+    # 동기화가 끝난) 시계에서 빼서 시작 시각을 역산한다.
+    self.started_mono = time.monotonic()
     self.route = []
     self.distance_m = 0.0
     self.last_point = None
@@ -274,19 +278,23 @@ class TripRecorder:
       print(f"Wayon telemetry: trip discarded ({self.distance_m:.0f}m)", flush=True)
       return False
 
-    ended_at = utc_now()
-    from datetime import datetime
-    try:
-      t0 = datetime.strptime(self.started_at, "%Y-%m-%dT%H:%M:%SZ")
-      t1 = datetime.strptime(ended_at, "%Y-%m-%dT%H:%M:%SZ")
-      duration_s = max(0, int((t1 - t0).total_seconds()))
-    except Exception:
-      duration_s = 0
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    if now.year < 2025:
+      # 시계가 아직 안 맞았다. 지금 올리면 started_at/ended_at 둘 다 엉뚱한 값이 되고,
+      # 앱의 '리셋 후 주행거리'가 이 트립을 잘못 포함/제외한다. 버리는 편이 낫다.
+      print("Wayon telemetry: trip discarded (clock not synced)", flush=True)
+      return False
+
+    duration_s = max(0, int(time.monotonic() - (self.started_mono or time.monotonic())))
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    ended_at = now.strftime(fmt)
+    started_at = (now - timedelta(seconds=duration_s)).strftime(fmt)
 
     payload = {
       "id": self.trip_id,
       "deviceId": device_id,
-      "startedAt": self.started_at,
+      "startedAt": started_at,
       "endedAt": ended_at,
       "durationS": duration_s,
       "distanceM": round(self.distance_m, 1),
