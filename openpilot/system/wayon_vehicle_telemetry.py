@@ -34,6 +34,16 @@ BATTERY_DELTA_TRIGGER_WH = 300.0
 USABLE_BATTERY_WH = 64000.0
 # 충전으로 판정할 최소 증가율[W]
 CHARGING_MIN_W = 300.0
+# 오도미터(KBI_Kilometerstand)는 DBC상 20비트 [0|1048573] 이다. 1048574(2^20-2)는
+# 규격상 Init/오류 표시값인데, 원격 공조 등으로 차가 깨어날 때 계기판 ECU가 아직
+# 값을 안 실어서 이게 그대로 올라오곤 했다. 유효범위 밖이면 버린다.
+ODO_MAX_VALID_KM = 1048573.0
+# 이전 값 대비 이만큼 이상 튀면 계기판이 준 값이라도 믿지 않는다.
+ODO_MAX_JUMP_KM = 1000.0
+# 충전 요금[원/kWh] — 11kW 이하 완속, 초과 급속
+CHARGE_SLOW_MAX_W = 11000.0
+CHARGE_PRICE_SLOW = 280.0
+CHARGE_PRICE_FAST = 320.0
 
 # can 구독 소켓 (재사용)
 _CAN_SOCK = None
@@ -82,6 +92,52 @@ def build_vehicle_block(battery_wh: float | None, charge_power_w: float | None,
   else:
     vehicle["charging"] = False
   return vehicle
+
+
+CHARGE_LEDGER_PATH = Path(os.getenv("WAYON_CHARGE_LEDGER", "/data/wayon_cloud/charge_ledger.json"))
+
+
+def load_charge_ledger() -> dict:
+  try:
+    data = json.loads(CHARGE_LEDGER_PATH.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and isinstance(data.get("months"), dict):
+      return data
+  except (OSError, ValueError):
+    pass
+  return {"months": {}}
+
+
+def save_charge_ledger(ledger: dict) -> None:
+  CHARGE_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+  tmp = CHARGE_LEDGER_PATH.with_suffix(".tmp")
+  tmp.write_text(json.dumps(ledger, separators=(",", ":")), encoding="utf-8")
+  os.replace(tmp, CHARGE_LEDGER_PATH)
+
+
+def add_charge_energy(ledger: dict, delta_wh: float, power_w: float) -> None:
+  """늘어난 에너지를 그 시점의 충전 전력에 따라 완속/급속으로 나눠 이번 달에 더한다.
+
+  11kW 이하를 완속으로 본다. 한 세션 안에서 전력이 오르내리면 구간별로 갈리는데,
+  실제 요금도 그렇게 매겨지므로 이 편이 실제에 가깝다.
+  """
+  if delta_wh <= 0:
+    return
+  from datetime import datetime, timezone
+  # 월 구분은 한국 시간 기준(KST=UTC+9). 월말 자정 근처 충전이 엉뚱한 달로 가지 않게.
+  now = datetime.now(timezone.utc).timestamp() + 9 * 3600
+  month = datetime.utcfromtimestamp(now).strftime("%Y-%m")
+
+  kind = "slow" if power_w <= CHARGE_SLOW_MAX_W else "fast"
+  price = CHARGE_PRICE_SLOW if kind == "slow" else CHARGE_PRICE_FAST
+  kwh = delta_wh / 1000.0
+
+  entry = ledger["months"].setdefault(month, {"slow_kwh": 0.0, "fast_kwh": 0.0, "cost_krw": 0.0})
+  entry[f"{kind}_kwh"] = round(entry.get(f"{kind}_kwh", 0.0) + kwh, 3)
+  entry["cost_krw"] = round(entry.get("cost_krw", 0.0) + kwh * price, 0)
+
+  # 최근 13개월만 남긴다 (페이로드가 무한정 커지지 않게)
+  for old_month in sorted(ledger["months"])[:-13]:
+    ledger["months"].pop(old_month, None)
 
 
 def merge_last_known(vehicle: dict, last_known: dict) -> dict:
@@ -161,7 +217,7 @@ def sample_vehicle_can(timeout_s: float = 6.0) -> dict:
           result["battery_wh"] = float(v_wh)
       if cp.vl_all["Diagnose_01"].get("KBI_Kilometerstand"):
         odo = cp.vl["Diagnose_01"]["KBI_Kilometerstand"]
-        if odo > 0:
+        if 0 < odo <= ODO_MAX_VALID_KM:
           result["odometer_km"] = float(odo)
       if cp.vl_all["Klima_Sensor_02"].get("BCM1_Aussen_Temp_ungef"):
         result["outside_temp_c"] = float(cp.vl["Klima_Sensor_02"]["BCM1_Aussen_Temp_ungef"])
@@ -348,6 +404,8 @@ def main() -> None:
   sm = messaging.SubMaster(["carState", "gpsLocation", "gpsLocationExternal", "peripheralState"])
 
   last = load_last_state()
+  charge_ledger = load_charge_ledger()
+  charge_ledger_last_wh: float | None = None
   last_battery_wh = last.get("battery_wh")
   last_battery_at = None  # monotonic, 이번 실행에서만 사용
   last_upload_at = None   # None = 아직 한 번도 안 올림 -> 즉시 업로드
@@ -435,7 +493,26 @@ def main() -> None:
       if last_battery_at is None or abs(battery_wh - (last_battery_wh or 0)) >= BATTERY_DELTA_TRIGGER_WH:
         last_battery_wh, last_battery_at = battery_wh, now
 
+    # 오도미터 급변 방어: 계기판이 깨어나는 중이면 엉뚱한 값이 한 번씩 섞인다.
+    # 이전에 알던 값과 1000km 이상 벌어지면 이번 값은 버리고 기존 값을 유지한다.
+    sampled_odo = sampled.get("odometer_km")
+    if sampled_odo is not None:
+      known_odo = last.get("odometer_km")
+      if known_odo is not None and abs(sampled_odo - float(known_odo)) >= ODO_MAX_JUMP_KM:
+        print(f"Wayon telemetry: odometer {sampled_odo:.0f} rejected "
+              f"(last {float(known_odo):.0f})", flush=True)
+        sampled.pop("odometer_km")
+
+    # 충전량 누적: 배터리 에너지가 늘어난 만큼을 그 시점의 충전 전력으로
+    # 완속/급속을 나눠 월별로 쌓는다.
+    if battery_wh is not None and charge_power_w is not None and charge_power_w >= CHARGING_MIN_W:
+      if charge_ledger_last_wh is not None and battery_wh > charge_ledger_last_wh:
+        add_charge_energy(charge_ledger, battery_wh - charge_ledger_last_wh, charge_power_w)
+        save_charge_ledger(charge_ledger)
+    charge_ledger_last_wh = battery_wh
+
     vehicle = build_vehicle_block(battery_wh, charge_power_w, sampled.get("capacity_wh"))
+    vehicle["charge_months"] = charge_ledger.get("months", {})
     for key in ("odometer_km", "outside_temp_c", "hv_voltage", "measured_capacity_wh",
                 "ac_on", "blower_volt", "blower_level", "seat_heat_left", "seat_heat_right", "recirc"):
       if sampled.get(key) is not None:
