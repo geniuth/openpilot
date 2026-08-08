@@ -114,20 +114,25 @@ def save_charge_ledger(ledger: dict) -> None:
   os.replace(tmp, CHARGE_LEDGER_PATH)
 
 
-def add_charge_energy(ledger: dict, delta_wh: float, power_w: float) -> None:
-  """늘어난 에너지를 그 시점의 충전 전력에 따라 완속/급속으로 나눠 이번 달에 더한다.
+def add_charge_energy(ledger: dict, delta_wh: float, hours: float) -> None:
+  """늘어난 에너지를 구간 평균 전력으로 완속/급속을 나눠 이번 달에 더한다.
 
-  11kW 이하를 완속으로 본다. 한 세션 안에서 전력이 오르내리면 구간별로 갈리는데,
-  실제 요금도 그렇게 매겨지므로 이 편이 실제에 가깝다.
+  전력은 '지금 값'이 아니라 (증가분 / 경과시간)으로 구한다. 기기가 자다 깨면
+  몇 시간치가 한 번에 들어오는데, 그때 순간 전력을 쓰면 판정이 엉뚱해진다.
   """
-  if delta_wh <= 0:
+  if delta_wh <= 0 or hours <= 0:
     return
+  avg_power_w = delta_wh / hours
+  # 상식 밖이면 계측 오류로 본다 (MEB 최대 급속이 ~175kW)
+  if avg_power_w > 250000:
+    return
+
   from datetime import datetime, timezone
   # 월 구분은 한국 시간 기준(KST=UTC+9). 월말 자정 근처 충전이 엉뚱한 달로 가지 않게.
   now = datetime.now(timezone.utc).timestamp() + 9 * 3600
   month = datetime.utcfromtimestamp(now).strftime("%Y-%m")
 
-  kind = "slow" if power_w <= CHARGE_SLOW_MAX_W else "fast"
+  kind = "slow" if avg_power_w <= CHARGE_SLOW_MAX_W else "fast"
   price = CHARGE_PRICE_SLOW if kind == "slow" else CHARGE_PRICE_FAST
   kwh = delta_wh / 1000.0
 
@@ -405,7 +410,6 @@ def main() -> None:
 
   last = load_last_state()
   charge_ledger = load_charge_ledger()
-  charge_ledger_last_wh: float | None = None
   last_battery_wh = last.get("battery_wh")
   last_battery_at = None  # monotonic, 이번 실행에서만 사용
   last_upload_at = None   # None = 아직 한 번도 안 올림 -> 즉시 업로드
@@ -503,13 +507,20 @@ def main() -> None:
               f"(last {float(known_odo):.0f})", flush=True)
         sampled.pop("odometer_km")
 
-    # 충전량 누적: 배터리 에너지가 늘어난 만큼을 그 시점의 충전 전력으로
-    # 완속/급속을 나눠 월별로 쌓는다.
-    if battery_wh is not None and charge_power_w is not None and charge_power_w >= CHARGING_MIN_W:
-      if charge_ledger_last_wh is not None and battery_wh > charge_ledger_last_wh:
-        add_charge_energy(charge_ledger, battery_wh - charge_ledger_last_wh, charge_power_w)
-        save_charge_ledger(charge_ledger)
-    charge_ledger_last_wh = battery_wh
+    # 충전량 누적.
+    # 기준점(last_wh/last_at)은 원장 파일에 같이 저장한다. 메모리에만 두면 기기가
+    # 자거나 매니저가 재시작될 때마다 날아가서, 그 사이에 들어간 전력을 통째로
+    # 놓친다(실측: 배터리는 42.1kWh 늘었는데 30.0kWh 만 집계됨).
+    # 주행 중 회생제동도 배터리를 늘리므로 주차 중(offroad)에만 센다.
+    if battery_wh is not None:
+      prev_wh = charge_ledger.get("last_wh")
+      prev_at = charge_ledger.get("last_at")
+      if not onroad and prev_wh is not None and prev_at is not None and battery_wh > prev_wh:
+        hours = max(0.0, time.time() - float(prev_at)) / 3600.0
+        add_charge_energy(charge_ledger, battery_wh - float(prev_wh), hours)
+      charge_ledger["last_wh"] = battery_wh
+      charge_ledger["last_at"] = time.time()
+      save_charge_ledger(charge_ledger)
 
     vehicle = build_vehicle_block(battery_wh, charge_power_w, sampled.get("capacity_wh"))
     vehicle["charge_months"] = charge_ledger.get("months", {})
