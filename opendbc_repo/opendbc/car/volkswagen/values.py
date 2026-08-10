@@ -92,6 +92,10 @@ class CarControllerParams:
       self.STEERING_POWER_MAX      = 50    # HCA_03 maximum steering power %
       self.STEERING_POWER_MIN      = 4     # HCA_03 minimum steering power %
       self.STEERING_POWER_STEP     = 2     # HCA_03 steering power counter steps
+      # 정차잠금 해제 요청 유지 (ACC_CONTROL_STEP=2 -> 50Hz 기준). 차가 홀드 해제에 응답해
+      # esp_hold_confirmation 이 풀리는 순간 요청을 거두면 핸드셰이크가 끊겨 EPB->P 로 간다.
+      self.HOLD_RELEASE_MAX_STEPS  = 100   # 약 2초까지 요청 유지
+      self.HOLD_RELEASE_DONE_SPEED = 0.3   # m/s, 이 속도를 넘으면 실제 출발로 보고 요청 종료
 
       self.CURVATURE_LIMITS: CurvatureSteeringLimits = CurvatureSteeringLimits(0.195)
 

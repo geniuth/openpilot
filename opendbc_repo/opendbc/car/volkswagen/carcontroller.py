@@ -47,12 +47,12 @@ class CarController(CarControllerBase):
     self.lead_limit_disp = False
     self.lead_limit_cnt = 0
 
+    self.hold_release_frames = 0  # 정차잠금 해제 요청 유지 카운터 (핸드셰이크 중단 방지)
 
   def update(self, CC, CS, now_nanos):
     actuators = CC.actuators
     hud_control = CC.hudControl
     can_sends = []
-
 
     # **** Steering Controls ************************************************ #
 
@@ -165,8 +165,32 @@ class CarController(CarControllerBase):
       if self.frame % self.CCP.ACC_CONTROL_STEP == 0:
         if self.CP.flags & VolkswagenFlags.MEB:
           stopping = actuators.longControlState == LongCtrlState.stopping
-          starting = actuators.longControlState == LongCtrlState.starting and CS.out.vEgo <= self.CP.vEgoStarting
           accel = float(np.clip(actuators.accel, self.CCP.ACCEL_MIN, self.CCP.ACCEL_MAX) if CC.enabled else 0)
+          # 앞차를 따라 스르륵 정차하면 플래너가 완전정지(stopping)를 안 잡고 "pid"에 머무는데,
+          # 이때 차가 스스로 ESP 홀드를 걸면 기존 (lcs==starting) 조건으로는 ACC_Anfahren(출발요청)이
+          # 영영 안 나가 차가 홀드에 갇힌다(앞차 출발해도 안 감). 정차 잠금 중 openpilot이 가속하려
+          # 하면(accel>0) 출발요청을 내보내 잠금을 푼다. (HKG는 accel 직접명령이라 이 핸드셰이크가 없음)
+          starting_planner = actuators.longControlState == LongCtrlState.starting and CS.out.vEgo <= self.CP.vEgoStarting
+          # 경사로 롤백 방지: 정차잠금 상태에선 accel이 0.2 m/s^2 이상 걸린 뒤에만 해제를 시작
+          # (미세 가속값에 잠금이 풀려 토크 공백 동안 뒤로 밀리는 것 방지. 정상 출발은
+          # startAccel=0.8이라 첫 프레임 통과 = 지연 없음)
+          begin_release = (actuators.longControlState == LongCtrlState.pid
+                           and CS.esp_hold_confirmation and accel >= 0.2)
+
+          # 요청은 차가 실제로 움직일 때까지 유지한다.
+          # 이전 구현은 조건에 esp_hold_confirmation 이 들어 있어, 차가 해제에 응답해 홀드가
+          # 풀리는 순간 요청이 스스로 취소됐다. 차 입장에선 핸드셰이크 도중 요청이 사라진 것이라
+          # EPB 로 폴백하고 그대로 P 까지 갔다 (실측 rlog: 홀드해제 0.06초 뒤 parkingBrake=True,
+          # 0.8초 뒤 gear=park).
+          if begin_release:
+            self.hold_release_frames = self.CCP.HOLD_RELEASE_MAX_STEPS
+          elif self.hold_release_frames > 0:
+            self.hold_release_frames -= 1
+          # 종료 조건: 가속의지 소멸 / 정지요청 / 롱컨 비활성 / 실제로 출발함
+          if not CC.enabled or stopping or accel <= 0.0 or CS.out.vEgo > self.CCP.HOLD_RELEASE_DONE_SPEED:
+            self.hold_release_frames = 0
+
+          starting = starting_planner or self.hold_release_frames > 0
 
           # override / disable ramp handling to avoid EPB error at low speed (infiniteCable2)
           long_override = CC.cruiseControl.override or CS.out.gasPressed
