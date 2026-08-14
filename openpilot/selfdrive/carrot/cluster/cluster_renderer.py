@@ -33,7 +33,6 @@ from cluster_config import (
     AMBER,
     BLUE,
     BLUE_SOFT,
-    CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA,
     CLUSTER_PANEL_LAYOUT_DRIVING_LEFT,
     CLUSTER_PANEL_LAYOUT_DRIVING_RIGHT,
     CLUSTER_RADAR_INFO_ALL_SPEED,
@@ -62,6 +61,9 @@ from cluster_config import (
     TEXT,
     VEHICLE_LENGTH_M,
     WHITE,
+    cluster_camera_view_is_road_camera,
+    cluster_camera_view_prefers_wide,
+    cluster_wide_camera_zoom_factor,
     current_cluster_theme,
     normalize_cluster_screen_mode,
     normalize_cluster_panel_layout,
@@ -136,12 +138,12 @@ CAMERA_BACKGROUND_VIGNETTE_ALPHA = 32
 CLUSTER_ALERT_SIZE_SMALL = 1
 CLUSTER_ALERT_SIZE_MID = 2
 CLUSTER_ALERT_SIZE_FULL = 3
-CLUSTER_ALERT_STATUS_COLORS = {
-    0: (21, 21, 21, 240),
-    1: (218, 111, 37, 244),
-    2: (201, 34, 49, 246),
+CLUSTER_ALERT_TEXT_COLORS = {
+    0: (255, 255, 255, 255),
+    1: (255, 174, 82, 255),
+    2: (255, 82, 96, 255),
 }
-CLUSTER_ALERT_OUTLINE = (255, 255, 255, 150)
+CLUSTER_ALERT_TEXT_STROKE = (0, 0, 0, 255)
 CLUSTER_SYNTHETIC_ALERT_TEXT_KEYS = {
     "clusterSelfdriveStartup": ("openpilot_unavailable", "waiting_to_start"),
     "clusterSelfdriveTimeout": ("take_control_immediately", "system_unresponsive"),
@@ -379,11 +381,10 @@ DEBUG_PLOT_FULL_X = 500.0
 DEBUG_PLOT_FULL_Y = DEBUG_PLOT_MARGIN
 DEBUG_PLOT_FULL_W = 1392.0
 DEBUG_PLOT_FULL_H = DESIGN_HEIGHT - DEBUG_PLOT_MARGIN * 2.0
-DEBUG_PLOT_RIGHT_X = SYSTEM_PANEL_X
-DEBUG_PLOT_RIGHT_Y = DEBUG_PLOT_MARGIN
-DEBUG_PLOT_RIGHT_W = SYSTEM_PANEL_W
-DEBUG_PLOT_RIGHT_H = DESIGN_HEIGHT - DEBUG_PLOT_MARGIN * 2.0
-DEBUG_PLOT_SIDE_GAUGE_GAP = DEBUG_PLOT_MARGIN
+DEBUG_PLOT_RIGHT_X = NAVI_LIVE_PANEL_X
+DEBUG_PLOT_RIGHT_Y = NAVI_LIVE_PANEL_Y
+DEBUG_PLOT_RIGHT_W = NAVI_LIVE_PANEL_W
+DEBUG_PLOT_RIGHT_H = NAVI_LIVE_PANEL_H
 GIT_STATUS_MARGIN = 2
 GIT_STATUS_BOTTOM_MARGIN = 12
 GIT_STATUS_DOT_RADIUS = 7
@@ -629,6 +630,7 @@ class CameraOverlayProjection:
     video_ty: float
     view_from_road: tuple[tuple[float, float, float], ...]
     camera_height_m: float
+    wide_camera: bool = False
 
 
 @lru_cache(maxsize=256)
@@ -935,6 +937,7 @@ class ClusterUiRenderer:
         self._route_video_frame_id: str | None = None
         self._live_road_camera = None
         self._live_road_camera_failed = False
+        self._camera_overlay_wide = False
         self._left_turn_signal_started_at: float | None = None
         self._right_turn_signal_started_at: float | None = None
         self._hazard_signal_started_at: float | None = None
@@ -1028,21 +1031,7 @@ class ClusterUiRenderer:
     def _side_gauge_offset_design_x(self, screen_mode: int) -> float:
         if screen_mode == CLUSTER_SCREEN_MODE_FULLSCREEN_3D:
             return FULLSCREEN_3D_SIDE_WIDGET_OFFSET_X
-        if screen_mode != CLUSTER_SCREEN_MODE_DEBUG_GRAPH_RIGHT:
-            return 0.0
-
-        plot_x = self._information_panel_x(DEBUG_PLOT_RIGHT_X)
-        desired_left_center_x = (
-            plot_x
-            - DEBUG_PLOT_SIDE_GAUGE_GAP
-            - SIDE_GAUGE_WIDTH * 0.5
-            - SIDE_GAUGE_COLUMN_GAP
-        )
-        return (
-            desired_left_center_x
-            - self._driving_hud_offset_design_x(screen_mode)
-            - SIDE_GAUGE_LEFT_CENTER_X
-        )
+        return 0.0
 
     @staticmethod
     def _center_clock_x(screen_mode: int) -> float:
@@ -1339,7 +1328,7 @@ class ClusterUiRenderer:
                 corner_lateral_offset_m,
                 paused,
                 self.route_camera_tuning_visible
-                and state.camera_view_mode == CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA,
+                and cluster_camera_view_is_road_camera(state.camera_view_mode),
             )
             self._profile_add("render_route_frame.controls", profile_stage)
         finally:
@@ -1463,7 +1452,7 @@ class ClusterUiRenderer:
     def _render_world(self, state: ClusterUiState, signal_lights: tuple[bool, bool] | None = None) -> None:
         if signal_lights is None:
             signal_lights = self._turn_signal_lights(state)
-        if state.camera_view_mode != CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA or not state.onroad:
+        if not cluster_camera_view_is_road_camera(state.camera_view_mode) or not state.onroad:
             self._close_live_road_camera()
         theme = self._current_theme()
         profile_stage = self._profile_start()
@@ -1472,7 +1461,8 @@ class ClusterUiRenderer:
         profile_stage = self._profile_start()
         rl.clear_background(rl_color(theme.bg))
         self._profile_add("render_world.clear_background", profile_stage)
-        if state.camera_view_mode == CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA:
+        if cluster_camera_view_is_road_camera(state.camera_view_mode):
+            self._camera_overlay_wide = self._select_camera_overlay_stream(state)
             projection = self._camera_overlay_projection(state)
             profile_stage = self._profile_start()
             self._draw_camera_background(state, projection)
@@ -1481,6 +1471,7 @@ class ClusterUiRenderer:
             self._draw_camera_projected_overlay(scene, state, projection)
             self._profile_add("render_world.camera_projected_overlay", profile_stage)
         else:
+            self._camera_overlay_wide = False
             profile_stage = self._profile_start()
             self._draw_scene(scene, state)
             self._profile_add("render_world.draw_scene", profile_stage)
@@ -1509,7 +1500,7 @@ class ClusterUiRenderer:
         state: ClusterUiState,
         projection: CameraOverlayProjection | None = None,
     ) -> None:
-        if state.camera_view_mode != CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA:
+        if not cluster_camera_view_is_road_camera(state.camera_view_mode):
             return
         overlay = state.route_overlay
         if projection is None:
@@ -1551,9 +1542,10 @@ class ClusterUiRenderer:
             rl.end_scissor_mode()
 
     def _live_road_camera_view(self):
-        if self._live_road_camera is not None:
-            return self._live_road_camera
-        if self._live_road_camera_failed or os.name != "posix":
+        live_camera = getattr(self, "_live_road_camera", None)
+        if live_camera is not None:
+            return live_camera
+        if getattr(self, "_live_road_camera_failed", False) or os.name != "posix":
             return None
         try:
             from cluster_live_camera import LiveRoadCamera
@@ -1564,9 +1556,29 @@ class ClusterUiRenderer:
             self._live_road_camera_failed = True
         return self._live_road_camera
 
+    def _select_camera_overlay_stream(self, state: ClusterUiState) -> bool:
+        overlay = getattr(state, "route_overlay", None)
+        if overlay is not None and overlay.video_rgba is not None:
+            return overlay.camera_stream == "wide"
+        live_camera = self._live_road_camera_view() if state.onroad else None
+        if live_camera is None:
+            return False
+        prefer_wide = cluster_camera_view_prefers_wide(
+            state.camera_view_mode,
+            state.speed_kph,
+            live_camera.is_wide,
+        )
+        try:
+            return bool(live_camera.select_stream(prefer_wide))
+        except Exception as exc:
+            print(f"Cluster live camera stream selection failed: {exc}", flush=True)
+            self._close_live_road_camera()
+            return False
+
     def _close_live_road_camera(self) -> None:
-        if self._live_road_camera is not None:
-            self._live_road_camera.close()
+        live_camera = getattr(self, "_live_road_camera", None)
+        if live_camera is not None:
+            live_camera.close()
             self._live_road_camera = None
 
     def _camera_overlay_content_rect(self) -> rl.Rectangle:
@@ -1580,18 +1592,21 @@ class ClusterUiRenderer:
         )
 
     @staticmethod
-    def _camera_overlay_camera(state: ClusterUiState):
+    def _camera_overlay_camera(state: ClusterUiState, wide_camera: bool = False):
         device_type = (state.camera_device_type or "").strip().lower()
         sensor = (state.camera_sensor or "").strip().lower()
         for key in ((device_type, sensor), ("unknown", sensor), (device_type, "unknown")):
             device_camera = DEVICE_CAMERAS.get(key)
             if device_camera is not None:
-                return device_camera.fcam
+                camera = device_camera.ecam if wide_camera else device_camera.fcam
+                return camera if camera.width > 0 and camera.height > 0 else device_camera.fcam
         if sensor:
             for (_, known_sensor), device_camera in DEVICE_CAMERAS.items():
                 if known_sensor == sensor:
-                    return device_camera.fcam
-        return CAMERA_OVERLAY_DEFAULT_CAMERA
+                    camera = device_camera.ecam if wide_camera else device_camera.fcam
+                    return camera if camera.width > 0 and camera.height > 0 else device_camera.fcam
+        default_device_camera = DEVICE_CAMERAS["tici", "ar0231"]
+        return default_device_camera.ecam if wide_camera else CAMERA_OVERLAY_DEFAULT_CAMERA
 
     def _camera_overlay_projection(self, state: ClusterUiState) -> CameraOverlayProjection | None:
         overlay = state.route_overlay
@@ -1602,8 +1617,13 @@ class ClusterUiRenderer:
         pitch += math.radians(self.camera_overlay_pitch_offset_deg)
 
         device_from_road = rot_from_euler([roll, pitch, yaw]).dot(np.diag([1.0, -1.0, -1.0]))
-        view_from_road = view_frame_from_device_frame.dot(device_from_road)
-        camera = self._camera_overlay_camera(state)
+        wide_camera = bool(getattr(self, "_camera_overlay_wide", False))
+        if wide_camera and state.wide_camera_from_device_euler is not None:
+            wide_from_device = rot_from_euler(state.wide_camera_from_device_euler)
+            view_from_road = view_frame_from_device_frame.dot(wide_from_device).dot(device_from_road)
+        else:
+            view_from_road = view_frame_from_device_frame.dot(device_from_road)
+        camera = self._camera_overlay_camera(state, wide_camera)
         source_width = (
             float(overlay.video_width)
             if overlay is not None and overlay.video_width > 0
@@ -1618,6 +1638,8 @@ class ClusterUiRenderer:
         calib_transform = intrinsic @ view_from_road
         kep = calib_transform @ np.array([1000.0, 0.0, 0.0])
         zoom = max(dest.width / float(camera.width), dest.height / float(camera.height))
+        if wide_camera:
+            zoom *= cluster_wide_camera_zoom_factor(state.speed_kph)
         cx = float(intrinsic[0, 2])
         cy = float(intrinsic[1, 2])
         max_x_offset = max(0.0, cx * zoom - dest.width * 0.5)
@@ -1654,6 +1676,7 @@ class ClusterUiRenderer:
             video_ty=video_ty,
             view_from_road=tuple(tuple(float(value) for value in row) for row in view_from_road),
             camera_height_m=camera_height_m,
+            wide_camera=wide_camera,
         )
 
     def _camera_overlay_screen_xy(
@@ -2943,12 +2966,17 @@ class ClusterUiRenderer:
 
     def _world_view_shift_x(self, state: ClusterUiState) -> float:
         screen_mode = self._effective_screen_mode(state)
-        if screen_mode not in (CLUSTER_SCREEN_MODE_DEFAULT, CLUSTER_SCREEN_MODE_TRIP_REPORT):
+        if cluster_camera_view_is_road_camera(state.camera_view_mode):
             return 0.0
-        if state.camera_view_mode == CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA:
-            return 0.0
-        if screen_mode == CLUSTER_SCREEN_MODE_TRIP_REPORT:
+        if screen_mode in (
+            CLUSTER_SCREEN_MODE_DEBUG,
+            CLUSTER_SCREEN_MODE_DEBUG_SYSTEM,
+            CLUSTER_SCREEN_MODE_DEBUG_GRAPH_RIGHT,
+            CLUSTER_SCREEN_MODE_TRIP_REPORT,
+        ):
             return NAVI_WORLD_VIEW_SHIFT_X * self.width / DESIGN_WIDTH
+        if screen_mode != CLUSTER_SCREEN_MODE_DEFAULT:
+            return 0.0
         navi_panel_visible = bool(
             self._navi_live_panel_visible(state.navi_live)
             or self._navi_map_frame_present(state.navi_dashboard)
@@ -2969,7 +2997,7 @@ class ClusterUiRenderer:
         )
         if self._effective_screen_mode(state) == CLUSTER_SCREEN_MODE_FULLSCREEN_3D:
             return 0.0
-        if state.camera_view_mode == CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA:
+        if cluster_camera_view_is_road_camera(state.camera_view_mode):
             camera_signal_center_x = CAMERA_BACKGROUND_X + signal_center_x * CAMERA_BACKGROUND_W / DESIGN_WIDTH
             return camera_signal_center_x - signal_center_x
         view_shift_x = self._world_view_shift_design_x(state)
@@ -3699,6 +3727,12 @@ class ClusterUiRenderer:
             if screen_mode == CLUSTER_SCREEN_MODE_FULLSCREEN_3D:
                 self._draw_status_footer(state)
                 return
+            if screen_mode == CLUSTER_SCREEN_MODE_DEBUG_SYSTEM:
+                profile_stage = self._profile_start()
+                self._draw_system_dashboard_panel(state)
+                self._profile_add("hud.system_dashboard", profile_stage)
+                self._draw_status_footer(state)
+                return
             if screen_mode == CLUSTER_SCREEN_MODE_DEBUG:
                 profile_stage = self._profile_start()
                 self._draw_live_debug_panel(state)
@@ -3755,42 +3789,43 @@ class ClusterUiRenderer:
             panel_x = self._driving_panel_offset_design_x()
             panel_w = CAMERA_BACKGROUND_W
             panel_center_x = panel_x + panel_w * 0.5
-            color = CLUSTER_ALERT_STATUS_COLORS.get(alert.status, CLUSTER_ALERT_STATUS_COLORS[0])
 
             if alert.size >= CLUSTER_ALERT_SIZE_FULL:
-                rect = rl.Rectangle(panel_x, 0.0, panel_w, DESIGN_HEIGHT)
-                rl.draw_rectangle_rec(rect, rl_color(color))
                 max_text_w = panel_w - 100.0
                 title_size = 56.0
                 detail_size = 32.0
             elif alert.size == CLUSTER_ALERT_SIZE_MID:
-                alert_w = panel_w - 56.0
-                alert_h = 164.0
-                rect = rl.Rectangle(panel_center_x - alert_w * 0.5, (DESIGN_HEIGHT - alert_h) * 0.5, alert_w, alert_h)
-                self._rounded_rect(rect.x, rect.y, rect.width, rect.height, 18.0, color, CLUSTER_ALERT_OUTLINE, 2.0)
-                max_text_w = alert_w - 72.0
+                max_text_w = panel_w - 128.0
                 title_size = 48.0
                 detail_size = 28.0
             else:
-                alert_w = panel_w - 136.0
-                alert_h = 106.0
-                rect = rl.Rectangle(panel_center_x - alert_w * 0.5, (DESIGN_HEIGHT - alert_h) * 0.5, alert_w, alert_h)
-                self._rounded_rect(rect.x, rect.y, rect.width, rect.height, 16.0, color, CLUSTER_ALERT_OUTLINE, 2.0)
-                max_text_w = alert_w - 64.0
+                max_text_w = panel_w - 200.0
                 title_size = 42.0
                 detail_size = 24.0
 
             title, detail = self._cluster_alert_text(alert)
+            if not title and detail:
+                title, detail = detail, ""
             title, title_size = self._fit_alert_text(title, title_size, max_text_w, 30.0)
             detail, detail_size = self._fit_alert_text(detail, detail_size, max_text_w, 20.0)
-            center_y = rect.y + rect.height * 0.5
+            center_y = DESIGN_HEIGHT * 0.5
+            title_color = CLUSTER_ALERT_TEXT_COLORS.get(alert.status, CLUSTER_ALERT_TEXT_COLORS[0])
             if detail:
                 title_y = center_y - (22.0 if alert.size == CLUSTER_ALERT_SIZE_SMALL else 30.0)
                 detail_y = center_y + (27.0 if alert.size == CLUSTER_ALERT_SIZE_SMALL else 36.0)
-                self._draw_text(title, panel_center_x, title_y, title_size, WHITE, anchor="center")
-                self._draw_text(detail, panel_center_x, detail_y, detail_size, (255, 255, 255, 220), anchor="center")
+                self._draw_text_with_stroke(
+                    title, panel_center_x, title_y, title_size, title_color,
+                    CLUSTER_ALERT_TEXT_STROKE, 4, anchor="center", cache=True,
+                )
+                self._draw_text_with_stroke(
+                    detail, panel_center_x, detail_y, detail_size, WHITE,
+                    CLUSTER_ALERT_TEXT_STROKE, 3, anchor="center", cache=True,
+                )
             else:
-                self._draw_text(title, panel_center_x, center_y, title_size, WHITE, anchor="center")
+                self._draw_text_with_stroke(
+                    title, panel_center_x, center_y, title_size, title_color,
+                    CLUSTER_ALERT_TEXT_STROKE, 4, anchor="center", cache=True,
+                )
         finally:
             rl.rl_pop_matrix()
 
@@ -3894,13 +3929,9 @@ class ClusterUiRenderer:
         requested_screen_mode = getattr(self, "screen_mode", CLUSTER_SCREEN_MODE_DEFAULT)
         if (
             requested_screen_mode == CLUSTER_SCREEN_MODE_FULLSCREEN_3D
-            and getattr(state, "camera_view_mode", 0) == CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA
+            and cluster_camera_view_is_road_camera(getattr(state, "camera_view_mode", 0))
         ):
             requested_screen_mode = CLUSTER_SCREEN_MODE_DEFAULT
-        if requested_screen_mode == CLUSTER_SCREEN_MODE_DEBUG_SYSTEM:
-            # Screen mode 2 renders the reference commit's mode-0 default
-            # system screen without inheriting the current report fallback.
-            return CLUSTER_SCREEN_MODE_DEFAULT
         if requested_screen_mode != CLUSTER_SCREEN_MODE_DEFAULT:
             return requested_screen_mode
         gear_text = str(getattr(state, "gear_text", "") or "").strip().upper()
@@ -5751,6 +5782,40 @@ class ClusterUiRenderer:
             if loaded_image is not None and rl.is_image_valid(loaded_image):
                 rl.unload_image(loaded_image)
 
+    def _draw_system_dashboard_panel(self, state: ClusterUiState) -> None:
+        theme = self._current_theme()
+        stats = self._system_stats.sample()
+        panel_x = self._information_panel_x(NAVI_LIVE_PANEL_X)
+        panel_y = NAVI_LIVE_PANEL_Y
+        panel_w = NAVI_LIVE_PANEL_W
+        panel_h = NAVI_LIVE_PANEL_H
+        card_y = panel_y + 8.0
+        card_h = panel_h - 16.0
+        detail_x = panel_x + 16.0
+        detail_w = 474.0
+        health_x = detail_x + detail_w + 10.0
+        health_w = panel_x + panel_w - 16.0 - health_x
+
+        self._rounded_rect(panel_x, panel_y, panel_w, panel_h, 12.0, theme.panel_bg, theme.faint, 1.5)
+        self._draw_system_stats_panel(
+            state,
+            panel_x=detail_x,
+            panel_y=card_y,
+            panel_w=detail_w,
+            panel_h=card_h,
+            show_runtime_info=True,
+            title_text="DETAIL",
+            stats=stats,
+        )
+        self._draw_system_health_card(
+            state,
+            stats,
+            health_x,
+            card_y,
+            health_w,
+            card_h,
+        )
+
     def _draw_system_stats_panel(
         self,
         state: ClusterUiState,
@@ -5760,17 +5825,22 @@ class ClusterUiRenderer:
         panel_w: float = SYSTEM_PANEL_W,
         panel_h: float | None = None,
         status_text: str | None = None,
+        show_runtime_info: bool = False,
+        title_text: str = "SYSTEM",
+        stats: SystemStats | None = None,
     ) -> None:
         if panel_x is None:
             panel_x = self._information_panel_x(SYSTEM_PANEL_X)
         theme = self._current_theme()
-        stats = self._system_stats.sample()
+        if stats is None:
+            stats = self._system_stats.sample()
         disconnected = status_text is not None
+        detailed = disconnected or show_runtime_info
         cpu_count = len(stats.cpu_core_percents)
         columns = 2 if cpu_count <= 8 else 4
         rows = max(1, math.ceil(max(1, cpu_count) / columns))
         core_row_h = 30.0 if columns == 2 else 24.0
-        header_h = 216.0 if disconnected else 122.0
+        header_h = 216.0 if detailed else 122.0
         if panel_h is None:
             panel_h = min(DESIGN_HEIGHT - panel_y - 18.0, header_h + rows * core_row_h + 18.0)
         core_area_h = max(24.0, panel_h - header_h - 14.0)
@@ -5782,7 +5852,7 @@ class ClusterUiRenderer:
         text_color = WHITE if disconnected else theme.text
         muted_color = (154, 164, 172, 255) if disconnected else theme.muted
         self._rounded_rect(panel_x, panel_y, panel_w, panel_h, 18, panel_bg, panel_outline, 2)
-        self._draw_text("SYSTEM", panel_x + pad_x, panel_y + 28, 18, muted_color)
+        self._draw_text(title_text, panel_x + pad_x, panel_y + 28, 18, muted_color)
         if status_text:
             self._draw_text(
                 status_text,
@@ -5793,7 +5863,7 @@ class ClusterUiRenderer:
                 anchor="right",
             )
 
-        if disconnected:
+        if detailed:
             fps_text = "-- Hz"
             if state.actual_fps is not None and math.isfinite(state.actual_fps):
                 fps_text = f"{state.actual_fps:.1f} Hz"
@@ -5801,7 +5871,7 @@ class ClusterUiRenderer:
             if state.onroad:
                 camera_text = (
                     "ROAD CAMERA"
-                    if state.camera_view_mode == CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA
+                    if cluster_camera_view_is_road_camera(state.camera_view_mode)
                     else "ONROAD"
                 )
             info_rows = (
@@ -5816,8 +5886,8 @@ class ClusterUiRenderer:
 
         mem_percent = stats.memory_used_percent
         mem_color = self._system_metric_color(mem_percent)
-        mem_text_y = panel_y + (164.0 if disconnected else 62.0)
-        mem_bar_y = panel_y + (182.0 if disconnected else 80.0)
+        mem_text_y = panel_y + (164.0 if detailed else 62.0)
+        mem_bar_y = panel_y + (182.0 if detailed else 80.0)
         self._draw_text("MEM", panel_x + pad_x, mem_text_y, 17, muted_color)
         self._draw_text(
             self._memory_text(stats),
@@ -5836,7 +5906,7 @@ class ClusterUiRenderer:
         )
         self._draw_percent_bar(panel_x + pad_x, mem_bar_y, panel_w - pad_x * 2, 12, mem_percent, mem_color)
 
-        cpu_header_y = panel_y + (208.0 if disconnected else 104.0)
+        cpu_header_y = panel_y + (208.0 if detailed else 104.0)
         self._draw_text("CPU CORE %", panel_x + pad_x, cpu_header_y, 15, muted_color)
         if cpu_count == 0:
             self._draw_text("unavailable", panel_x + panel_w - pad_x, cpu_header_y, 15, muted_color, anchor="right")
@@ -5859,16 +5929,18 @@ class ClusterUiRenderer:
     def _draw_trip_report_panel(self, state: ClusterUiState) -> None:
         report = state.trip_report or TripReportState()
         stats = self._system_stats.sample()
+        theme = self._current_theme()
         panel_x = self._information_panel_x(TRIP_REPORT_PANEL_X)
         panel_y = TRIP_REPORT_PANEL_Y
         panel_w = TRIP_REPORT_PANEL_W
         panel_h = TRIP_REPORT_PANEL_H
-        panel_bg = (7, 12, 18, 248)
-        card_bg = (16, 23, 32, 246)
-        card_outline = (69, 83, 96, 230)
-        muted = (154, 166, 178)
+        panel_bg = theme.panel_bg
+        card_bg = theme.route_panel_bg
+        card_outline = theme.faint
+        text_color = theme.text
+        muted = theme.muted
 
-        self._rounded_rect(panel_x, panel_y, panel_w, panel_h, 12.0, panel_bg, (67, 80, 93), 1.5)
+        self._rounded_rect(panel_x, panel_y, panel_w, panel_h, 12.0, panel_bg, card_outline, 1.5)
 
         summary_x = panel_x + 16.0
         summary_y = panel_y + 8.0
@@ -5879,7 +5951,6 @@ class ClusterUiRenderer:
         system_w = panel_x + panel_w - 16.0 - system_x
         system_h = summary_h
         self._rounded_rect(summary_x, summary_y, summary_w, summary_h, 10.0, card_bg, card_outline, 1.2)
-        self._rounded_rect(system_x, system_y, system_w, system_h, 10.0, card_bg, card_outline, 1.2)
 
         self._draw_text(self._text("trip_summary"), summary_x + 18.0, summary_y + 31.0, 22.0, muted)
         self._draw_text(self._text("time"), summary_x + 18.0, summary_y + 82.0, 19.0, muted)
@@ -5907,6 +5978,8 @@ class ClusterUiRenderer:
             self._text("distance"),
             self._trip_distance_text(report.distance_m),
             metric_w,
+            text_color=text_color,
+            muted_color=muted,
         )
         self._draw_trip_metric(
             metric_right,
@@ -5915,6 +5988,8 @@ class ClusterUiRenderer:
             f"{display_speed(report.average_speed_kph, self.is_metric):.1f}",
             metric_w,
             report_speed_unit,
+            text_color=text_color,
+            muted_color=muted,
         )
         self._draw_trip_metric(
             metric_left,
@@ -5923,6 +5998,8 @@ class ClusterUiRenderer:
             f"{display_speed(report.max_speed_kph, self.is_metric):.1f}",
             metric_w,
             report_speed_unit,
+            text_color=text_color,
+            muted_color=muted,
         )
         self._draw_trip_metric(
             metric_right,
@@ -5931,6 +6008,8 @@ class ClusterUiRenderer:
             f"{report.auto_ratio_percent:.0f}",
             metric_w,
             "%",
+            text_color=text_color,
+            muted_color=muted,
         )
         self._draw_trip_metric(
             metric_left,
@@ -5939,6 +6018,8 @@ class ClusterUiRenderer:
             f"{report.max_accel_mps2:+.2f}",
             metric_w,
             "m/s²",
+            text_color=text_color,
+            muted_color=muted,
         )
         self._draw_trip_metric(
             metric_right,
@@ -5947,6 +6028,8 @@ class ClusterUiRenderer:
             f"{report.max_decel_mps2:+.2f}",
             metric_w,
             "m/s²",
+            text_color=text_color,
+            muted_color=muted,
         )
 
         event_y = summary_y + 390.0
@@ -5958,11 +6041,61 @@ class ClusterUiRenderer:
             (self._text("hard_corner"), report.hard_corner_count, BLUE_SOFT),
         )):
             event_x = summary_x + 18.0 + index * (event_w + 10.0)
-            self._rounded_rect(event_x, event_y, event_w, 47.0, 7.0, (24, 32, 42), color, 1.2)
+            self._rounded_rect(event_x, event_y, event_w, 47.0, 7.0, theme.panel_bg, color, 1.2)
             self._draw_text(label, event_x + 9.0, event_y + 23.5, event_label_size, muted)
             self._draw_text(str(count), event_x + event_w - 9.0, event_y + 23.5, 23.0, color, anchor="right")
 
-        self._draw_text(self._text("system"), system_x + 18.0, system_y + 31.0, 22.0, muted)
+        self._draw_system_health_card(
+            state,
+            stats,
+            system_x,
+            system_y,
+            system_w,
+            system_h,
+            panel_bg=card_bg,
+            panel_outline=card_outline,
+            text_color=text_color,
+            muted_color=muted,
+            target_fill=theme.panel_bg,
+        )
+
+    def _draw_system_health_card(
+        self,
+        state: ClusterUiState,
+        stats: SystemStats,
+        panel_x: float,
+        panel_y: float,
+        panel_w: float,
+        panel_h: float,
+        *,
+        panel_bg: tuple[int, ...] | None = None,
+        panel_outline: tuple[int, ...] | None = None,
+        text_color: tuple[int, ...] | None = None,
+        muted_color: tuple[int, ...] | None = None,
+        target_fill: tuple[int, ...] | None = None,
+    ) -> None:
+        theme = self._current_theme() if any(
+            value is None
+            for value in (panel_bg, panel_outline, text_color, muted_color, target_fill)
+        ) else None
+        if panel_bg is None:
+            assert theme is not None
+            panel_bg = theme.route_panel_bg
+        if panel_outline is None:
+            assert theme is not None
+            panel_outline = theme.faint
+        if text_color is None:
+            assert theme is not None
+            text_color = theme.text
+        if muted_color is None:
+            assert theme is not None
+            muted_color = theme.muted
+        if target_fill is None:
+            assert theme is not None
+            target_fill = theme.panel_bg
+
+        self._rounded_rect(panel_x, panel_y, panel_w, panel_h, 10.0, panel_bg, panel_outline, 1.2)
+        self._draw_text(self._text("system"), panel_x + 18.0, panel_y + 31.0, 22.0, muted_color)
         cpu_percent = state.cpu_usage_percent if state.cpu_usage_percent is not None else stats.cpu_used_percent
         memory_percent = (
             state.memory_used_percent
@@ -5980,19 +6113,19 @@ class ClusterUiRenderer:
                 "TEMP",
                 "--°C" if state.cpu_temp_c is None else f"{state.cpu_temp_c:.0f}°C",
                 state.cpu_temp_c,
-                self._trip_temp_color(state.cpu_temp_c),
+                self._trip_temp_color(state.cpu_temp_c, muted_color),
             ),
             ("MEM", self._percent_text(memory_percent).strip(), memory_percent, self._system_metric_color(memory_percent)),
             ("DISK", self._percent_text(disk_percent).strip(), disk_percent, self._system_metric_color(disk_percent)),
         )
         gauge_pad_x = 16.0
         gauge_gap_x = 8.0
-        gauge_w = (system_w - gauge_pad_x * 2.0 - gauge_gap_x) * 0.5
-        gauge_centers_y = (system_y + 107.0, system_y + 224.0)
+        gauge_w = (panel_w - gauge_pad_x * 2.0 - gauge_gap_x) * 0.5
+        gauge_centers_y = (panel_y + 107.0, panel_y + 224.0)
         for index, (label, value, percent, color) in enumerate(system_metrics):
             column = index % 2
             row = index // 2
-            center_x = system_x + gauge_pad_x + gauge_w * 0.5 + column * (gauge_w + gauge_gap_x)
+            center_x = panel_x + gauge_pad_x + gauge_w * 0.5 + column * (gauge_w + gauge_gap_x)
             self._draw_system_gauge(
                 center_x,
                 gauge_centers_y[row],
@@ -6000,17 +6133,17 @@ class ClusterUiRenderer:
                 value,
                 percent,
                 color,
-                muted,
-                card_outline,
+                muted_color,
+                panel_outline,
             )
 
         rl.draw_line_ex(
-            rl.Vector2(system_x + 18.0, system_y + 282.0),
-            rl.Vector2(system_x + system_w - 18.0, system_y + 282.0),
+            rl.Vector2(panel_x + 18.0, panel_y + 282.0),
+            rl.Vector2(panel_x + panel_w - 18.0, panel_y + 282.0),
             1.0,
-            rl_color(card_outline),
+            rl_color(panel_outline),
         )
-        self._draw_text(self._text("device_angle"), system_x + 18.0, system_y + 308.0, 18.0, muted)
+        self._draw_text(self._text("device_angle"), panel_x + 18.0, panel_y + 308.0, 18.0, muted_color)
         pitch_deg: float | None = None
         yaw_deg: float | None = None
         calibration = state.camera_calibration_euler
@@ -6021,14 +6154,16 @@ class ClusterUiRenderer:
                 pitch_deg = candidate_pitch
                 yaw_deg = candidate_yaw
         self._draw_device_angle_indicator(
-            system_x + 14.0,
-            system_y + 325.0,
-            system_w - 28.0,
+            panel_x + 14.0,
+            panel_y + 325.0,
+            panel_w - 28.0,
             117.0,
             pitch_deg,
             yaw_deg,
-            muted,
-            card_outline,
+            muted_color,
+            panel_outline,
+            text_color=text_color,
+            target_fill=target_fill,
         )
 
     def _draw_system_gauge(
@@ -6108,11 +6243,13 @@ class ClusterUiRenderer:
         yaw_deg: float | None,
         muted: tuple[int, int, int],
         outline: tuple[int, int, int],
+        *,
+        text_color: tuple[int, ...] = WHITE,
+        target_fill: tuple[int, ...] = (11, 18, 26, 235),
     ) -> None:
         center_x = x + 52.0
         center_y = y + height * 0.5
         radius = 31.0
-        target_fill = (11, 18, 26, 235)
         rl.draw_circle_v(rl.Vector2(center_x, center_y), radius, rl_color(target_fill))
         rl.draw_ring(
             rl.Vector2(center_x, center_y),
@@ -6123,18 +6260,17 @@ class ClusterUiRenderer:
             24,
             rl_color(outline),
         )
-        axis_color = (71, 87, 101, 210)
         rl.draw_line_ex(
             rl.Vector2(center_x - radius + 6.0, center_y),
             rl.Vector2(center_x + radius - 6.0, center_y),
             1.0,
-            rl_color(axis_color),
+            rl_color(outline),
         )
         rl.draw_line_ex(
             rl.Vector2(center_x, center_y - radius + 6.0),
             rl.Vector2(center_x, center_y + radius - 6.0),
             1.0,
-            rl_color(axis_color),
+            rl_color(outline),
         )
         self._draw_text("P-", center_x, center_y - radius - 7.0, 9.0, muted, anchor="center")
         self._draw_text("P+", center_x, center_y + radius + 7.0, 9.0, muted, anchor="center")
@@ -6164,8 +6300,8 @@ class ClusterUiRenderer:
         value_x = x + width * 0.45
         pitch_text = "P  --°" if pitch_deg is None else f"P {pitch_deg:+.1f}°"
         yaw_text = "Y  --°" if yaw_deg is None else f"Y {yaw_deg:+.1f}°"
-        self._draw_text(pitch_text, value_x, y + 36.0, 22.0, WHITE)
-        self._draw_text(yaw_text, value_x, y + 69.0, 22.0, WHITE)
+        self._draw_text(pitch_text, value_x, y + 36.0, 22.0, text_color)
+        self._draw_text(yaw_text, value_x, y + 69.0, 22.0, text_color)
 
     def _draw_trip_metric(
         self,
@@ -6175,17 +6311,29 @@ class ClusterUiRenderer:
         value: str,
         width: float,
         unit: str = "",
+        *,
+        text_color: tuple[int, ...] | None = None,
+        muted_color: tuple[int, ...] | None = None,
     ) -> None:
-        muted = (154, 166, 178)
-        self._draw_text(label, x, y, 18.0, muted)
-        self._draw_text(value, x, y + 32.0, 29.0, WHITE)
+        theme = self._current_theme() if text_color is None or muted_color is None else None
+        if text_color is None:
+            assert theme is not None
+            text_color = theme.text
+        if muted_color is None:
+            assert theme is not None
+            muted_color = theme.muted
+        self._draw_text(label, x, y, 18.0, muted_color)
+        self._draw_text(value, x, y + 32.0, 29.0, text_color)
         if unit:
-            self._draw_text(unit, x + width, y + 32.0, 16.0, muted, anchor="right")
+            self._draw_text(unit, x + width, y + 32.0, 16.0, muted_color, anchor="right")
 
     @staticmethod
-    def _trip_temp_color(temp_c: float | None) -> tuple[int, int, int]:
+    def _trip_temp_color(
+        temp_c: float | None,
+        unavailable_color: tuple[int, ...],
+    ) -> tuple[int, ...]:
         if temp_c is None or not math.isfinite(temp_c):
-            return (154, 166, 178)
+            return unavailable_color
         if temp_c >= 90.0:
             return RED
         if temp_c >= 75.0:
@@ -6204,119 +6352,86 @@ class ClusterUiRenderer:
 
     def _draw_live_debug_panel(self, state: ClusterUiState) -> None:
         sections = self._live_debug_sections(state)
-        if not sections:
-            return
-
         theme = self._current_theme()
-        panel_x = self._information_panel_x(SYSTEM_PANEL_X)
-        panel_y = SYSTEM_PANEL_Y
-        panel_w = SYSTEM_PANEL_W
-        pad_x = 24.0
-        header_h = 54.0
-        section_title_h = 20.0
-        row_h = 24.0
-        section_gap = 10.0
-        content_h = sum(section_title_h + len(rows) * row_h for _, rows in sections)
-        content_h += max(0, len(sections) - 1) * section_gap
-        panel_h = min(DESIGN_HEIGHT - SYSTEM_PANEL_Y - 18.0, header_h + content_h + 18.0)
-        max_y = panel_y + panel_h - 18.0
+        panel_x = self._information_panel_x(NAVI_LIVE_PANEL_X)
+        panel_y = NAVI_LIVE_PANEL_Y
+        panel_w = NAVI_LIVE_PANEL_W
+        panel_h = NAVI_LIVE_PANEL_H
+        card_pad_x = 16.0
+        card_pad_y = 8.0
+        card_gap = 10.0
+        card_w = (panel_w - card_pad_x * 2.0 - card_gap) * 0.5
+        card_h = (panel_h - card_pad_y * 2.0 - card_gap) * 0.5
 
-        self._rounded_rect(panel_x, panel_y, panel_w, panel_h, 18, theme.route_panel_bg, theme.faint, 2)
-        self._draw_text("LIVE DEBUG", panel_x + pad_x, panel_y + 28, 18, theme.muted)
+        self._rounded_rect(panel_x, panel_y, panel_w, panel_h, 12.0, theme.panel_bg, theme.faint, 1.5)
+        for index, (section_title, rows) in enumerate(sections):
+            column = index % 2
+            row = index // 2
+            card_x = panel_x + card_pad_x + column * (card_w + card_gap)
+            card_y = panel_y + card_pad_y + row * (card_h + card_gap)
+            content_x = card_x + 18.0
+            value_x = card_x + card_w - 18.0
+            value_max_w = card_w - 210.0
 
-        y = panel_y + header_h
-        label_x = panel_x + pad_x
-        value_x = panel_x + panel_w - pad_x
-        label_w = 168.0
-        value_max_w = panel_w - pad_x * 2 - label_w - 12.0
-        for section_index, (section_title, rows) in enumerate(sections):
-            if section_index > 0:
-                line_y = y - section_gap * 0.45
-                rl.draw_line_ex(
-                    rl.Vector2(panel_x + pad_x, line_y),
-                    rl.Vector2(panel_x + panel_w - pad_x, line_y),
-                    1.0,
-                    rl_color(theme.faint),
-                )
-            if y + section_title_h * 0.5 > max_y:
-                break
-            self._draw_text(section_title, label_x, y + 8.0, 15, theme.muted)
-            y += section_title_h
-            for label, value in rows:
-                if y + row_h * 0.5 > max_y:
-                    break
-                self._draw_text(label, label_x, y + 8.0, 17, theme.muted)
-                value = self._ellipsize_text(value, 17, value_max_w)
-                self._draw_text(value, value_x, y + 8.0, 17, theme.text, anchor="right")
-                y += row_h
-            y += section_gap
+            self._rounded_rect(card_x, card_y, card_w, card_h, 12.0, theme.route_panel_bg, theme.faint, 1.2)
+            self._draw_text(section_title, content_x, card_y + 30.0, 18.0, theme.muted)
+            for row_index, (label, value) in enumerate(rows):
+                text_y = card_y + 78.0 + row_index * 38.0
+                self._draw_text(label, content_x, text_y, 17.0, theme.muted)
+                value = self._ellipsize_text(value, 17.0, value_max_w)
+                self._draw_text(value, value_x, text_y, 17.0, theme.text, anchor="right")
 
     def _live_debug_sections(self, state: ClusterUiState) -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
-        sections: list[tuple[str, tuple[tuple[str, str], ...]]] = []
         live_debug = state.live_debug
-        if live_debug is not None:
-            if live_debug.live_delay_calibration_percent is not None or live_debug.live_delay_lateral_s is not None:
-                sections.append(
-                    (
-                        "LIVE DELAY",
-                        (
-                            (
-                                "CAL / LAT",
-                                f"{self._optional_percent_text(live_debug.live_delay_calibration_percent)} / "
-                                f"{self._optional_seconds_text(live_debug.live_delay_lateral_s, 2)}",
-                            ),
-                        ),
-                    )
-                )
-            if (
-                live_debug.live_torque_calibration_percent is not None
-                or live_debug.live_torque_valid is not None
-                or live_debug.live_torque_lat_accel_factor is not None
-                or live_debug.live_torque_friction is not None
-            ):
-                live_valid = "--" if live_debug.live_torque_valid is None else "ON" if live_debug.live_torque_valid else "OFF"
-                sections.append(
-                    (
-                        "LIVE TORQUE",
-                        (
-                            (
-                                "STATE",
-                                f"{live_valid} / {self._optional_percent_text(live_debug.live_torque_calibration_percent)}",
-                            ),
-                            (
-                                "FACT / FRIC",
-                                f"{self._optional_float_text(live_debug.live_torque_lat_accel_factor, 2)} / "
-                                f"{self._optional_float_text(live_debug.live_torque_friction, 2)}",
-                            ),
-                        ),
-                    )
-                )
-            if (
-                live_debug.live_steer_ratio is not None
-                or live_debug.custom_steer_ratio is not None
-                or live_debug.steer_actuator_delay_s is not None
-            ):
-                sections.append(
-                    (
-                        "STEERING",
-                        (
-                            (
-                                "SR LIVE / CUSTOM",
-                                f"{self._optional_float_text(live_debug.live_steer_ratio, 1)} / "
-                                f"{self._optional_float_text(live_debug.custom_steer_ratio, 1)}",
-                            ),
-                            ("SAD", self._optional_seconds_text(live_debug.steer_actuator_delay_s, 2)),
-                        ),
-                    )
-                )
-        if state.lateral_plan_debug_text:
-            sections.append(
+        live_valid = "--"
+        if live_debug is not None and live_debug.live_torque_valid is not None:
+            live_valid = "ON" if live_debug.live_torque_valid else "OFF"
+        lateral_plan_text = str(state.lateral_plan_debug_text) if state.lateral_plan_debug_text else "--"
+        return (
+            (
+                "LIVE DELAY",
                 (
-                    "LATERAL PLAN",
-                    (("DEBUG", str(state.lateral_plan_debug_text)),),
-                )
-            )
-        return tuple(sections)
+                    (
+                        "CAL / LAT",
+                        f"{self._optional_percent_text(live_debug.live_delay_calibration_percent if live_debug else None)} / "
+                        f"{self._optional_seconds_text(live_debug.live_delay_lateral_s if live_debug else None, 2)}",
+                    ),
+                ),
+            ),
+            (
+                "LIVE TORQUE",
+                (
+                    (
+                        "STATE",
+                        f"{live_valid} / "
+                        f"{self._optional_percent_text(live_debug.live_torque_calibration_percent if live_debug else None)}",
+                    ),
+                    (
+                        "FACT / FRIC",
+                        f"{self._optional_float_text(live_debug.live_torque_lat_accel_factor if live_debug else None, 2)} / "
+                        f"{self._optional_float_text(live_debug.live_torque_friction if live_debug else None, 2)}",
+                    ),
+                ),
+            ),
+            (
+                "STEERING",
+                (
+                    (
+                        "SR LIVE / CUSTOM",
+                        f"{self._optional_float_text(live_debug.live_steer_ratio if live_debug else None, 1)} / "
+                        f"{self._optional_float_text(live_debug.custom_steer_ratio if live_debug else None, 1)}",
+                    ),
+                    (
+                        "SAD",
+                        self._optional_seconds_text(live_debug.steer_actuator_delay_s if live_debug else None, 2),
+                    ),
+                ),
+            ),
+            (
+                "LATERAL PLAN",
+                (("DEBUG", lateral_plan_text),),
+            ),
+        )
 
     @staticmethod
     def _optional_percent_text(value: float | None) -> str:
@@ -6902,7 +7017,7 @@ class ClusterUiRenderer:
             return
         theme = self._current_theme()
         color = WHITE if gear != "U" else theme.muted
-        outline = color if state.camera_view_mode == CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA else (5, 9, 12, 245)
+        outline = color if cluster_camera_view_is_road_camera(state.camera_view_mode) else (5, 9, 12, 245)
         rect = rl.Rectangle(
             SPEED_GEAR_CENTER_X - SPEED_GEAR_W * 0.5,
             SPEED_GEAR_CENTER_Y - SPEED_GEAR_H * 0.5,
@@ -7091,7 +7206,7 @@ class ClusterUiRenderer:
             )
 
     def _side_gauge_outline(self, state: ClusterUiState) -> tuple[int, int, int, int]:
-        if self._current_theme().is_dark or state.camera_view_mode == CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA:
+        if self._current_theme().is_dark or cluster_camera_view_is_road_camera(state.camera_view_mode):
             return SIDE_GAUGE_OUTLINE
         return (5, 9, 12, 235)
 

@@ -7,7 +7,6 @@ from openpilot.common.params import Params
 from openpilot.system.hardware import PC, TICI
 from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
 
-FLASK_AVAILABLE = importlib.util.find_spec("flask") is not None
 try:
   BODYTELEOP_AVAILABLE = importlib.util.find_spec("openpilot.tools.bodyteleop.web") is not None
 except ModuleNotFoundError:
@@ -88,9 +87,6 @@ def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
 def enable_updated(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started and params.get_bool("SoftwareMenu")
 
-def check_fleet(started, params, CP: car.CarParams) -> bool:
-  return FLASK_AVAILABLE
-
 def or_(*fns):
   return lambda *args: any(fn(*args) for fn in fns)
 
@@ -143,7 +139,8 @@ def enable_youtube_encoder(started, params, CP: car.CarParams) -> bool:
 
 def enable_youtube_wide_encoder(started, params, CP: car.CarParams) -> bool:
   try:
-    return params.get_int("CarrotYouTubeLive") > 0 and params.get_int("CarrotYouTubeQuality") == 3
+    use_wide_camera = bool(params.get("UseWideCamera", return_default=True))
+    return use_wide_camera and params.get_int("CarrotYouTubeLive") > 0 and params.get_int("CarrotYouTubeQuality") == 3
   except Exception:
     return False
 

@@ -52,6 +52,11 @@ def parse_args() -> argparse.Namespace:
     action="store_true",
     help="return nonzero when an existing-radard expectation fails",
   )
+  parser.add_argument(
+    "--strict-shadow",
+    action="store_true",
+    help="return nonzero when a physical dPath shadow expectation fails",
+  )
   return parser.parse_args()
 
 
@@ -92,7 +97,12 @@ def _first_event(
   for index, frame in enumerate(frames):
     if not start_s <= frame.time_s <= end_s:
       continue
-    candidates = tuple(getattr(selector.select(frame, index), attribute))
+    value = getattr(selector.select(frame, index), attribute)
+    candidates = (
+      () if value is None
+      else (value,) if attribute in ("lead_one", "lead_two")
+      else tuple(value)
+    )
     matches = [
       candidate for candidate in candidates
       if candidate_matches_targets(candidate, targets)
@@ -105,6 +115,23 @@ def _first_event(
       )
       return frame.time_s, best.track_id
   return None
+
+
+def _lead_one_continuous(
+  selector: Any,
+  frames: list[Any],
+  entry: dict[str, Any],
+) -> bool | None:
+  window = entry.get("lead_one_continuous_window")
+  if window is None:
+    return None
+  start_s, end_s = (float(value) for value in window)
+  samples = [
+    selector.select(frame, index).lead_one is not None
+    for index, frame in enumerate(frames)
+    if start_s <= frame.time_s <= end_s
+  ]
+  return bool(samples) and all(samples)
 
 
 def _stationary_event(
@@ -240,8 +267,13 @@ def main() -> int:
         )
         radard_pass = radard_event is not None
       else:
+        validation_stage = str(entry.get("validation_stage", "output"))
+        validation_attribute = {
+          "lead_one": "lead_one",
+          "lead_two": "lead_two",
+        }.get(validation_stage, "active_cutin_candidates")
         radard_event = _first_event(
-          radard, frames, entry, "active_cutin_candidates",
+          radard, frames, entry, validation_attribute,
         )
         entry_source = str(entry.get("source", "front+corner"))
         shadow_applicable = (
@@ -250,7 +282,14 @@ def main() -> int:
         )
         shadow_event = (
           _first_event(
-            shadow, frames, entry, "decision_cutin_candidates",
+            shadow,
+            frames,
+            entry,
+            (
+              validation_attribute
+              if validation_attribute in ("lead_one", "lead_two")
+              else "decision_cutin_candidates"
+            ),
           )
           if shadow_applicable
           else None
@@ -258,6 +297,10 @@ def main() -> int:
         radard_pass = (radard_event is not None) == (expected == "detect")
       if expected == "stationary":
         shadow_applicable = True
+      shadow_pass = (
+        not shadow_applicable
+        or (shadow_event is not None) == (expected in ("detect", "stationary"))
+      )
       deadline = entry.get("latest_detection_s")
       if (
         radard_pass
@@ -266,6 +309,23 @@ def main() -> int:
         and expected == "detect"
       ):
         radard_pass = radard_event[0] <= float(deadline)
+      if (
+        shadow_pass
+        and deadline is not None
+        and shadow_event is not None
+        and expected == "detect"
+      ):
+        shadow_pass = shadow_event[0] <= float(deadline)
+      radard_continuous = _lead_one_continuous(
+        radard, frames, entry,
+      )
+      shadow_continuous = _lead_one_continuous(
+        shadow, frames, entry,
+      )
+      if radard_continuous is not None:
+        radard_pass = radard_pass and radard_continuous
+      if shadow_continuous is not None and shadow_applicable:
+        shadow_pass = shadow_pass and shadow_continuous
       row = {
         "id": str(entry["id"]),
         "validation_set": str(entry["validation_set"]),
@@ -276,15 +336,26 @@ def main() -> int:
         "shadow_applicable": shadow_applicable,
         "shadow_sensor": shadow.motion_sensor,
         "radard_pass": radard_pass,
+        "shadow_pass": shadow_pass,
+        "radard_continuous": radard_continuous,
+        "shadow_continuous": shadow_continuous,
       }
       rows.append(row)
       print(
-        f"  {'PASS' if radard_pass else 'FAIL'} {entry['id']} "
-        + f"expected={expected} radard={_event_text(radard_event)} "
+        f"  {entry['id']} expected={expected} "
+        + f"radard={'PASS' if radard_pass else 'FAIL'}:{_event_text(radard_event)} "
         + (
-          f"shadow={_event_text(shadow_event)}"
+          f"shadow={'PASS' if shadow_pass else 'FAIL'}:{_event_text(shadow_event)}"
           if shadow_applicable
           else f"shadow=N/A({shadow.motion_sensor})"
+        )
+        + (
+          " continuity="
+          + f"radard:{'PASS' if radard_continuous else 'FAIL'}"
+          + f"/shadow:{'PASS' if shadow_continuous else 'FAIL'}"
+          if radard_continuous is not None
+          and shadow_continuous is not None
+          else ""
         ),
         flush=True,
       )
@@ -300,9 +371,11 @@ def main() -> int:
     _print_metrics("existing radard", _metrics(subset, "radard_event"))
     _print_metrics("physical dPath shadow", _metrics(subset, "shadow_event"))
   radard_failures = sum(not row["radard_pass"] for row in rows)
+  shadow_failures = sum(not row["shadow_pass"] for row in rows)
   print(
     f"\nprocessed={len(rows)} missing={missing} "
-    + f"existing-radard expectation failures={radard_failures}"
+    + f"existing-radard expectation failures={radard_failures} "
+    + f"physical-dpath expectation failures={shadow_failures}"
   )
 
   if args.report is not None:
@@ -315,6 +388,7 @@ def main() -> int:
         "physical_dpath_shadow": _metrics(rows, "shadow_event"),
         "missing": missing,
         "radard_expectation_failures": radard_failures,
+        "physical_dpath_expectation_failures": shadow_failures,
       },
     }
     args.report.write_text(
@@ -322,7 +396,11 @@ def main() -> int:
       encoding="utf-8",
     )
     print(f"report written: {args.report}")
-  return int(missing > 0 or (args.strict_radard and radard_failures > 0))
+  return int(
+    missing > 0
+    or (args.strict_radard and radard_failures > 0)
+    or (args.strict_shadow and shadow_failures > 0)
+  )
 
 
 if __name__ == "__main__":

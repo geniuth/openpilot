@@ -47,6 +47,34 @@ def test_c3x_lite_hardware_setting_is_exposed(settings, params):
   assert device_hardware["params"] == ["HardwareC3xLite"]
 
 
+def test_wide_camera_fallback_setting_is_exposed(settings, params):
+  by_name = {p["name"]: p for p in params}
+  use_wide_camera = by_name["UseWideCamera"]
+  assert (use_wide_camera["min"], use_wide_camera["max"], use_wide_camera["default"]) == (0, 1, 1)
+  assert use_wide_camera["control"] == "toggle"
+  assert use_wide_camera["risk"] == "high"
+  assert "재부팅" in use_wide_camera["descr"]
+  assert "Reboot" in use_wide_camera["edescr"]
+
+  system = next(category for category in settings["menu"] if category["id"] == "SYSTEM")
+  camera = next(group for group in system["groups"] if group["id"] == "SYS_CAMERA")
+  assert camera["params"] == ["UseWideCamera"]
+
+  params_keys = PARAMS_KEYS_PATH.read_text(encoding="utf-8")
+  assert '{"UseWideCamera", {PERSISTENT, BOOL, "1"}}' in params_keys
+
+
+def test_tpms_position_setting_matches_device_support(params):
+  by_name = {p["name"]: p for p in params}
+  show_tpms = by_name["ShowTpms"]
+  assert (show_tpms["min"], show_tpms["max"], show_tpms["default"]) == (0, 3, 1)
+  assert "C4(MICI)는 해당 없음" in show_tpms["descr"]
+  assert "Not applicable to C4 (MICI)" in show_tpms["edescr"]
+
+  params_keys = PARAMS_KEYS_PATH.read_text(encoding="utf-8")
+  assert '{"ShowTpms", {PERSISTENT, INT, "1"}}' in params_keys
+
+
 def test_external_hud_brightness_and_orientation_use_catalog_controls(settings, params):
   by_name = {p["name"]: p for p in params}
   brightness = by_name["ClusterHudBrightness"]
@@ -92,6 +120,11 @@ def test_external_hud_brightness_and_orientation_use_catalog_controls(settings, 
     "ClusterHudPanelLayout",
     "ClusterHudCameraViewMode",
   ]
+  camera_view = by_name["ClusterHudCameraViewMode"]
+  assert (camera_view["min"], camera_view["max"], camera_view["default"]) == (0, 4, 0)
+  assert camera_view["control"] == "select"
+  assert camera_view["options"]["ko"][2:] == ["일반 카메라", "광각 카메라", "속도 자동"]
+  assert camera_view["options"]["en"][2:] == ["Narrow camera", "Wide camera", "Speed automatic"]
 
   params_keys = PARAMS_KEYS_PATH.read_text(encoding="utf-8")
   assert '{"ClusterHudBrightness", {PERSISTENT, INT, "0"}}' in params_keys

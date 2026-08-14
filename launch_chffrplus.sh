@@ -86,6 +86,13 @@ function start_carrot_web {
 
   [ -f "$watchdog_script" ] || return
 
+  # The watchdog survives tmux/openpilot restarts. The pid file can be lost or
+  # replaced while that old process is still alive, so also check the process
+  # table before starting another watchdog.
+  if command -v pgrep >/dev/null 2>&1 && pgrep -f '[c]arrot_web_watchdog[.]sh' >/dev/null 2>&1; then
+    return
+  fi
+
   if [ -f "$pid_file" ]; then
     local old_pid
     old_pid="$(cat "$pid_file" 2>/dev/null || true)"
@@ -218,23 +225,11 @@ function launch {
   rm openpilot/selfdrive/pandad/*.so
   # write tmux scrollback to a file
   tmux capture-pane -pq -S-1500 > /tmp/launch_log
-  if python -c "import flask" > /dev/null 2>&1; then
-    echo "Flask already installed."
-  else
-    echo "Flask installing."
-    pip install flask
-  fi
   if python -c "import shapely" > /dev/null 2>&1; then
     echo "shapely already installed."
   else
     echo "shapely installing."
     pip install shapely
-  fi
-  if python -c "import kaitaistruct" > /dev/null 2>&1; then
-    echo "kaitaistruct already installed."
-  else
-    echo "kaitaistruct installing."
-    pip install kaitaistruct
   fi
   if python3 -c "import msgpack" > /dev/null 2>&1; then
     echo "msgpack already installed."

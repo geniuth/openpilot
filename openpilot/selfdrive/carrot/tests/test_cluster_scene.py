@@ -11,7 +11,9 @@ CLUSTER_DIR = Path(__file__).resolve().parents[1] / "cluster"
 sys.path.insert(0, str(CLUSTER_DIR))
 
 from cluster_config import (
+  CLUSTER_CAMERA_VIEW_MODE_AUTO_CAMERA,
   CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA,
+  CLUSTER_CAMERA_VIEW_MODE_WIDE_CAMERA,
   CLUSTER_PANEL_LAYOUT_DRIVING_RIGHT,
   CLUSTER_RADAR_INFO_ALL_SPEED_DISTANCE,
   CLUSTER_RADAR_INFO_NONE,
@@ -20,7 +22,7 @@ from cluster_config import (
   LIGHT_CLUSTER_THEME,
   VEHICLE_LENGTH_M,
 )
-from cluster_models import ClusterAlert, ClusterUiState, DetectedVehicle, LaneMarking, ModelPathPoint, RadarPoint
+from cluster_models import ClusterAlert, ClusterUiState, DetectedVehicle, LaneMarking, ModelPathPoint, RadarPoint, RouteOverlay
 import cluster_renderer
 from cluster_renderer import ClusterUiRenderer
 import cluster_scene
@@ -72,23 +74,22 @@ def test_cluster_alert_is_centered_in_swapped_camera_panel(monkeypatch) -> None:
   renderer.height = cluster_renderer.DESIGN_HEIGHT
   renderer.panel_layout = CLUSTER_PANEL_LAYOUT_DRIVING_RIGHT
   renderer.screen_mode = cluster_renderer.CLUSTER_SCREEN_MODE_DEFAULT
-  rounded_rects = []
   labels = []
 
   monkeypatch.setattr(cluster_renderer.rl, "rl_push_matrix", lambda: None)
   monkeypatch.setattr(cluster_renderer.rl, "rl_scalef", lambda *_args: None)
   monkeypatch.setattr(cluster_renderer.rl, "rl_pop_matrix", lambda: None)
-  monkeypatch.setattr(renderer, "_rounded_rect", lambda *args: rounded_rects.append(args))
+  monkeypatch.setattr(renderer, "_rounded_rect", lambda *_args: pytest.fail("alert background drawn"))
+  monkeypatch.setattr(cluster_renderer.rl, "draw_rectangle_rec", lambda *_args: pytest.fail("alert background drawn"))
   monkeypatch.setattr(renderer, "_fit_alert_text", lambda text, size, *_args: (text, size))
-  monkeypatch.setattr(renderer, "_draw_text", lambda *args, **kwargs: labels.append((args, kwargs)))
+  monkeypatch.setattr(renderer, "_draw_text_with_stroke", lambda *args, **kwargs: labels.append((args, kwargs)))
 
   renderer._draw_alert_overlay(ClusterAlert("Steering Unavailable", "Take Control", size=2, status=1))
 
   camera_center_x = cluster_renderer.NAVI_LIVE_PANEL_W + cluster_renderer.CAMERA_BACKGROUND_W * 0.5
-  rect_x, _rect_y, rect_w, _rect_h = rounded_rects[0][:4]
-  assert rect_x + rect_w * 0.5 == pytest.approx(camera_center_x)
   assert {args[1] for args, _kwargs in labels} == {camera_center_x}
   assert [args[0] for args, _kwargs in labels] == ["Steering Unavailable", "Take Control"]
+  assert all(args[5] == cluster_renderer.CLUSTER_ALERT_TEXT_STROKE for args, _kwargs in labels)
 
 
 def test_synthetic_cluster_alert_uses_cluster_language() -> None:
@@ -701,7 +702,12 @@ def test_longitudinal_render_distance_is_halved_without_changing_lateral_data() 
   assert detected_box.longitudinal_m == 40.0
 
 
-def test_road_camera_keeps_longitudinal_render_distance_one_to_one() -> None:
+@pytest.mark.parametrize("camera_view_mode", (
+  CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA,
+  CLUSTER_CAMERA_VIEW_MODE_WIDE_CAMERA,
+  CLUSTER_CAMERA_VIEW_MODE_AUTO_CAMERA,
+))
+def test_camera_background_modes_keep_longitudinal_render_distance_one_to_one(camera_view_mode) -> None:
   vehicle = DetectedVehicle(
     "L1",
     longitudinal_m=40.0,
@@ -710,7 +716,7 @@ def test_road_camera_keeps_longitudinal_render_distance_one_to_one() -> None:
     primary=True,
   )
   state = _cluster_state(
-    camera_view_mode=CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA,
+    camera_view_mode=camera_view_mode,
     detected_vehicles=(vehicle,),
   )
 
@@ -721,6 +727,46 @@ def test_road_camera_keeps_longitudinal_render_distance_one_to_one() -> None:
   assert detected_box.center.x == pytest.approx(2.25)
   assert detected_box.center.y == pytest.approx(EGO_FORWARD_M + 40.0 + VEHICLE_LENGTH_M * 0.5)
   assert detected_box.longitudinal_m == 40.0
+
+
+def test_wide_camera_projection_uses_ecam_calibration_and_speed_zoom() -> None:
+  renderer = object.__new__(ClusterUiRenderer)
+  renderer.width = cluster_renderer.DESIGN_WIDTH
+  renderer.height = cluster_renderer.DESIGN_HEIGHT
+  renderer.panel_layout = CLUSTER_PANEL_LAYOUT_DRIVING_RIGHT
+  renderer.camera_overlay_pitch_offset_deg = 0.0
+  state = _cluster_state(
+    speed_kph=0.0,
+    camera_view_mode=CLUSTER_CAMERA_VIEW_MODE_WIDE_CAMERA,
+    camera_device_type="tici",
+    camera_sensor="ar0231",
+    camera_calibration_euler=(0.0, 0.0, 0.0),
+    wide_camera_from_device_euler=(0.0, 0.02, 0.0),
+  )
+
+  renderer._camera_overlay_wide = False
+  narrow = renderer._camera_overlay_projection(state)
+  renderer._camera_overlay_wide = True
+  wide_low_speed = renderer._camera_overlay_projection(state)
+  wide_high_speed = renderer._camera_overlay_projection(replace(state, speed_kph=54.0))
+
+  assert narrow is not None and wide_low_speed is not None and wide_high_speed is not None
+  assert not narrow.wide_camera
+  assert wide_low_speed.wide_camera
+  assert narrow.focal_length == pytest.approx(2648.0)
+  assert wide_low_speed.focal_length == pytest.approx(567.0)
+  assert wide_low_speed.view_from_road != narrow.view_from_road
+  assert wide_high_speed.zoom == pytest.approx(wide_low_speed.zoom * 1.55)
+
+
+def test_route_overlay_declares_the_camera_projection_stream() -> None:
+  renderer = object.__new__(ClusterUiRenderer)
+  state = _cluster_state(
+    camera_view_mode=CLUSTER_CAMERA_VIEW_MODE_WIDE_CAMERA,
+    route_overlay=RouteOverlay(video_rgba=b"frame", camera_stream="wide"),
+  )
+
+  assert renderer._select_camera_overlay_stream(state)
 
 
 def test_model_road_geometry_matches_vehicle_longitudinal_scale() -> None:
@@ -777,6 +823,55 @@ def test_corner_radar_does_not_duplicate_points_covered_by_vehicle_boxes() -> No
 
   assert {vehicle.label for vehicle in scene.vehicles if vehicle.source == "cornerRadar"} == {"C1", "C2", "C3"}
   assert scene.radar_points == ()
+
+
+@pytest.mark.parametrize("lead_label", ("L1", "L2"))
+def test_road_camera_hides_own_lane_corner_radar_when_front_lead_is_detected(lead_label) -> None:
+  points = (
+    RadarPoint("CENTER_EXPLICIT", 12.0, 0.2, "cornerRadar", in_my_lane=1),
+    RadarPoint("CENTER_PATH", 30.0, 1.2, "cornerRadar"),
+    RadarPoint("ADJACENT", 20.0, 2.4, "cornerRadar", in_my_lane=0),
+  )
+  state = _cluster_state(
+    camera_view_mode=CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA,
+    model_path=(ModelPathPoint(0.0, 0.0), ModelPathPoint(40.0, 1.2)),
+    detected_vehicles=(DetectedVehicle(lead_label, 45.0, 0.0, source="radarState", primary=True),),
+    radar_points=points,
+  )
+
+  scene = build_cluster_scene(state)
+  labels = {vehicle.label for vehicle in scene.vehicles}
+
+  assert lead_label in labels
+  assert "ADJACENT" in labels
+  assert "CENTER_EXPLICIT" not in labels
+  assert "CENTER_PATH" not in labels
+  assert {marker.label for marker in scene.radar_points}.isdisjoint({"CENTER_EXPLICIT", "CENTER_PATH"})
+
+
+def test_non_camera_view_keeps_own_lane_corner_radar_with_front_lead() -> None:
+  point = RadarPoint("CENTER", 12.0, 0.2, "cornerRadar", in_my_lane=1)
+  state = _cluster_state(
+    detected_vehicles=(DetectedVehicle("L1", 45.0, 0.0, source="radarState", primary=True),),
+    radar_points=(point,),
+  )
+
+  scene = build_cluster_scene(state)
+
+  assert any(vehicle.label == "CENTER" for vehicle in scene.vehicles)
+
+
+def test_road_camera_keeps_own_lane_corner_radar_without_front_lead() -> None:
+  point = RadarPoint("CENTER", 12.0, 0.2, "cornerRadar", in_my_lane=1)
+  state = _cluster_state(
+    camera_view_mode=CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA,
+    detected_vehicles=(DetectedVehicle("M1", 45.0, 0.0, source="modelV2.leadsV3", primary=True),),
+    radar_points=(point,),
+  )
+
+  scene = build_cluster_scene(state)
+
+  assert any(vehicle.label == "CENTER" for vehicle in scene.vehicles)
 
 
 def test_many_corner_radar_points_are_bounded_and_not_drawn_twice() -> None:

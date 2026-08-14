@@ -2,6 +2,94 @@
   "sensitivity": 50,
   "cases": [
     {
+      "id": "carnival-ed-11-motorcycle-cutout-stationary-shadow",
+      "vehicle_folder": "KIA_CARNIVAL_4TH_GEN c4dcf95545dafe68",
+      "log": "000000ed--9fbaeb1dea--11/rlog.zst",
+      "source": "front+corner",
+      "window": [18.80, 21.20],
+      "expected": "detect",
+      "human_verified": true,
+      "validation_stage": "lead_two",
+      "target_track_ids": [53],
+      "latest_detection_s": 19.30,
+      "scene": "A moving motorcycle lead 44 cuts out left and reveals central stopped front-radar track 53; retain the motorcycle as leadOne while confirming track 53 as an early stationary shadow leadTwo"
+    },
+    {
+      "id": "k8-2b1-12-left-truck-cutin-34",
+      "vehicle_folder": "KIA_K8_HEV_1ST_GEN 4aa2ded146fd78b9",
+      "log": "000002b1--1e5c7aad6a--12/rlog.zst",
+      "source": "front+corner",
+      "window": [33.4, 36.2],
+      "expected": "detect",
+      "human_verified": true,
+      "target_track_ids": [33, 1050],
+      "latest_detection_s": 34.1,
+      "scene": "Cargo truck enters the ego lane from the left; corner track 1050 shows sustained inward position history before front track 33 becomes leadOne"
+    },
+    {
+      "id": "sorento-1-4-stationary-113m",
+      "vehicle_folder": "KIA_SORENTO_HEV_4TH_GEN ec52e28535e2b281",
+      "log": "00000001--468b94c6c9--4/rlog.zst",
+      "source": "front+corner",
+      "window": [16.5, 27.5],
+      "expected": "stationary",
+      "target_track_ids": [60, 1003],
+      "scene": "Night stopped vehicle approached from 113 m with front and corner radar"
+    },
+    {
+      "id": "sorento-1-4-weak-vision-paired-early-lead",
+      "vehicle_folder": "KIA_SORENTO_HEV_4TH_GEN ec52e28535e2b281",
+      "log": "00000001--468b94c6c9--4/rlog.zst",
+      "source": "front+corner",
+      "window": [18.2, 18.8],
+      "expected": "detect",
+      "human_verified": true,
+      "validation_stage": "lead_one",
+      "target_track_ids": [60, 1003],
+      "latest_detection_s": 18.70,
+      "scene": "Weak night vision may accelerate leadOne only after a tight, central and continuous front/corner stationary pair confirms the same stopped vehicle"
+    },
+    {
+      "id": "ioniq5-d53-3-stationary-closer-handoff",
+      "vehicle_folder": "HYUNDAI_IONIQ_5_PE 8b06424f3adf2bd3",
+      "log": "00000d53--4a628c2753--3/rlog.zst",
+      "source": "front+corner",
+      "window": [11.6, 16.4],
+      "expected": "stationary",
+      "human_verified": true,
+      "target_track_ids": [46],
+      "required_lead_one_ids": [46],
+      "forbidden_lead_one_ids": [59],
+      "require_lead_one_continuous": true,
+      "scene": "A persistent closer front-radar reflection 46 must replace the held farther stationary reflection 59 before the final stop"
+    },
+    {
+      "id": "ioniq9-25b-10-stationary-corner-velocity-hold",
+      "vehicle_folder": "HYUNDAI_IONIQ_9 c92fab3f15c0dbfb",
+      "log": "0000025b--c5bf47c084--10/rlog.zst",
+      "source": "front+corner",
+      "window": [27.20, 29.20],
+      "expected": "detect",
+      "human_verified": true,
+      "validation_stage": "lead_one",
+      "target_track_ids": [1005],
+      "latest_detection_s": 27.22,
+      "lead_one_continuous_window": [27.21, 29.20],
+      "scene": "A selected stationary corner L1 and comma vision keep identifying the same far lead after the corner velocity becomes a bounded negative outlier; retain radar track 1005 and preserve L1 continuity"
+    },
+    {
+      "id": "k5-224-11-weak-vision-front-stationary-ghost",
+      "vehicle_folder": "KIA_K5_2021 UnregisteredDevice",
+      "log": "00000224--9cfd6f3b43--11/rlog.zst",
+      "source": "front",
+      "window": [35.0, 44.4],
+      "expected": "clear",
+      "human_verified": true,
+      "validation_stage": "lead_one",
+      "target_track_ids": [34],
+      "scene": "Empty road after a weak visual seed: offset stationary front-radar reflection 34 must release when current vision support disappears"
+    },
+    {
       "id": "palisade-bef-2-motorcycle-leadone",
       "vehicle_folder": "HYUNDAI_PALISADE b84b4a4fbb604be1",
       "log": "00000bef--a8eb1d8c98--2/rlog.zst",
@@ -13,6 +101,18 @@
       "forbidden_lead_one_ids": [43],
       "require_lead_one_continuous": true,
       "scene": "Closer in-path motorcycle track 34 must replace the previously held farther moving track 43 without repeated leadOne skips"
+    },
+    {
+      "id": "ioniq9-234-6-stationary-range-outlier",
+      "vehicle_folder": "HYUNDAI_IONIQ_9 c92fab3f15c0dbfb",
+      "log": "00000234--127adb09bb--6/rlog.zst",
+      "source": "front+corner",
+      "window": [12.5, 19.5],
+      "expected": "stationary",
+      "human_verified": true,
+      "target_track_ids": [45, 1004],
+      "required_lead_one_ids": [45, 1004],
+      "scene": "Stopped lead corroborated by front track 45 and corner track 1004 while the visual longitudinal range is initially overestimated"
     },
     {
       "id": "azera-109-271-corner-moving-ghost",
@@ -48,6 +148,20 @@
       "forbidden_lead_one_ids": [60],
       "forbidden_lead_two_ids": [60],
       "scene": "Front-only stationary reflection 60 must not cross the moving speed boundary and trigger close-range braking"
+    },
+    {
+      "id": "ev9-2f-3-overpass-front-moving-ghost",
+      "vehicle_folder": "KIA_EV9 f1653dc04207a818",
+      "log": "0000002f--5c877408ea--3/rlog.zst",
+      "source": "front+corner",
+      "window": [7.8, 9.0],
+      "expected": "clear",
+      "human_verified": true,
+      "validation_stage": "lead_one",
+      "target_track_ids": [39],
+      "forbidden_lead_one_ids": [39],
+      "forbidden_lead_two_ids": [39],
+      "scene": "Empty road before an overpass: brief central front-radar reflection 39 with implausible positive acceleration must not become a radar-only moving lead"
     },
     {
       "id": "ioniq5-d39-41-closest-moving-leadone",
@@ -93,16 +207,6 @@
       "forbidden_lead_one_ids": [40, 61],
       "forbidden_lead_two_ids": [40, 51],
       "scene": "Tunnel reflections must not become a vision-matched leadOne or stationary leadTwo"
-    },
-    {
-      "id": "sorento-1-4-stationary-113m",
-      "vehicle_folder": "KIA_SORENTO_HEV_4TH_GEN ec52e28535e2b281",
-      "log": "00000001--468b94c6c9--4/rlog.zst",
-      "source": "front+corner",
-      "window": [16.5, 27.5],
-      "expected": "stationary",
-      "target_track_ids": [60, 1003],
-      "scene": "Night stopped vehicle approached from 113 m with front and corner radar"
     },
     {
       "id": "ioniq9-209-30-l1-handoff-no-duplicate-cutin",
