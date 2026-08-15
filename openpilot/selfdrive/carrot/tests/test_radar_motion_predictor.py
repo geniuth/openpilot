@@ -24,6 +24,7 @@ from openpilot.selfdrive.carrot.radar_motion.predictor import (
 from openpilot.selfdrive.carrot.radar_motion.lead_selection import (
   DPathLeadCandidate,
   DPathLeadTwoTracker,
+  DPathStationaryPrimaryHandoffTracker,
   cutin_can_compete_with_primary,
   dpath_control_max_d_rel,
   front_cutin_motion_supported,
@@ -32,6 +33,7 @@ from openpilot.selfdrive.carrot.radar_motion.lead_selection import (
 )
 from openpilot.selfdrive.carrot.radar_motion.controller import (
   DPathRadarController,
+  stationary_shadow_corner_supported,
 )
 from openpilot.selfdrive.carrot.radar_motion.predictor import RadarMotionCutIn
 from openpilot.selfdrive.carrot.radar_motion.primary import (
@@ -1974,7 +1976,54 @@ def test_controller_confirms_stationary_shadow_behind_cutting_out_lead() -> None
   ))
 
   output = None
-  for index in range(7):
+  for index in range(12):
+    corner = (
+      Point(
+        1053, 66.0 - index * 0.8, 0.4,
+        v_rel=-15.0, v_lead=1.0, source="corner235",
+      ),
+    ) if index <= 6 else ()
+    output = controller.update(
+      time_s=index * 0.05,
+      v_ego=16.0,
+      radar_points=(
+        Point(
+          44, 50.0, -1.0, v_rel=-6.0, v_lead=10.0,
+          trackState=2,
+        ),
+        Point(
+          53, 60.0 - index * 0.8, 0.0,
+          v_rel=-16.0, v_lead=0.0, trackState=2,
+        ),
+      ) + corner,
+      model=model_with_lead(50.0, -1.0, 10.0, probability=0.99),
+    )
+    assert output.lead_one is not None
+    assert output.lead_one["radarTrackId"] == 44
+    if index < 5:
+      assert output.lead_two is None
+
+  assert output is not None
+  assert output.lead_two is not None
+  assert output.lead_two["radarTrackId"] == 53
+  assert output.lead_two["dRel"] > output.lead_one["dRel"]
+  assert output.leads_cutin == ()
+
+
+def test_controller_rejects_front_only_stationary_shadow() -> None:
+  controller = DPathRadarController(
+    prefer_corner_radar=True,
+    enable_radar_tracks=1,
+    cut_in_sensitivity=3,
+  )
+  controller.primary_cut_out_predictor = FixedPredictor(SimpleNamespace(
+    source="frontRadar",
+    track_id=44,
+    cut_out_probability=0.90,
+  ))
+
+  output = None
+  for index in range(8):
     output = controller.update(
       time_s=index * 0.05,
       v_ego=16.0,
@@ -1990,16 +2039,132 @@ def test_controller_confirms_stationary_shadow_behind_cutting_out_lead() -> None
       ),
       model=model_with_lead(50.0, -1.0, 10.0, probability=0.99),
     )
-    assert output.lead_one is not None
-    assert output.lead_one["radarTrackId"] == 44
-    if index < 5:
-      assert output.lead_two is None
 
   assert output is not None
-  assert output.lead_two is not None
-  assert output.lead_two["radarTrackId"] == 53
-  assert output.lead_two["dRel"] > output.lead_one["dRel"]
-  assert output.leads_cutin == ()
+  assert output.lead_two is None
+
+
+def test_stationary_shadow_rejects_nearby_moving_corner_return() -> None:
+  path = STRAIGHT_PATH
+  front = snapshot_radar_points((
+    Point(
+      34, 54.0, -0.5, v_rel=-24.0, v_lead=0.0,
+      trackState=2,
+    ),
+  ), v_ego=24.0)[0]
+  points = snapshot_radar_points((
+    Point(
+      34, 54.0, -0.5, v_rel=-24.0, v_lead=0.0,
+      trackState=2,
+    ),
+    Point(
+      1000, 56.6, -0.05, v_rel=-0.1, v_lead=23.9,
+      source="corner235",
+    ),
+  ), v_ego=24.0)
+
+  assert not stationary_shadow_corner_supported(front, points, path)
+
+
+def test_stationary_corner_primary_handoff_becomes_and_remains_lead_two() -> None:
+  handoff = DPathStationaryPrimaryHandoffTracker()
+  lead_two = DPathLeadTwoTracker()
+  corner_lead = {
+    "status": True,
+    "radar": True,
+    "radarTrackId": 1039,
+    "dRel": 45.0,
+    "yRel": 0.2,
+    "dPath": 0.2,
+    "vRel": -19.0,
+    "vLead": 1.0,
+    "modelProb": 0.85,
+  }
+  corner = DPathLeadCandidate(
+    corner_lead, "corner235", 1039, 0, True, False,
+  )
+
+  assert handoff.update(0.0, corner_lead, (corner,), None) is None
+
+  farther_primary = {
+    "status": True,
+    "radar": True,
+    "radarTrackId": 55,
+    "dRel": 64.0,
+    "yRel": 0.0,
+    "vRel": -10.0,
+    "vLead": 10.0,
+    "modelProb": 0.9,
+  }
+  moved_lead = dict(corner_lead, dRel=43.1)
+  moved = replace(corner, lead=moved_lead)
+  acquired = handoff.update(0.1, farther_primary, (moved,), None)
+
+  assert acquired is not None
+  assert acquired.confirmed_stationary_shadow
+  assert lead_two.update(
+    0.1, farther_primary, (acquired,), 20.0,
+  ).lead_two is acquired.lead
+
+  retained = None
+  for index in range(2, 13):
+    time_s = index * 0.1
+    retained_candidate = replace(
+      corner,
+      lead=dict(corner_lead, dRel=45.0 - 19.0 * time_s),
+    )
+    retained = handoff.update(
+      time_s,
+      farther_primary,
+      (retained_candidate,),
+      lead_two.active_identity,
+    )
+    assert retained is retained_candidate
+    assert not retained.confirmed_stationary_shadow
+    assert lead_two.update(
+      time_s, farther_primary, (retained,), 20.0,
+    ).lead_two is retained.lead
+
+  assert retained is not None
+
+
+def test_stationary_corner_primary_handoff_rejects_weak_or_reused_identity() -> None:
+  base_lead = {
+    "status": True,
+    "radar": True,
+    "radarTrackId": 1039,
+    "dRel": 45.0,
+    "yRel": 0.2,
+    "dPath": 0.2,
+    "vRel": -19.0,
+    "vLead": 1.0,
+    "modelProb": 0.39,
+  }
+  corner = DPathLeadCandidate(
+    base_lead, "corner235", 1039, 0, True, False,
+  )
+  farther_primary = {
+    "status": True,
+    "radar": True,
+    "radarTrackId": 55,
+    "dRel": 80.0,
+    "vLead": 10.0,
+    "modelProb": 0.9,
+  }
+
+  weak = DPathStationaryPrimaryHandoffTracker()
+  assert weak.update(0.0, base_lead, (corner,), None) is None
+  assert weak.update(0.1, farther_primary, (corner,), None) is None
+
+  reused = DPathStationaryPrimaryHandoffTracker()
+  strong_lead = dict(base_lead, modelProb=0.85)
+  strong = replace(corner, lead=strong_lead)
+  assert reused.update(0.0, strong_lead, (strong,), None) is None
+  jumped = replace(
+    corner,
+    lead=dict(strong_lead, dRel=70.0),
+  )
+  assert reused.update(0.1, farther_primary, (jumped,), None) is None
 
 
 @pytest.mark.parametrize(
