@@ -70,6 +70,12 @@ def hud_module(monkeypatch):
     started_frame=0,
     status=0,
     is_metric=True,
+    usbgpu_present=False,
+    usbgpu_compiled=False,
+    usbgpu_compile_pending=False,
+    usbgpu_loading=False,
+    usbgpu_active=False,
+    usbgpu_startup_failed=False,
   )
   gui_app = SimpleNamespace(
     font=lambda weight: ("font", weight),
@@ -82,6 +88,12 @@ def hud_module(monkeypatch):
       CV=SimpleNamespace(MS_TO_KPH=3.6, MS_TO_MPH=2.2369362920544),
     ),
     "openpilot.selfdrive.ui.onroad.exp_button": SimpleNamespace(ExpButton=FakeExpButton),
+    "openpilot.system.hardware.usbgpu": SimpleNamespace(
+      usbgpu_badge_state=lambda compiled, loading, active, failed, compile_pending=False: (
+        "error" if failed else "loading" if loading else "compile_pending" if compile_pending
+        else "active" if active else "ready" if compiled else "not_compiled"
+      ),
+    ),
     "openpilot.selfdrive.ui.ui_state": SimpleNamespace(
       ui_state=fake_ui_state,
       UIStatus=SimpleNamespace(ENGAGED=1, DISENGAGED=2, OVERRIDE=3),
@@ -589,6 +601,7 @@ def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
   monkeypatch.setattr(renderer, "_refresh_hud_params", lambda now: calls.append(("params", now)))
   monkeypatch.setattr(renderer, "_draw_date_time", lambda rect: calls.append("date"))
   monkeypatch.setattr(renderer, "_draw_tpms", lambda rect: calls.append("tpms"))
+  monkeypatch.setattr(renderer, "_draw_egpu_badge", lambda rect: calls.append("egpu"))
   monkeypatch.setattr(renderer, "_draw_cruise_speed_animation", lambda rect: calls.append("animation"))
   monkeypatch.setattr(module.rl, "draw_rectangle_gradient_v", lambda *args: calls.append("header"))
   monkeypatch.setattr(module.time, "monotonic", lambda: 12.5)
@@ -602,5 +615,27 @@ def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
     ("plot", 6),
     "date",
     "tpms",
+    "egpu",
     "animation",
   ]
+
+
+def test_vehicle_navigation_profile_does_not_force_speed_with_cruise_off(hud_module):
+  module, _ = hud_module
+  sm = {
+    "longitudinalPlan": SimpleNamespace(cruiseTarget=0.0),
+    "carrotMan": SimpleNamespace(
+      vehicleNaviActive=True,
+      vehicleNaviSpeed=105,
+      desiredSpeed=105,
+      desiredSource="hda_section",
+    ),
+  }
+
+  override = module.SetSpeedOverride().compute(sm, set_speed_kph=105)
+
+  assert not override.active
+  assert override.speed_kph == 105
+  assert override.label == "MAX"
+  assert override.speed_color_mode == 0
+  assert not override.force_persist

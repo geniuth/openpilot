@@ -16,7 +16,13 @@ export const APP_DIALOG_VARIANT_CLASSES = Object.freeze([
   "app-dialog--form",
   "app-dialog--input",
   "app-dialog--progress",
+  "app-dialog--titleless",
+  "app-dialog--tools-device-info",
 ]);
+
+const APP_DIALOG_VARIANT_BY_NAME = Object.freeze({
+  "tools-device-info": "app-dialog--tools-device-info",
+});
 
 const MODAL_SURFACE_IDS = Object.freeze([
   "appDialog",
@@ -108,6 +114,7 @@ export function createDialogController(environment = {}) {
   const { target, documentRoot, setTimer, requestFrame, cancelFrame } = controllerEnvironment(environment);
   const element = (id) => documentRoot?.getElementById?.(id) ?? null;
   const appDialog = element("appDialog");
+  const appDialogSheet = appDialog?.querySelector?.(".app-dialog__sheet") ?? null;
   const appDialogBackdrop = element("appDialogBackdrop");
   const appDialogTitle = element("appDialogTitle");
   const appDialogBody = element("appDialogBody");
@@ -122,6 +129,51 @@ export function createDialogController(environment = {}) {
   let activeDialog = null;
   let dialogSerial = 0;
   let pendingRestoreFocus = null;
+  let dialogHistoryActive = false;
+  let dialogHistoryClosing = false;
+
+  // A same-URL entry lets mobile Back dismiss the dialog before the page
+  // router (or an underlying search/log panel) sees the navigation event.
+  function pushDialogHistory() {
+    if (!activeDialog || dialogHistoryActive || dialogHistoryClosing || !target.history?.pushState) return;
+    target.history.pushState({ ...target.history.state, appDialog: true }, "");
+    dialogHistoryActive = true;
+  }
+
+  function popDialogHistory() {
+    if (!dialogHistoryActive) return;
+    dialogHistoryActive = false;
+    if (!target.history?.state?.appDialog) return;
+    dialogHistoryClosing = true;
+    target.history.back();
+  }
+
+  function onHistoryPop(event) {
+    if (dialogHistoryClosing) {
+      dialogHistoryClosing = false;
+      event.stopImmediatePropagation();
+      // A choice can open another dialog before history.back() completes.
+      pushDialogHistory();
+      return;
+    }
+    if (!dialogHistoryActive) {
+      // Forward may revisit a dismissed dialog entry. Restore only its page;
+      // never replay a confirmation or resurrect a completed operation.
+      if (event.state?.appDialog) {
+        const { appDialog: ignored, ...pageState } = event.state;
+        target.history.replaceState(pageState, "");
+      }
+      return;
+    }
+    dialogHistoryActive = false;
+    event.stopImmediatePropagation();
+    if (activeDialog?.mode === "alert") resolveDialogState(activeDialog, true);
+    else cancelAppDialog();
+    // Submitting forms and asynchronous progress cancellation keep their
+    // dialog open, so they still need a guard for the next Back press.
+    pushDialogHistory();
+  }
+  target.addEventListener?.("popstate", onHistoryPop, true);
 
   const makeFocusTrap = environment.createFocusTrap ?? ((container, options) => createDefaultFocusTrap(
     container,
@@ -149,6 +201,10 @@ export function createDialogController(environment = {}) {
 
   function resetPresentation() {
     appDialog?.classList?.remove(...APP_DIALOG_VARIANT_CLASSES);
+    if (appDialogSheet) {
+      appDialogSheet.setAttribute("aria-labelledby", "appDialogTitle");
+      appDialogSheet.removeAttribute("aria-label");
+    }
     if (appDialogChoices) {
       appDialogChoices.className = "app-dialog__choices";
       appDialogChoices.style.removeProperty("--app-dialog-choice-columns");
@@ -204,10 +260,11 @@ export function createDialogController(environment = {}) {
     state.resolve(result);
   }
 
-  function resolveDialogState(state, result) {
+  function resolveDialogState(state, result, { keepHistory = false } = {}) {
     if (!state || activeDialog !== state || state.closing) return;
     state.closing = true;
     activeDialog = null;
+    if (!keepHistory) popDialogHistory();
     pendingRestoreFocus = state.lastFocus || pendingRestoreFocus;
     if (state.openFrame != null) {
       cancelFrame(state.openFrame);
@@ -308,7 +365,7 @@ export function createDialogController(environment = {}) {
     let inheritedLastFocus = pendingRestoreFocus;
     if (activeDialog) {
       inheritedLastFocus = activeDialog.lastFocus || inheritedLastFocus;
-      resolveDialogState(activeDialog, dialogCancelResult(activeDialog));
+      resolveDialogState(activeDialog, dialogCancelResult(activeDialog), { keepHistory: true });
     }
     pendingRestoreFocus = null;
 
@@ -332,8 +389,18 @@ export function createDialogController(environment = {}) {
     const isChoice = mode === "choice" || hasChoices;
     const choiceLayout = appDialogChoiceLayout(choiceGroups, options);
     const showCancel = mode !== "alert" && options.showCancel !== false;
+    const hideTitle = options.hideTitle === true;
+    const variantClass = APP_DIALOG_VARIANT_BY_NAME[options.variant];
 
     resetPresentation();
+    if (variantClass) appDialog.classList.add(variantClass);
+    if (hideTitle) {
+      appDialog.classList.add("app-dialog--titleless");
+      if (appDialogSheet) {
+        appDialogSheet.removeAttribute("aria-labelledby");
+        appDialogSheet.setAttribute("aria-label", options.dialogLabel || title);
+      }
+    }
     if (isForm) appDialog.classList.add("app-dialog--form");
     if (mode === "prompt" || isForm) appDialog.classList.add("app-dialog--input");
     if (hasChoices) {
@@ -403,6 +470,7 @@ export function createDialogController(environment = {}) {
         button.className = buttonClass;
         if (choice.labelHtml) button.innerHTML = choice.labelHtml;
         else button.textContent = String(choice.label);
+        if (choice.current || choice.selected) button.setAttribute("aria-current", "true");
         button.addEventListener("click", () => resolveAppDialog(choice.value));
         return button;
       };
@@ -474,6 +542,7 @@ export function createDialogController(environment = {}) {
         closeTimer: null,
       };
       activeDialog = state;
+      pushDialogHistory();
       appDialog.hidden = false;
       syncModalBodyLock();
 
@@ -517,6 +586,10 @@ export function createDialogController(environment = {}) {
       html: options.html,
       confirmLabel: options.confirmLabel,
       copyText: options.copyText,
+      copyLabel: options.copyLabel,
+      hideTitle: options.hideTitle,
+      dialogLabel: options.dialogLabel,
+      variant: options.variant,
     });
   }
 

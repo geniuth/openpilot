@@ -8,6 +8,11 @@ from openpilot.common.params import Params
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 
+HYUNDAI_LONGITUDINAL_KP = 1.0
+HYUNDAI_LONGITUDINAL_KI = 0.0
+HYUNDAI_LONGITUDINAL_KF = 1.0
+STOPPING_ACCEL = -0.5  # m/s^2; formerly StoppingAccel=-50
+
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
 
@@ -63,12 +68,34 @@ class LongControl:
 
     self.params = Params()
     self.readParamCount = 0
-    self.stopping_accel = 0
+    self.stopping_accel = STOPPING_ACCEL
     self.j_lead = 0.0
+
+    self.hyundai_fixed_longitudinal_tuning = CP.brand == "hyundai"
+    if self.hyundai_fixed_longitudinal_tuning:
+      self._apply_hyundai_longitudinal_tuning()
 
     self.use_accel_pid = False
     if CP.brand == "toyota":
       self.use_accel_pid = True
+
+  def _apply_hyundai_longitudinal_tuning(self):
+    # Hyundai, Kia, and Genesis all use the opendbc "hyundai" brand. Keep the
+    # complete acceleration/deceleration feedforward path intact instead of
+    # allowing a stale or unsafe persistent tuning value to override it.
+    self.pid._k_p = ([0.0], [HYUNDAI_LONGITUDINAL_KP])
+    self.pid._k_i = ([0.0], [HYUNDAI_LONGITUDINAL_KI])
+    self.pid.k_f = HYUNDAI_LONGITUDINAL_KF
+
+  def _refresh_longitudinal_tuning(self):
+    if self.hyundai_fixed_longitudinal_tuning:
+      self._apply_hyundai_longitudinal_tuning()
+    elif len(self.CP.longitudinalTuning.kpBP) == 1 and len(self.CP.longitudinalTuning.kiBP) == 1:
+      longitudinalTuningKpV = self.params.get_float("LongTuningKpV") * 0.01
+      longitudinalTuningKiV = self.params.get_float("LongTuningKiV") * 0.001
+      self.pid._k_p = (self.CP.longitudinalTuning.kpBP, [longitudinalTuningKpV])
+      self.pid._k_i = (self.CP.longitudinalTuning.kiBP, [longitudinalTuningKiV])
+      self.pid.k_f = self.params.get_float("LongTuningKf") * 0.01
 
   def reset(self):
     self.pid.reset()
@@ -84,14 +111,8 @@ class LongControl:
     self.readParamCount += 1
     if self.readParamCount >= 100:
       self.readParamCount = 0
-      self.stopping_accel = self.params.get_float("StoppingAccel") * 0.01
     elif self.readParamCount == 10:
-      if len(self.CP.longitudinalTuning.kpBP) == 1 and len(self.CP.longitudinalTuning.kiBP)==1:
-        longitudinalTuningKpV = self.params.get_float("LongTuningKpV") * 0.01
-        longitudinalTuningKiV = self.params.get_float("LongTuningKiV") * 0.001
-        self.pid._k_p = (self.CP.longitudinalTuning.kpBP, [longitudinalTuningKpV])
-        self.pid._k_i = (self.CP.longitudinalTuning.kiBP, [longitudinalTuningKiV])
-        self.pid.k_f = self.params.get_float("LongTuningKf") * 0.01
+      self._refresh_longitudinal_tuning()
 
 
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
@@ -114,8 +135,7 @@ class LongControl:
       if soft_hold_active:
         output_accel = self.CP.stopAccel
 
-      stopAccel = self.stopping_accel if self.stopping_accel < 0.0 else self.CP.stopAccel
-      if output_accel > stopAccel:
+      if output_accel > self.stopping_accel:
         output_accel = min(output_accel, 0.0)
         output_accel -= self.CP.stoppingDecelRate * DT_CTRL
       self.reset()

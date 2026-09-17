@@ -59,6 +59,7 @@ struct SchemaIndex {
 };
 
 constexpr size_t INVALID_DYNAMIC_SLOT = std::numeric_limits<size_t>::max();
+constexpr double SEGMENT_DURATION_SECONDS = 60.0;
 
 struct SeriesAccumulator {
   explicit SeriesAccumulator(size_t fixed_count = 0) : fixed_series(fixed_count) {}
@@ -68,12 +69,14 @@ struct SeriesAccumulator {
   std::vector<CanMessageData> can_messages;
   std::unordered_map<std::string, size_t> dynamic_slots;
   std::unordered_map<std::string, std::vector<size_t>> list_scalar_slots;
+  std::unordered_map<std::string, std::unordered_map<std::string, size_t>> text_value_slots;
   std::unordered_map<CanMessageId, size_t, CanMessageIdHash> can_message_slots;
   std::unordered_map<std::string, EnumInfo> enum_info;
 };
 
 void append_fixed_scalar_point(RouteSeries *series, double tm, double value);
 void append_dynamic_scalar_point(const std::string &path, double tm, double value, SeriesAccumulator *series);
+void append_text_point(const std::string &path, double tm, capnp::Text::Reader value, SeriesAccumulator *series);
 RouteSeries *ensure_list_scalar_series(const std::string &base_path, size_t index, SeriesAccumulator *series);
 void append_can_frame(CanServiceKind service,
                       uint8_t bus,
@@ -610,13 +613,13 @@ void append_log_event(cereal::Event::Which which,
       logs->push_back(std::move(entry));
       break;
     }
-    case cereal::Event::Which::OPERATING_SYSTEM_LOG: {
-      const auto operating_system_log = event.getOperatingSystemLog();
-      auto entry = make_entry(LogOrigin::OperatingSystem, operating_system_priority_to_level(operating_system_log.getPriority()));
-      entry.wall_time = operating_system_wall_time_seconds(operating_system_log.getTs());
-      entry.source = operating_system_log.hasTag() ? operating_system_log.getTag().cStr() : "operating_system";
-      entry.message = operating_system_log.hasMessage() ? operating_system_log.getMessage().cStr() : std::string();
-      entry.context = "pid=" + std::to_string(operating_system_log.getPid()) + ", tid=" + std::to_string(operating_system_log.getTid());
+    case cereal::Event::Which::ANDROID_LOG: {
+      const auto android_log = event.getAndroidLog();
+      auto entry = make_entry(LogOrigin::OperatingSystem, operating_system_priority_to_level(android_log.getPriority()));
+      entry.wall_time = operating_system_wall_time_seconds(android_log.getTs());
+      entry.source = android_log.hasTag() ? android_log.getTag().cStr() : "android";
+      entry.message = android_log.hasMessage() ? android_log.getMessage().cStr() : std::string();
+      entry.context = "pid=" + std::to_string(android_log.getPid()) + ", tid=" + std::to_string(android_log.getTid());
       if (!entry.message.empty()) {
         std::string err;
         if (const auto p = json11::Json::parse(entry.message, err); err.empty() && p.is_object()) {
@@ -627,7 +630,7 @@ void append_log_event(cereal::Event::Which which,
             entry.level = operating_system_priority_to_level(*pri);
           if (auto ts = json_u64_value(p["__REALTIME_TIMESTAMP"]); ts.has_value())
             entry.wall_time = operating_system_wall_time_seconds(*ts);
-          entry.context = format_journal_context(p, operating_system_log.getPid(), operating_system_log.getTid());
+          entry.context = format_journal_context(p, android_log.getPid(), android_log.getTid());
         }
       }
       logs->push_back(std::move(entry));
@@ -1045,6 +1048,31 @@ void append_dynamic_scalar_point(const std::string &path, double tm, double valu
   append_scalar_point(ensure_dynamic_series(path, series), path, tm, value);
 }
 
+void append_text_point(const std::string &path,
+                       double tm,
+                       capnp::Text::Reader value,
+                       SeriesAccumulator *series) {
+  EnumInfo &info = series->enum_info[path];
+  info.text_values = true;
+  const std::string text(value.begin(), value.size());
+  auto [it, inserted] = series->text_value_slots[path].try_emplace(text, info.names.size());
+  if (inserted) {
+    info.names.push_back(text);
+  }
+  const double category = static_cast<double>(it->second);
+  RouteSeries *text_series = ensure_dynamic_series(path, series);
+  if (text_series->values.empty()) {
+    append_scalar_point(text_series, path, tm, category);
+    append_scalar_point(text_series, path, tm, category);
+  } else if (text_series->values.back() == category) {
+    text_series->times.back() = tm;
+  } else {
+    text_series->times.back() = tm;
+    append_scalar_point(text_series, path, tm, category);
+    append_scalar_point(text_series, path, tm, category);
+  }
+}
+
 void append_event_fast(cereal::Event::Which which,
                        int32_t eidx_segnum,
                        kj::ArrayPtr<const capnp::word> data,
@@ -1113,10 +1141,18 @@ void merge_series_accumulator(SeriesAccumulator *dst, SeriesAccumulator *src) {
   }
 
   for (size_t i = 0; i < dst->fixed_series.size(); ++i) {
+    auto info_it = src->enum_info.find(src->fixed_series[i].path);
+    if (info_it != src->enum_info.end() && info_it->second.text_values) {
+      remap_text_series(&src->fixed_series[i], info_it->second, &dst->enum_info[info_it->first]);
+    }
     merge_route_series(&dst->fixed_series[i], &src->fixed_series[i]);
   }
   for (auto &series : src->dynamic_series) {
     if (series.path.empty()) continue;
+    auto info_it = src->enum_info.find(series.path);
+    if (info_it != src->enum_info.end() && info_it->second.text_values) {
+      remap_text_series(&series, info_it->second, &dst->enum_info[info_it->first]);
+    }
     RouteSeries &dst_series = dst->dynamic_series[ensure_dynamic_slot(series.path, dst)];
     merge_route_series(&dst_series, &series);
   }
@@ -1125,7 +1161,9 @@ void merge_series_accumulator(SeriesAccumulator *dst, SeriesAccumulator *src) {
     merge_can_message_data(&dst_message, &message);
   }
   for (auto &[path, info] : src->enum_info) {
-    dst->enum_info.try_emplace(path, std::move(info));
+    if (!info.text_values) {
+      dst->enum_info.try_emplace(path, std::move(info));
+    }
   }
 }
 
@@ -1318,6 +1356,28 @@ RouteData build_route_data(std::vector<RouteSeries> &&series_list,
   rebuild_gps_trace(&route_data);
   route_data.roots = collect_route_roots_for_paths(route_data.paths);
   return route_data;
+}
+
+void constrain_route_time_range_to_loaded_segments(RouteData *route_data,
+                                                    const std::map<int, SegmentLogs> &segments) {
+  if (route_data == nullptr || !route_data->has_time_range || segments.empty() || segments.begin()->first < 0) {
+    return;
+  }
+
+  // Route logs can contain metadata copied from earlier segments. Keep those samples available,
+  // but do not let them add an empty prefix to the default view for a partial route.
+  double loaded_min = static_cast<double>(segments.begin()->first) * SEGMENT_DURATION_SECONDS;
+  double loaded_max = static_cast<double>(segments.rbegin()->first + 1) * SEGMENT_DURATION_SECONDS;
+  if (loaded_max <= route_data->x_min || loaded_min >= route_data->x_max) {
+    loaded_max -= loaded_min;
+    loaded_min = 0.0;
+  }
+  const double constrained_min = std::max(route_data->x_min, loaded_min);
+  const double constrained_max = std::min(route_data->x_max, loaded_max);
+  if (constrained_max > constrained_min) {
+    route_data->x_min = constrained_min;
+    route_data->x_max = constrained_max;
+  }
 }
 
 const RouteSeries *find_route_series(const RouteData &route_data, std::string_view path) {
@@ -1882,6 +1942,7 @@ RouteData load_route_data(const std::string &route_name,
                                           std::move(artifacts.enum_info),
                                           metadata.car_fingerprint,
                                           resolved_dbc);
+  constrain_route_time_range_to_loaded_segments(&route_data, segments);
   route_data.route_id = make_route_identifier(route, segments);
   build_camera_index(segments, route_data, &SegmentLogs::fcamera, "roadEncodeIdx", &route_data.road_camera);
   build_camera_index(segments, route_data, &SegmentLogs::dcamera, "driverEncodeIdx", &route_data.driver_camera);

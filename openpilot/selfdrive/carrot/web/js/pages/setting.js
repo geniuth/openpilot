@@ -36,6 +36,13 @@ const settingValueRepository = carrotSettingsRuntime.values;
 const SETTING_VALUES_TTL_MS = settingValueRepository.defaultTtlMs;
 
 const SETTING_FAVORITES_GROUP = settingDerivedRuntime.ids.favoritesGroup;
+const SETTING_INLINE_SEARCH_GROUP = settingDerivedRuntime.ids.searchGroup;
+let settingInlineSearchQuery = "";
+let settingInlineSearchPreviousGroup = null;
+let settingInlineSearchTimer = null;
+const settingInlineSearchForm = document.getElementById("settingInlineSearch");
+const settingInlineSearchInput = document.getElementById("settingInlineSearchInput");
+const settingInlineSearchClear = document.getElementById("settingInlineSearchClear");
 const SETTING_FAVORITES_LONG_PRESS_MS = 620;
 const SETTING_FAVORITES_MOVE_TOLERANCE = 10;
 const settingProfileSectionExpandedState = new Map();
@@ -112,11 +119,23 @@ function getSettingProfilesLabel() {
 }
 
 function getSettingGroupsForDisplay() {
-  return getSettingDerivedModel().getGroupsForDisplay();
+  const groups = getSettingDerivedModel().getGroupsForDisplay();
+  groups.splice(1, 0, { group: SETTING_INLINE_SEARCH_GROUP, virtual: true });
+  return groups;
 }
 
 function getSettingItemEntriesForGroup(group) {
+  if (group === SETTING_INLINE_SEARCH_GROUP) return getSettingInlineSearchResults().entries;
   return getSettingDerivedModel().getItemEntriesForGroup(group);
+}
+
+function getSettingDetailEntries(group, name) {
+  if (group === SETTING_INLINE_SEARCH_GROUP) {
+    const entry = findSettingItemByName(name);
+    if (!entry) return [];
+    return entry.item.detail_parent ? [entry] : getSettingDerivedModel().getDetailEntries(entry.group, name);
+  }
+  return getSettingDerivedModel().getDetailEntries(group, name);
 }
 
 async function loadSettingPopularValues(force = false) {
@@ -218,6 +237,12 @@ async function toggleSettingFavorite(name) {
 }
 
 function getSettingGroupParamNames(group) {
+  if (group === SETTING_INLINE_SEARCH_GROUP) {
+    const entries = CURRENT_SETTING_DETAIL
+      ? getSettingDetailEntries(group, CURRENT_SETTING_DETAIL)
+      : getSettingItemEntriesForGroup(group);
+    return entries.map((entry) => entry.item.name);
+  }
   if (isSettingFavoritesGroup(group)) return getValidSettingFavoriteNames();
   const profile = getSettingProfileByGroup(group);
   if (profile) return getProfileSettingEntries(profile).map((entry) => entry.item.name).filter(Boolean);
@@ -365,7 +390,7 @@ async function presentSettingsEntry(catalog, options = {}) {
   rebuildSettingSearchEntries();
   syncSettingSearchFabState();
 
-  if (CURRENT_GROUP && !getSettingDerivedModel().getGroupMeta(CURRENT_GROUP)) {
+  if (CURRENT_GROUP && CURRENT_GROUP !== SETTING_INLINE_SEARCH_GROUP && !getSettingDerivedModel().getGroupMeta(CURRENT_GROUP)) {
     CURRENT_GROUP = null;
     CURRENT_SETTING_DETAIL = null;
   }
@@ -516,13 +541,126 @@ function renderGroups(options = {}) {
     profilesLabel: getSettingProfilesLabel(),
     getGroupLabel: getSettingGroupLabel,
   });
+  const restoreSearchFocus = document.activeElement === settingInlineSearchInput;
   settingViewRuntime.renderGroupList(box, plan, { animate: animateGroups });
+  mountSettingInlineSearch();
+  if (restoreSearchFocus) settingInlineSearchInput.focus({ preventScroll: true });
   scheduleSettingOverflowSync(box);
 }
 
 function getSettingGroupLabel(group) {
+  if (group === SETTING_INLINE_SEARCH_GROUP) return getUIText("setting_search_results", "Search results");
   return getSettingDerivedModel().getGroupLabel(group);
 }
+
+function getSettingInlineSearchResults() {
+  return getSettingDerivedModel().searchItemEntries(settingInlineSearchQuery);
+}
+
+function getSettingInlineSearchCountLabel() {
+  const { entries, total } = getSettingInlineSearchResults();
+  return getUIText("setting_inline_search_count", "Showing {shown} of {total}")
+    .replace("{shown}", String(entries.length)).replace("{total}", String(total));
+}
+
+function mountSettingInlineSearch(screen = null) {
+  if (!settingInlineSearchForm) return;
+  const itemsVisible = screen ? screen === "items" : screenItems?.style.display !== "none";
+  const inItems = CURRENT_GROUP === SETTING_INLINE_SEARCH_GROUP && itemsVisible
+    && isCarrotSettingTabActive() && !isCompactLandscapeMode();
+  const target = inItems ? screenItems : document.querySelector(".setting-inline-search-slot");
+  const focused = document.activeElement === settingInlineSearchInput;
+  const selection = focused ? [settingInlineSearchInput.selectionStart, settingInlineSearchInput.selectionEnd] : null;
+  if (target && settingInlineSearchForm.parentElement !== target) {
+    if (inItems) target.insertBefore(settingInlineSearchForm, document.getElementById("items"));
+    else target.appendChild(settingInlineSearchForm);
+    if (focused) {
+      settingInlineSearchInput.focus({ preventScroll: true });
+      settingInlineSearchInput.setSelectionRange(...selection);
+    }
+  }
+  document.getElementById("settingInlineSearchLabel").textContent = getUIText("setting_inline_search", "Find settings");
+  document.getElementById("settingInlineSearchHint").textContent = getUIText("setting_inline_search_hint", "Search names, descriptions and groups · Up to 20 results");
+  settingInlineSearchInput.placeholder = getUIText("setting_inline_search_placeholder", "e.g. deceleration, TF");
+  settingInlineSearchClear.setAttribute("aria-label", getUIText("setting_inline_search_clear", "Clear search"));
+  settingInlineSearchClear.hidden = !settingInlineSearchInput.value;
+  document.getElementById("settingInlineSearchStatus").textContent = settingInlineSearchQuery
+    ? getSettingInlineSearchCountLabel() : "";
+}
+
+function restoreSettingInlineSearch(query = "") {
+  clearTimeout(settingInlineSearchTimer);
+  settingInlineSearchTimer = null;
+  settingInlineSearchQuery = String(query).trim();
+  if (settingInlineSearchInput) settingInlineSearchInput.value = settingInlineSearchQuery;
+  settingValueRepository.invalidateGroup(SETTING_INLINE_SEARCH_GROUP);
+}
+
+async function applySettingInlineSearch() {
+  clearTimeout(settingInlineSearchTimer);
+  settingInlineSearchTimer = null;
+  if (!SETTINGS || CURRENT_PAGE !== "setting" || !isCarrotSettingTabActive()) return;
+  const query = settingInlineSearchInput.value.trim();
+  if (query === settingInlineSearchQuery && CURRENT_GROUP === SETTING_INLINE_SEARCH_GROUP
+    && !CURRENT_SETTING_DETAIL && isSettingItemsScreenActive()) return;
+  const wasSearching = CURRENT_GROUP === SETTING_INLINE_SEARCH_GROUP;
+  settingInlineSearchQuery = query;
+  // This virtual group's parameter set changes on each query and detail view.
+  settingValueRepository.invalidateGroup(SETTING_INLINE_SEARCH_GROUP);
+  ++settingRenderToken;
+  if (!query) {
+    if (wasSearching) {
+      const previous = settingInlineSearchPreviousGroup;
+      const group = getSettingDerivedModel().getGroupMeta(previous) ? previous : null;
+      if (group || isCompactLandscapeMode()) {
+        await activateSettingGroup(group || SETTING_FAVORITES_GROUP, false, { scrollMode: "restore", animateItems: false });
+      } else {
+        CURRENT_GROUP = null;
+        CURRENT_SETTING_DETAIL = null;
+        renderGroups({ animateGroups: false });
+        showSettingScreen("groups", false);
+        history.replaceState({ page: "setting", screen: "groups" }, "");
+      }
+    }
+    mountSettingInlineSearch();
+    return;
+  }
+  if (!wasSearching) {
+    settingInlineSearchPreviousGroup = CURRENT_GROUP;
+    saveCurrentSettingScrollPosition();
+  }
+  CURRENT_GROUP = SETTING_INLINE_SEARCH_GROUP;
+  CURRENT_SETTING_DETAIL = null;
+  const restoreInputFocus = document.activeElement === settingInlineSearchInput;
+  showSettingScreen("items", !wasSearching);
+  renderGroups({ animateGroups: false });
+  mountSettingInlineSearch("items");
+  if (restoreInputFocus) settingInlineSearchInput.focus({ preventScroll: true });
+  history.replaceState({ page: "setting", screen: "items", group: CURRENT_GROUP, inlineSearchQuery: query }, "");
+  await renderItems(SETTING_INLINE_SEARCH_GROUP, { animateItems: false });
+}
+
+function scheduleSettingInlineSearch(event) {
+  clearTimeout(settingInlineSearchTimer);
+  settingInlineSearchClear.hidden = !settingInlineSearchInput.value;
+  if (event?.isComposing) return;
+  settingInlineSearchTimer = window.setTimeout(() => {
+    applySettingInlineSearch().catch((e) => showAppToast(e.message, { tone: "error" }));
+  }, 160);
+}
+
+settingInlineSearchInput?.addEventListener("input", scheduleSettingInlineSearch);
+settingInlineSearchInput?.addEventListener("compositionstart", () => clearTimeout(settingInlineSearchTimer));
+settingInlineSearchInput?.addEventListener("compositionend", scheduleSettingInlineSearch);
+settingInlineSearchForm?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  applySettingInlineSearch().catch((e) => showAppToast(e.message, { tone: "error" }));
+});
+settingInlineSearchClear?.addEventListener("click", () => {
+  settingInlineSearchInput.value = "";
+  applySettingInlineSearch().then(() => settingInlineSearchInput.focus({ preventScroll: true }))
+    .catch((e) => showAppToast(e.message, { tone: "error" }));
+});
 
 // Control kinds a parameter may declare via its "control" field.
 const SETTING_CONTROL_KINDS = ["toggle", "segmented", "select", "slider"];
@@ -557,6 +695,7 @@ const SETTING_DISPLAY_UNIT_TYPES = Object.freeze({
   speedKph: "km/h",
   distanceCm: "cm",
   timeSec: "s",
+  timeMs: "ms",
   timeMin: "min",
   percent: "%",
   degree: "deg",
@@ -1506,6 +1645,7 @@ function resetSettingItemsViewport() {
 function hasRenderedSettingItems(group = CURRENT_GROUP) {
   const itemsBox = document.getElementById("items");
   if (!itemsBox || !group) return false;
+  if (group === SETTING_INLINE_SEARCH_GROUP && itemsBox.dataset.renderedSearchQuery !== settingInlineSearchQuery) return false;
   return itemsBox.dataset.renderedGroup === group && !itemsBox.dataset.renderedDetail && itemsBox.childElementCount > 0;
 }
 
@@ -1514,6 +1654,10 @@ function isCarrotSettingTabActive() {
 }
 
 function syncSettingGroupChrome(group = CURRENT_GROUP) {
+  mountSettingInlineSearch();
+  if (group === SETTING_INLINE_SEARCH_GROUP) {
+    history.replaceState({ ...history.state, inlineSearchQuery: settingInlineSearchQuery }, "");
+  }
   const meta = document.getElementById("groupMeta");
   const list = getSettingItemEntriesForGroup(group);
   const profile = getSettingProfileByGroup(group);
@@ -1530,7 +1674,8 @@ function syncSettingGroupChrome(group = CURRENT_GROUP) {
   }
   if (meta && group) {
     meta.classList.remove("setting-profile-meta");
-    meta.textContent = profile ? "" : `${group} / ${list.length}`;
+    meta.textContent = group === SETTING_INLINE_SEARCH_GROUP ? getSettingInlineSearchCountLabel()
+      : profile ? "" : `${group} / ${list.length}`;
   }
   if (group) {
     settingTitle.textContent = (UI_STRINGS[LANG].setting || "Setting") + " - " + groupLabel;
@@ -1578,6 +1723,7 @@ async function selectSettingDetail(group, name, pushHistory = true) {
   saveCurrentSettingScrollPosition(targetGroup);
   CURRENT_GROUP = targetGroup;
   CURRENT_SETTING_DETAIL = targetName;
+  if (targetGroup === SETTING_INLINE_SEARCH_GROUP) settingValueRepository.invalidateGroup(targetGroup);
   if (pushHistory) {
     history.pushState({
       page: "setting",
@@ -2187,6 +2333,7 @@ async function activateSettingGroup(group, pushHistory = true, options = {}) {
   if (!isCarrotSettingTabActive()) return;
   const nextGroup = group || CURRENT_GROUP;
   const previousGroup = CURRENT_GROUP;
+  if (group === SETTING_INLINE_SEARCH_GROUP && CURRENT_SETTING_DETAIL) settingValueRepository.invalidateGroup(group);
   CURRENT_SETTING_DETAIL = null;
   const scrollMode = options.scrollMode || "top";
   const animateItems = options.animateItems !== false;
@@ -2261,6 +2408,7 @@ async function activateSettingGroup(group, pushHistory = true, options = {}) {
 }
 
 function selectGroup(group, pushHistory = true) {
+  restoreSettingInlineSearch();
   const shouldPush = pushHistory && !(isCompactLandscapeMode() && CURRENT_PAGE === "setting");
   const options = (isCompactLandscapeMode() && CURRENT_PAGE === "setting")
     ? { animateGroups: false }
@@ -2304,10 +2452,11 @@ async function renderItems(group, options = {}) {
   itemsBox.innerHTML = "";
   delete itemsBox.dataset.renderedGroup;
   delete itemsBox.dataset.renderedDetail;
+  itemsBox.dataset.renderedSearchQuery = group === SETTING_INLINE_SEARCH_GROUP ? settingInlineSearchQuery : "";
 
   const allEntries = getSettingItemEntriesForGroup(group);
   const detailEntry = detailMode ? getSettingDetailEntry(group, detailName) : null;
-  const entries = detailMode ? (detailEntry ? [detailEntry] : []) : allEntries;
+  const entries = detailMode ? (detailEntry ? getSettingDetailEntries(group, detailName) : []) : allEntries;
   const list = entries.map((entry) => entry.item);
   const profile = getSettingProfileByGroup(group);
   if (screenItems) screenItems.classList.toggle("setting-screen-items--profile", Boolean(profile));
@@ -2315,11 +2464,15 @@ async function renderItems(group, options = {}) {
   CURRENT_SETTING_DETAIL = detailMode ? detailName : null;
   const groupLabel = getSettingGroupLabel(group);
   const detailTitle = detailMode && list[0] ? getSettingDetailTitle(list[0]) : "";
+  if (group === SETTING_INLINE_SEARCH_GROUP) {
+    history.replaceState({ ...history.state, inlineSearchQuery: settingInlineSearchQuery }, "");
+  }
   settingTitle.textContent = (UI_STRINGS[LANG].setting || "Setting") + " - " + (detailTitle || groupLabel);
   setSettingItemsTitle(detailTitle || groupLabel);
   if (meta) {
     meta.classList.remove("setting-profile-meta");
-    meta.textContent = profile && !detailMode ? "" : `${group} / ${detailMode ? "1" : list.length}`;
+    meta.textContent = group === SETTING_INLINE_SEARCH_GROUP && !detailMode ? getSettingInlineSearchCountLabel()
+      : profile && !detailMode ? "" : `${group} / ${detailMode ? "1" : list.length}`;
   }
 
   let values = {};
@@ -2367,6 +2520,16 @@ async function renderItems(group, options = {}) {
 
   if (profile && !detailMode) appendSettingProfileHeader(profile, itemsBox);
 
+  if (!list.length && group === SETTING_INLINE_SEARCH_GROUP) {
+    settingViewRuntime.renderEmptyState(itemsBox, {
+      title: getUIText("setting_search_empty", "No matching settings found."),
+      description: getUIText("setting_inline_search_hint", "Search names, descriptions and groups · Up to 20 results"),
+    });
+    itemsBox.dataset.renderedGroup = group;
+    requestAnimationFrame(resetSettingItemsViewport);
+    return;
+  }
+
   // Keep layout decisions independent from row controls: the plan opens a new
   // detail/favorites/category/profile container only where the structure changes.
   const itemLayout = settingViewRuntime.createItemLayoutPlan({
@@ -2375,6 +2538,8 @@ async function renderItems(group, options = {}) {
     detailMode,
     profile,
     favoriteMode: isSettingFavoritesGroup(group),
+    searchMode: group === SETTING_INLINE_SEARCH_GROUP,
+    getItemContextLabel: (originGroup, item) => getSettingDerivedModel().getItemContextLabel(originGroup, item),
     getSectionLabel: settingNodeLabel,
     getGroupLabel: getSettingGroupLabel,
     getProfileSectionExpanded: (stateKey) => settingProfileSectionExpandedState.has(stateKey)
@@ -2410,6 +2575,11 @@ async function renderItems(group, options = {}) {
     if (animateItems) el.style.setProperty("--i", String(index));
     el.dataset.settingName = name;
     el.dataset.settingGroup = originGroup;
+    if (detailMode && p.detail_parent) {
+      el.dataset.detailParent = p.detail_parent;
+      el.dataset.detailSection = p.detail_section || "";
+      el.classList.add("setting--detail-child");
+    }
     el.classList.toggle("is-favorite", isSettingFavorite(name));
 
     const top = document.createElement("div");
@@ -2479,7 +2649,7 @@ async function renderItems(group, options = {}) {
     let popularDetail = null;
     let historyBlock = null;
     let historyFullBlock = null;
-    if (detailMode) {
+    if (detailMode && index === 0) {
       contextPanel = settingContextRuntime.create({
         document,
         text: getUIText,
@@ -2782,12 +2952,17 @@ async function renderItems(group, options = {}) {
           className: "setting-choice-option",
         };
       });
+      const choiceLayout = window.CarrotUI?.settingsChoiceDialog?.resolveLayout?.(p, { name }) || "list";
+      const currentLabel = getSettingOptionLabel(name, current);
+      const choiceMeta = choiceLayout === "list"
+        ? `${getUIText("setting_choice_current", "Current")}: ${currentLabel}`
+        : rangeMeta;
       const selected = await openAppDialog({
         mode: "choice",
-        choiceLayout: "value-grid",
+        choiceLayout,
         title: title || name,
         html: true,
-        messageHtml: `<div class="setting-choice-dialog">${escapeHtml(name)}<br>${escapeHtml(rangeMeta)}</div>`,
+        messageHtml: `<div class="setting-choice-dialog">${escapeHtml(choiceMeta)}</div>`,
         choices,
         cancelLabel: getUIText("cancel", "Cancel"),
         showCancel: true,
@@ -2867,7 +3042,7 @@ async function renderItems(group, options = {}) {
         if (el.dataset.settingSuppressClick === "1") return;
         if (isSettingValueControlHit(event, el)) return;
         if (isSettingInlineControlTarget(event.target)) return;
-        selectSettingDetail(originGroup, name).catch(() => {});
+        selectSettingDetail(group === SETTING_INLINE_SEARCH_GROUP ? group : originGroup, name).catch(() => {});
       };
     }
   });
@@ -2875,6 +3050,8 @@ async function renderItems(group, options = {}) {
   itemsBox.dataset.renderedGroup = group;
   if (detailMode) itemsBox.dataset.renderedDetail = detailName;
   scheduleSettingOverflowSync(itemsBox);
+  window.CarrotSettingsExtensions?.sync?.({ group, detailMode, detailName, root: itemsBox });
+  // Legacy panels are migrated into CarrotSettingsExtensions in later phases.
   window.CarrotMapboxTokenSettings?.sync?.();
   window.CarrotYouTubeLiveSettings?.sync?.();
   syncSettingLiveRefresh();

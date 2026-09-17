@@ -22,13 +22,34 @@ from openpilot.selfdrive.carrot.radar_motion.predictor import (
 CUTIN_MAX_DREL_M = 80.0
 PRIMARY_DUPLICATE_MAX_DREL_DELTA_M = 3.5
 PRIMARY_DUPLICATE_MAX_YREL_DELTA_M = 1.8
+PRIMARY_PROXIMITY_MIN_VLEAD_DELTA_MPS = 2.5
 PRIMARY_ROW_MAX_DREL_DELTA_M = 8.0
 CUTIN_PRIMARY_FUTURE_MARGIN_M = 2.0
 FRONT_CUT_IN_MIN_DPATH_RATE_MPS = 0.75
+# Front-radar azimuth is coarse enough that a parallel adjacent target can
+# appear to move inward by nearly a metre without actually approaching the
+# ego corridor. Do not control on a forecast-only entry until the measured
+# target body is within 0.40 m of the path-overlap boundary.
+FRONT_PREDICTED_CUTIN_MAX_ABS_DPATH_M = 2.20
+CORNER_FAR_CUTIN_MAX_ABS_DPATH_M = 2.20
+CORNER_FAR_CUTIN_MIN_LONG_INWARD_MPS = 0.65
+CORNER_FAR_CUTIN_MIN_CLOSING_SPEED_MPS = 3.0
+CORNER_DISTANT_CURRENT_PATH_MIN_DREL_M = 45.0
+CORNER_DISTANT_CURRENT_PATH_MIN_INWARD_DISPLACEMENT_M = 0.35
 FRONT_NEAR_PATH_MAX_DREL_M = 10.0
 FRONT_NEAR_PATH_MIN_SHORT_INWARD_MPS = 0.50
 FRONT_NEAR_PATH_MIN_LONG_INWARD_MPS = 0.20
 FRONT_NEAR_PATH_MIN_REPORTED_INWARD_MPS = 0.15
+# A close slow target is normally discarded as position-only noise. Permit it
+# only when front and corner radar have independently associated the same
+# object and its measured front-radar history shows a sustained path entry.
+CROSS_SENSOR_CLOSE_CUTIN_MAX_DREL_M = 12.0
+CROSS_SENSOR_CLOSE_CUTIN_MIN_OVERLAP_S = 1.0
+CROSS_SENSOR_CLOSE_CUTIN_MIN_INWARD_DISPLACEMENT_M = 0.30
+CROSS_SENSOR_CLOSE_CUTIN_MIN_DIRECTIONAL_CONSISTENCY = 0.50
+CROSS_SENSOR_CLOSE_CUTIN_MIN_INWARD_SAMPLE_RATIO = 0.50
+CROSS_SENSOR_CLOSE_CUTIN_MIN_SHORT_INWARD_MPS = 0.25
+CROSS_SENSOR_CLOSE_CUTIN_MIN_LONG_INWARD_MPS = 0.20
 LEAD_TWO_POSITION_HOLD_S = 0.75
 LEAD_TWO_LONGITUDINAL_JUMP_M = 2.25
 LEAD_TWO_LATERAL_JUMP_M = 1.25
@@ -41,6 +62,12 @@ STATIONARY_SHADOW_MAX_DPATH_M = 0.75
 STATIONARY_SHADOW_MAX_ABS_VLEAD_MPS = 1.5
 STATIONARY_SHADOW_MIN_PRIMARY_VLEAD_MPS = 4.0
 STATIONARY_SHADOW_EQUIVALENCE_BRAKE_MPS2 = 2.5
+STATIONARY_PRIMARY_HANDOFF_MAX_ABS_VLEAD_MPS = 4.0
+STATIONARY_PRIMARY_HANDOFF_MAX_DPATH_M = 0.75
+STATIONARY_PRIMARY_HANDOFF_MIN_MODEL_PROBABILITY = 0.40
+STATIONARY_PRIMARY_HANDOFF_CONFIRMATION_S = 0.25
+STATIONARY_PRIMARY_HANDOFF_SUPPORT_HOLD_S = 1.0
+STATIONARY_PRIMARY_HANDOFF_MIN_CLOSER_MARGIN_M = 1.0
 
 
 @dataclass(frozen=True)
@@ -58,6 +85,7 @@ class DPathLeadCandidate:
   retainable: bool
   confirmed_cutin: bool
   confirmed_stationary_shadow: bool = False
+  allow_low_speed: bool = False
 
   @property
   def identity(self) -> tuple[str, int, int]:
@@ -191,11 +219,148 @@ class DPathStationaryShadowTracker:
     return replace(active, confirmed_stationary_shadow=confirmed)
 
 
+class DPathStationaryPrimaryHandoffTracker:
+  """Keep a vision-confirmed stopped corner hypothesis in leadTwo."""
+
+  def __init__(self) -> None:
+    self._identity: tuple[str, int, int] | None = None
+    self._since_s: float | None = None
+    self._last_primary_s: float | None = None
+    self._last_primary_candidate: DPathLeadCandidate | None = None
+
+  def reset(self) -> None:
+    self._identity = None
+    self._since_s = None
+    self._last_primary_s = None
+    self._last_primary_candidate = None
+
+  @staticmethod
+  def _eligible(candidate: DPathLeadCandidate) -> bool:
+    lead = candidate.lead
+    return (
+      candidate.source.startswith("corner")
+      and bool(lead.get("status"))
+      and abs(float(lead.get("vLead", 0.0)))
+      <= STATIONARY_PRIMARY_HANDOFF_MAX_ABS_VLEAD_MPS
+      and abs(float(lead.get("dPath", math.inf)))
+      <= STATIONARY_PRIMARY_HANDOFF_MAX_DPATH_M
+      and 0.8 < float(lead.get("dRel", 0.0))
+      <= STATIONARY_SHADOW_MAX_DREL_M
+    )
+
+  def _continuous(
+    self,
+    time_s: float,
+    candidate: DPathLeadCandidate,
+  ) -> bool:
+    previous_candidate = self._last_primary_candidate
+    previous_time_s = self._last_primary_s
+    if previous_candidate is None or previous_time_s is None:
+      return True
+    dt = float(time_s) - previous_time_s
+    if dt < 0.0 or dt > STATIONARY_PRIMARY_HANDOFF_SUPPORT_HOLD_S:
+      return False
+    previous = previous_candidate.lead
+    predicted_d_rel = (
+      float(previous.get("dRel", 0.0))
+      + float(previous.get("vRel", 0.0)) * dt
+    )
+    predicted_y_rel = (
+      float(previous.get("yRel", 0.0))
+      + float(previous.get("vLat", 0.0)) * dt
+    )
+    return (
+      abs(float(candidate.lead.get("dRel", 0.0)) - predicted_d_rel)
+      <= LEAD_TWO_LONGITUDINAL_JUMP_M
+      and abs(float(candidate.lead.get("yRel", 0.0)) - predicted_y_rel)
+      <= LEAD_TWO_LATERAL_JUMP_M
+    )
+
+  def update(
+    self,
+    time_s: float,
+    primary: dict[str, Any] | None,
+    candidates: Iterable[DPathLeadCandidate],
+    active_identity: tuple[str, int, int] | None,
+  ) -> DPathLeadCandidate | None:
+    time_s = float(time_s)
+    values = tuple(candidate for candidate in candidates if self._eligible(candidate))
+    primary_track_id = (
+      int(primary.get("radarTrackId", -1))
+      if primary is not None and primary.get("status") and primary.get("radar")
+      else -1
+    )
+    supported = tuple(
+      candidate for candidate in values
+      if float(candidate.lead.get("modelProb", 0.0))
+      >= STATIONARY_PRIMARY_HANDOFF_MIN_MODEL_PROBABILITY
+    )
+    primary_candidate = next((
+      candidate for candidate in supported
+      if candidate.track_id == primary_track_id
+    ), None)
+    if primary_candidate is None:
+      primary_candidate = min(
+        supported,
+        key=lambda candidate: (
+          abs(float(candidate.lead.get("dPath", math.inf))),
+          -float(candidate.lead.get("modelProb", 0.0)),
+          float(candidate.lead.get("dRel", math.inf)),
+        ),
+        default=None,
+      )
+    if (
+      primary_candidate is not None
+    ):
+      if (
+        primary_candidate.identity != self._identity
+        or not self._continuous(time_s, primary_candidate)
+      ):
+        self._identity = primary_candidate.identity
+        self._since_s = time_s
+      self._last_primary_candidate = primary_candidate
+      self._last_primary_s = time_s
+
+    if self._identity is None:
+      return None
+    candidate = next((
+      value for value in values if value.identity == self._identity
+    ), None)
+    if candidate is None or candidate.track_id == primary_track_id:
+      return None
+    if active_identity == self._identity:
+      return candidate
+    if (
+      self._last_primary_s is None
+      or time_s - self._last_primary_s
+      > STATIONARY_PRIMARY_HANDOFF_SUPPORT_HOLD_S
+      or not self._continuous(time_s, candidate)
+    ):
+      self.reset()
+      return None
+    if (
+      self._since_s is None
+      or time_s - self._since_s
+      < STATIONARY_PRIMARY_HANDOFF_CONFIRMATION_S
+    ):
+      return None
+    if primary is None or not primary.get("status"):
+      return None
+    if (
+      float(candidate.lead.get("dRel", math.inf))
+      + STATIONARY_PRIMARY_HANDOFF_MIN_CLOSER_MARGIN_M
+      >= float(primary.get("dRel", math.inf))
+    ):
+      return None
+    return replace(candidate, confirmed_stationary_shadow=True)
+
+
 def front_cutin_motion_supported(
   source: str,
   d_path_rate_long: float,
   *,
   d_rel: float = math.inf,
+  v_rel: float = 0.0,
   d_path: float = 0.0,
   d_path_rate_short: float = 0.0,
   reported_normal_speed: float = 0.0,
@@ -204,24 +369,97 @@ def front_cutin_motion_supported(
   directional_inward_displacement_m: float = 0.0,
   directional_consistency: float = 0.0,
   directional_inward_sample_ratio: float = 0.0,
+  corner_directional_entry: bool = False,
   tracked_close_entry: bool = False,
+  cross_sensor_confirmed: bool = False,
   minimum_directional_consistency: float = DIRECTIONAL_MIN_CONSISTENCY,
 ) -> bool:
   """Require strong motion or sustained direction-supported overlap from front."""
   if source != "frontRadar":
+    side = (
+      math.copysign(1.0, float(d_path))
+      if abs(float(d_path)) > 1e-6
+      else 0.0
+    )
+    if (
+      source.startswith("corner")
+      and not current_path_occupancy
+      and abs(float(d_path)) > CORNER_FAR_CUTIN_MAX_ABS_DPATH_M
+    ):
+      # Ego closing speed cannot prove a lateral merge: a stationary roadside
+      # vehicle closes at nearly ego speed too. Far corner-only targets must
+      # show strong measured path-relative inward motion of their own, or have
+      # already passed the predictor's strict directional-history entry gate.
+      return (
+        -side * float(d_path_rate_long)
+        >= CORNER_FAR_CUTIN_MIN_LONG_INWARD_MPS
+        or (
+          bool(corner_directional_entry)
+          and float(v_rel) <= -CORNER_FAR_CUTIN_MIN_CLOSING_SPEED_MPS
+        )
+      )
+    if (
+      source.startswith("corner")
+      and current_path_occupancy
+      and float(d_rel) >= CORNER_DISTANT_CURRENT_PATH_MIN_DREL_M
+    ):
+      return (
+        float(directional_inward_displacement_m)
+        >= CORNER_DISTANT_CURRENT_PATH_MIN_INWARD_DISPLACEMENT_M
+        and float(directional_consistency)
+        >= float(minimum_directional_consistency)
+        and float(directional_inward_sample_ratio)
+        >= DIRECTIONAL_MIN_INWARD_SAMPLE_RATIO
+        and -side * float(d_path_rate_long)
+        >= DIRECTIONAL_MIN_LONG_INWARD_RATE_MPS
+      )
     return True
-  if tracked_close_entry:
-    return True
-  if abs(float(d_path_rate_long)) >= FRONT_CUT_IN_MIN_DPATH_RATE_MPS:
-    return True
-
   side = (
     math.copysign(1.0, float(d_path))
     if abs(float(d_path)) > 1e-6
     else 0.0
   )
+  if tracked_close_entry:
+    return True
+  measured_near_path = (
+    abs(float(d_path)) <= FRONT_PREDICTED_CUTIN_MAX_ABS_DPATH_M
+  )
+  if (
+    cross_sensor_confirmed
+    and measured_near_path
+    and FRONT_CUT_IN_MIN_DREL_M <= float(d_rel)
+    <= CROSS_SENSOR_CLOSE_CUTIN_MAX_DREL_M
+    and float(predicted_path_overlap_s)
+    >= CROSS_SENSOR_CLOSE_CUTIN_MIN_OVERLAP_S
+    and float(directional_inward_displacement_m)
+    >= CROSS_SENSOR_CLOSE_CUTIN_MIN_INWARD_DISPLACEMENT_M
+    and float(directional_consistency)
+    >= CROSS_SENSOR_CLOSE_CUTIN_MIN_DIRECTIONAL_CONSISTENCY
+    and float(directional_inward_sample_ratio)
+    >= CROSS_SENSOR_CLOSE_CUTIN_MIN_INWARD_SAMPLE_RATIO
+    and -side * float(d_path_rate_short)
+    >= CROSS_SENSOR_CLOSE_CUTIN_MIN_SHORT_INWARD_MPS
+    and -side * float(d_path_rate_long)
+    >= CROSS_SENSOR_CLOSE_CUTIN_MIN_LONG_INWARD_MPS
+  ):
+    return True
+  # Front-radar azimuth quantization can create a high one-second dPath rate
+  # for a parallel vehicle. Do not bypass the measured direction history.
+  strong_directional_motion = (
+    measured_near_path
+    and -side * float(d_path_rate_long)
+    >= FRONT_CUT_IN_MIN_DPATH_RATE_MPS
+    and float(directional_consistency)
+    >= float(minimum_directional_consistency)
+    and float(directional_inward_sample_ratio)
+    >= DIRECTIONAL_MIN_INWARD_SAMPLE_RATIO
+  )
+  if strong_directional_motion:
+    return True
+
   directional_future_overlap = (
-    float(d_rel) >= FRONT_CUT_IN_MIN_DREL_M
+    measured_near_path
+    and float(d_rel) >= FRONT_CUT_IN_MIN_DREL_M
     and float(predicted_path_overlap_s)
     >= FULL_PREDICTED_PATH_OVERLAP_SUPPORT_S
     and float(directional_inward_displacement_m)
@@ -303,7 +541,9 @@ class DPathLeadTwoTracker:
       candidate
       for candidate in candidate_values
       if (
-        candidate.identity == self.active_identity
+        self.active_identity is not None
+        and candidate.source == self.active_identity[0]
+        and candidate.continuity_id == self.active_identity[2]
         and candidate.retainable
         and self._position_continuous(time_s, candidate)
       )
@@ -322,13 +562,19 @@ class DPathLeadTwoTracker:
       (candidate.lead for candidate in eligible),
       v_ego,
       allow_stopped_track_ids=frozenset(
-        candidate.track_id for candidate in active_candidates
+        int(candidate.lead.get("radarTrackId", candidate.track_id))
+        for candidate in active_candidates
       ) | frozenset(
-        candidate.track_id for candidate in eligible
-        if candidate.confirmed_stationary_shadow
+        int(candidate.lead.get("radarTrackId", candidate.track_id))
+        for candidate in eligible
+        if (
+          candidate.confirmed_stationary_shadow
+          or candidate.allow_low_speed
+        )
       ),
       allow_farther_track_ids=frozenset(
-        candidate.track_id for candidate in eligible
+        int(candidate.lead.get("radarTrackId", candidate.track_id))
+        for candidate in eligible
         if (
           candidate.confirmed_stationary_shadow
           or (
@@ -338,7 +584,8 @@ class DPathLeadTwoTracker:
         )
       ),
       allow_primary_proximity_track_ids=frozenset(
-        candidate.track_id for candidate in eligible
+        int(candidate.lead.get("radarTrackId", candidate.track_id))
+        for candidate in eligible
         if (
           candidate.confirmed_stationary_shadow
           or (
@@ -365,9 +612,13 @@ class DPathLeadTwoTracker:
       ),
       v_ego,
       allow_stopped_track_ids=frozenset(
-        candidate.track_id
+        int(candidate.lead.get("radarTrackId", candidate.track_id))
         for candidate in active_candidates
         if candidate.confirmed_cutin
+      ) | frozenset(
+        int(candidate.lead.get("radarTrackId", candidate.track_id))
+        for candidate in eligible
+        if candidate.confirmed_cutin and candidate.allow_low_speed
       ),
     )
     selection = DPathLeadSelection(
@@ -445,7 +696,7 @@ def cutin_can_compete_with_primary(
   primary_d_rel = float(primary.get("dRel", math.inf))
   if not math.isfinite(lead_d_rel) or not math.isfinite(primary_d_rel):
     return False
-  if entry_horizon_s is not None and float(entry_horizon_s) > 0.0:
+  if entry_horizon_s is not None and float(entry_horizon_s) >= 0.0:
     horizon_s = float(entry_horizon_s)
     lead_future_d_rel = (
       lead_d_rel + float(lead.get("vRel", 0.0)) * horizon_s
@@ -503,8 +754,15 @@ def select_dpath_lead_two(
         )
         and (
           not lead_duplicates_primary(lead, primary)
-          or int(lead.get("radarTrackId", -1))
-          in allow_primary_proximity_track_ids
+          or (
+            int(lead.get("radarTrackId", -1))
+            in allow_primary_proximity_track_ids
+            and primary is not None
+            and abs(
+              float(lead.get("vLead", 0.0))
+              - float(primary.get("vLead", 0.0))
+            ) > PRIMARY_PROXIMITY_MIN_VLEAD_DELTA_MPS
+          )
         )
       )
     ),

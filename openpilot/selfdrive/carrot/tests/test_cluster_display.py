@@ -23,7 +23,7 @@ from cluster_display import (
   speed_unit,
 )
 from cluster_renderer import ClusterUiRenderer
-from main import ClusterDisplayPreferencesParamReader
+from main import ClusterClockVisibilityParamReader, ClusterDisplayPreferencesParamReader
 
 
 @pytest.mark.parametrize(
@@ -78,6 +78,33 @@ def test_display_preference_reader_uses_param_defaults_and_values():
 
   reader._params = FakeParams({})
   assert reader.read() == ("ko", True)
+
+
+@pytest.mark.parametrize(
+  ("show_date_time", "expected"),
+  ((0, False), (1, True), (2, True), (3, False)),
+)
+def test_cluster_clock_visibility_follows_show_date_time(show_date_time, expected):
+  class FakeParams:
+    def get_int(self, name):
+      assert name == "ShowDateTime"
+      return show_date_time
+
+  reader = object.__new__(ClusterClockVisibilityParamReader)
+  reader._params = FakeParams()
+
+  assert reader.read() is expected
+
+
+def test_cluster_clock_visibility_fails_visible():
+  class FailingParams:
+    def get_int(self, _name):
+      raise RuntimeError("read failed")
+
+  reader = object.__new__(ClusterClockVisibilityParamReader)
+  reader._params = FailingParams()
+
+  assert reader.read() is True
 
 
 def test_trip_report_draws_english_imperial_labels(monkeypatch):
@@ -201,6 +228,69 @@ def test_trip_report_follows_current_cluster_theme(monkeypatch, theme):
     target_fill=theme.panel_bg,
   )
   assert [line[3] for line in angle_lines] == [theme.faint, theme.faint]
+
+
+def test_trip_report_cache_refreshes_once_per_second_and_on_context_changes():
+  renderer = object.__new__(ClusterUiRenderer)
+  renderer.width = cluster_renderer.DESIGN_WIDTH
+  renderer.height = cluster_renderer.DESIGN_HEIGHT
+  renderer.language = "ko"
+  renderer.is_metric = True
+  renderer.panel_layout = cluster_renderer.CLUSTER_PANEL_LAYOUT_DRIVING_LEFT
+  renderer._trip_report_target = None
+  renderer._trip_report_cache_key = None
+  renderer._trip_report_cache_valid = False
+  renderer._trip_report_cache_visible = False
+  renderer._trip_report_cache_next_refresh = 0.0
+  renderer._profile_start = lambda: None
+  renderer._profile_add = lambda *_args: None
+
+  current_theme = [LIGHT_CLUSTER_THEME]
+  renderer._current_theme = lambda: current_theme[0]
+  renderer._effective_screen_mode = lambda state: state.mode
+  refreshes = []
+
+  def refresh(state):
+    refreshes.append(state.mode)
+    renderer._trip_report_target = SimpleNamespace()
+
+  renderer._refresh_trip_report_cache = refresh
+  state = SimpleNamespace(mode=cluster_renderer.CLUSTER_SCREEN_MODE_TRIP_REPORT)
+
+  renderer._prepare_trip_report_cache(state, now=10.0)
+  renderer._prepare_trip_report_cache(state, now=10.9)
+  assert len(refreshes) == 1
+
+  current_theme[0] = DARK_CLUSTER_THEME
+  renderer._prepare_trip_report_cache(state, now=10.9)
+  assert len(refreshes) == 2
+
+  state.mode = cluster_renderer.CLUSTER_SCREEN_MODE_DEFAULT
+  renderer._prepare_trip_report_cache(state, now=10.95)
+  state.mode = cluster_renderer.CLUSTER_SCREEN_MODE_TRIP_REPORT
+  renderer._prepare_trip_report_cache(state, now=10.96)
+  assert len(refreshes) == 3
+
+
+def test_trip_report_cache_draws_one_texture_instead_of_panel_contents(monkeypatch):
+  renderer = object.__new__(ClusterUiRenderer)
+  renderer.panel_layout = cluster_renderer.CLUSTER_PANEL_LAYOUT_DRIVING_LEFT
+  renderer.screen_mode = cluster_renderer.CLUSTER_SCREEN_MODE_TRIP_REPORT
+  texture = SimpleNamespace(width=792, height=478)
+  renderer._trip_report_target = SimpleNamespace(texture=texture)
+  renderer._trip_report_cache_valid = True
+  renderer._draw_trip_report_panel_contents = lambda _state: pytest.fail("cached panel was redrawn")
+  draws = []
+  monkeypatch.setattr(cluster_renderer, "rl_color", lambda color: color)
+  monkeypatch.setattr(cluster_renderer.rl, "draw_texture_pro", lambda *args: draws.append(args))
+
+  renderer._draw_trip_report_panel(SimpleNamespace())
+
+  assert len(draws) == 1
+  assert draws[0][0] is texture
+  assert draws[0][1].height == -478.0
+  assert (draws[0][2].x, draws[0][2].y) == (1124.0, 1.0)
+  assert (draws[0][2].width, draws[0][2].height) == (792.0, 478.0)
 
 
 @pytest.mark.parametrize(

@@ -3,6 +3,8 @@ import numpy as np
 
 from openpilot.cereal import car
 from openpilot.common.constants import CV
+from openpilot.selfdrive.carrot.carrot_man_input import get_carrot_man
+from openpilot.selfdrive.carrot.cruise_gap import cruise_gap_levels, next_gap_personality, supported_gap_levels
 
 from opendbc.car import structs
 GearShifter = structs.CarState.GearShifter
@@ -21,6 +23,9 @@ IMPERIAL_INCREMENT = round(CV.MPH_TO_KPH, 1)  # round here to avoid rounding err
 ButtonEvent = car.CarState.ButtonEvent
 ButtonType = car.CarState.ButtonEvent.Type
 CRUISE_LONG_PRESS = 50
+# Keep automatic re-engagement out of parking/full-lock turns. Hyundai EPS
+# fault avoidance begins at 85 degrees, so leave margin below that boundary.
+AUTO_CRUISE_MAX_STEERING_ANGLE = 70.0
 CRUISE_NEAREST_FUNC = {
   ButtonType.accelCruise: math.ceil,
   ButtonType.decelCruise: math.floor,
@@ -29,6 +34,10 @@ CRUISE_INTERVAL_SIGN = {
   ButtonType.accelCruise: +1,
   ButtonType.decelCruise: -1,
 }
+
+
+def is_hold_interlock_active(CS) -> bool:
+  return CS.brakeHoldActive or CS.parkingBrake
 
 
 class VCruiseHelper:
@@ -186,10 +195,14 @@ class VCruiseCarrot:
     self._brake_pressed_count = 0
     self._soft_hold_count = 0
     self._soft_hold_active = 0
+    self.soft_hold_on_cancel = self.params.get_bool("SoftHoldOnCancel")
     self._cruise_ready = False
     self._cruise_cancel_state = False
     self._pause_auto_speed_up = False
     self._activate_cruise = 0
+    self._cruise_available = False
+    self._hold_interlock_active = False
+    self._steering_interlock_active = False
     self._lat_enabled = self.params.get_int("AutoEngage") > 0
     self._v_cruise_kph_at_brake = 0
     self.cruise_state_available_last = False
@@ -253,6 +266,7 @@ class VCruiseCarrot:
     unit_factor = 1.0 if is_metric else CV.MPH_TO_KPH
     if self.frame % 10 == 0:
       self.autoCruiseControl = self.params.get_int("AutoCruiseControl") * unit_factor
+      self.soft_hold_on_cancel = self.params.get_bool("SoftHoldOnCancel")
       self.autoGasTokSpeed = self.params.get_int("AutoGasTokSpeed") * unit_factor
       self.autoGasCancelSpeed = self.params.get_int("AutoGasCancelSpeed") * unit_factor
       self.autoGasSyncSpeed = self.params.get_int("AutoGasSyncSpeed")
@@ -289,6 +303,20 @@ class VCruiseCarrot:
           cruiseSpeed1 = self.nRoadLimitSpeed + self.autoRoadSpeedLimitOffset
       self._cruise_speed_table = [cruiseSpeed1, cruiseSpeed2, cruiseSpeed3, cruiseSpeed4, cruiseSpeed5]
 
+  def _update_carrot_man(self, sm):
+    carrot_man = get_carrot_man(sm)
+    if carrot_man is not None:
+      self.nRoadLimitSpeed = carrot_man.nRoadLimitSpeed
+      self.desiredSpeed = carrot_man.desiredSpeed
+      self.carrot_cmd_index = carrot_man.carrotCmdIndex
+      self.carrot_cmd = carrot_man.carrotCmd
+      self.carrot_arg = carrot_man.carrotArg
+    else:
+      self.nRoadLimitSpeed = 0
+      self.desiredSpeed = 250
+      self.carrot_cmd = ""
+      self.carrot_arg = ""
+
   def update_v_cruise(self, CS, sm, is_metric):
     self._add_log("")
     self.update_params(is_metric)
@@ -308,13 +336,7 @@ class VCruiseCarrot:
       self.autoCruiseControl_cancel_timer = max(0, self.autoCruiseControl_cancel_timer - 1)
 
     CC = sm['carControl']
-    if sm.alive['carrotMan']:
-      carrot_man = sm['carrotMan']
-      self.nRoadLimitSpeed = carrot_man.nRoadLimitSpeed
-      self.desiredSpeed = carrot_man.desiredSpeed
-      self.carrot_cmd_index = carrot_man.carrotCmdIndex
-      self.carrot_cmd = carrot_man.carrotCmd
-      self.carrot_arg = carrot_man.carrotArg
+    self._update_carrot_man(sm)
     if sm.alive['longitudinalPlan']:
       lp = sm['longitudinalPlan']
       self.xState = lp.xState
@@ -336,6 +358,20 @@ class VCruiseCarrot:
     #self.events = []
     self.v_ego_kph_set = int(CS.vEgoCluster * CV.MS_TO_KPH + 0.5)
     self._activate_cruise = 0
+    self._cruise_available = CS.cruiseState.available
+    if not self._cruise_available:
+      self._cruise_ready = False
+      self._paddle_decel_active = False
+      self._soft_hold_count = 0
+      self._soft_hold_active = 0
+    self._hold_interlock_active = is_hold_interlock_active(CS)
+    self._steering_interlock_active = abs(CS.steeringAngleDeg) >= AUTO_CRUISE_MAX_STEERING_ANGLE
+    if self._hold_interlock_active:
+      # Drop queued automatic engagement state while AVH or the parking brake
+      # owns longitudinal control.
+      self._cruise_ready = False
+      self._paddle_decel_active = False
+      self._soft_hold_active = 0
     self._prepare_brake_gas(CS, CC)
     if CC.enabled:
       self._cruise_ready = False
@@ -599,11 +635,14 @@ class VCruiseCarrot:
         self._cruise_speed_initialized = True
 
       elif button_type == ButtonType.gapAdjustCruise:
-        longitudinalPersonalityMax = self.params.get_int("LongitudinalPersonalityMax")
-        if CS.pcmCruiseGap == 0:
-          personality = (self.params.get_int('LongitudinalPersonality') - 1) % longitudinalPersonalityMax
+        longitudinalPersonalityMax = supported_gap_levels(self.params.get_int("LongitudinalPersonalityMax"))
+        gap_levels = cruise_gap_levels(self.params.get_int("CruiseGapLevels"), longitudinalPersonalityMax)
+        if not self.CP.openpilotLongitudinalControl:
+          gap_levels = longitudinalPersonalityMax
+        if CS.pcmCruiseGap == 0 or gap_levels < longitudinalPersonalityMax:
+          personality = next_gap_personality(self.params.get_int('LongitudinalPersonality'), gap_levels)
         else:
-          personality = np.clip(CS.pcmCruiseGap - 1, 0, longitudinalPersonalityMax)
+          personality = int(np.clip(CS.pcmCruiseGap - 1, 0, longitudinalPersonalityMax - 1))
         self.params.put_int_nonblocking('LongitudinalPersonality', personality)
         #self.events.append(EventName.personalityChanged)
       elif button_type == ButtonType.lfaButton:
@@ -717,8 +756,20 @@ class VCruiseCarrot:
     self.nRoadLimitSpeed_last = self.nRoadLimitSpeed
     return v_cruise_kph
 
-  def _cruise_control(self, enable, cancel_timer, reason):
-    if self._cruise_cancel_state: # and self._soft_hold_active != 2:
+  def _cruise_control(self, enable, cancel_timer, reason, allow_cancel_state=False):
+    if enable > 0 and not self._cruise_available:
+      self._activate_cruise = 0
+      self._add_log(reason + " > Cruise unavailable")
+      return
+    if enable > 0 and self._steering_interlock_active:
+      self._activate_cruise = 0
+      self._add_log(reason + " > Steering angle interlock active")
+      return
+    if enable > 0 and self._hold_interlock_active:
+      self._activate_cruise = 0
+      self._add_log(reason + " > Brake hold interlock active")
+      return
+    if self._cruise_cancel_state and not allow_cancel_state:
       self._add_log(reason + " > Cancel state")
     elif enable > 0 and self._cancel_timer > 0 and cancel_timer >= 0:
       enable = 0
@@ -750,13 +801,16 @@ class VCruiseCarrot:
     else:
       return False, d_final
 
+  def _engage_soft_hold(self):
+    self._soft_hold_active = 2
+    self._cruise_control(1, -1, "Cruise on (soft hold)", allow_cancel_state=self.soft_hold_on_cancel)
+
   def _update_cruise_state(self, CS, CC, v_cruise_kph):
     if not CC.enabled:
       #self._pause_auto_speed_up = False
       if self._brake_pressed_count == -1 and self._soft_hold_active > 0:
-        self._soft_hold_active = 2
         #self.autoCruiseControl_cancel_timer = 0
-        self._cruise_control(1, -1, "Cruise on (soft hold)")
+        self._engage_soft_hold()
       # GM: autoResume
       elif self.params.get_bool("ActivateCruiseAfterBrake"):
         self.params.put_bool_nonblocking("ActivateCruiseAfterBrake", False)
@@ -858,15 +912,18 @@ class VCruiseCarrot:
   def _prepare_brake_gas(self, CS, CC):
     if CS.gasPressed:
       gas_pressed_start = self._gas_pressed_count <= 0
+      cancel_soft_hold = gas_pressed_start and self._soft_hold_active > 0 and self._cruise_cancel_state
       self._paddle_decel_active = False
       self._gas_pressed_count = max(1, self._gas_pressed_count + 1)
       self._gas_pressed_count_last = self._gas_pressed_count
       self._gas_pressed_value = max(CS.gas, self._gas_pressed_value) if self._gas_pressed_count > 1 else CS.gas
       self._gas_tok = False
-      #if self._cruise_cancel_state and self._soft_hold_active == 2:
-      #  self._cruise_control(-1, -1, "Cruise off,softhold mode (gasPressed)")
       self._soft_hold_active = 0
-      if gas_pressed_start and self.disengage_on_accelerator:
+      if cancel_soft_hold:
+        self._cruise_ready = False
+        self.carrot_cruise_active = False
+        self._cruise_control(-1, -1, "Cruise off (cancel soft hold released)", allow_cancel_state=True)
+      elif gas_pressed_start and self.disengage_on_accelerator:
         self._cruise_ready = False
         self.carrot_cruise_active = False
         self._cruise_control(-1, 0, "Cruise off (gas pressed)")
@@ -884,8 +941,11 @@ class VCruiseCarrot:
       if self._brake_pressed_count == 1 and self.enabled_last:
         self._v_cruise_kph_at_brake = self.v_cruise_kph
         self._add_log(f"{self.v_cruise_kph} Cruise speed at brake")
-      self._soft_hold_count = self._soft_hold_count + 1 if CS.vEgo < 0.1 and CS.gearShifter == GearShifter.drive else 0
-      if self.autoCruiseControl == 0 or self.CP.pcmCruise:
+      soft_hold_available = CS.cruiseState.available and self.autoCruiseControl != 0 and not self.CP.pcmCruise and \
+                            self.autoCruiseControl_cancel_timer == 0 and \
+                            (not self._cruise_cancel_state or self.soft_hold_on_cancel)
+      self._soft_hold_count = self._soft_hold_count + 1 if soft_hold_available and CS.vEgo < 0.1 and CS.gearShifter == GearShifter.drive else 0
+      if not soft_hold_available:
         self._soft_hold_active = 0
       else:
         self._soft_hold_active = 1 if self._soft_hold_count > 60 else 0

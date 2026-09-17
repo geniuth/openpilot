@@ -94,8 +94,8 @@ class CarControllerParams:
       self.STEERING_POWER_STEP     = 2     # HCA_03 steering power counter steps
       self.HOLD_RELEASE_MAX_STEPS  = 100   # sustain ACC_Anfahren up to ~2s (ACC_CONTROL_STEP based)
       self.HOLD_RELEASE_DONE_SPEED = 0.3   # m/s, above this the car has actually launched
-      # ACC_Anforderung_HMS를 HALTEN(1)/ANFAHREN(4)에서 KEINE_ANFORDERUNG(0)으로 직행시키면
-      # 차가 P로 폴트난다 (commaai/opendbc). 이 속도 미만에서는 LOESEN_UEBER_RAMPE(5)를 경유한다.
+      # Dropping ACC_Anforderung_HMS straight from HALTEN(1)/ANFAHREN(4) to KEINE_ANFORDERUNG(0)
+      # can fault the car into park (commaai/opendbc). Pass through LOESEN_UEBER_RAMPE(5) below this speed.
       self.HOLD_RELEASE_SPEED      = 5 * CV.KPH_TO_MS  # m/s
 
       self.CURVATURE_LIMITS: CurvatureSteeringLimits = CurvatureSteeringLimits(0.195)

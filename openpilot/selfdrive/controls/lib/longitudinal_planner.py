@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import math
 import numpy as np
 
 import openpilot.cereal.messaging as messaging
@@ -9,10 +8,20 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
-from openpilot.cereal import car
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, N
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, is_volkswagen_meb
+from openpilot.selfdrive.controls.lib.cutin_predecel import (
+  apply_cutin_predecel_accel_limit,
+  get_cutin_predecel_accel_limit,
+)
+from openpilot.selfdrive.controls.lib.longitudinal_preview import (
+  apply_preview_target,
+  clip_preview_offset,
+  get_lead_preview_request,
+  rate_limit_preview,
+)
+from openpilot.selfdrive.controls.lib.turn_accel import get_future_curvature, limit_accel_in_turns
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
@@ -26,8 +35,6 @@ CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.5
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 RESET_DECEL_RAMP_TIME = 2.0
-TURN_CURVATURE_LOOKAHEAD = 1.0
-TURN_CURVATURE_MIN_SPEED = 3.0
 
 
 def get_max_accel(v_ego):
@@ -36,50 +43,6 @@ def get_max_accel(v_ego):
 def get_coast_accel(pitch):
   return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
 
-
-def get_future_curvature(model_msg, fallback_curvature, lookahead=TURN_CURVATURE_LOOKAHEAD):
-  if (len(model_msg.orientationRate.z) != ModelConstants.IDX_N or
-      len(model_msg.velocity.x) != ModelConstants.IDX_N):
-    return fallback_curvature
-
-  yaw_rate_future = float(np.interp(lookahead, ModelConstants.T_IDXS, model_msg.orientationRate.z))
-  velocity_future = float(np.interp(lookahead, ModelConstants.T_IDXS, model_msg.velocity.x))
-  if not (np.isfinite(yaw_rate_future) and np.isfinite(velocity_future)):
-    return fallback_curvature
-
-  return yaw_rate_future / max(abs(velocity_future), TURN_CURVATURE_MIN_SPEED)
-
-def limit_accel_in_turns(v_ego, curvature, a_target, a_lat_max,
-                         safety_ratio=0.70,   # 0.60~0.85 (작을수록 더 얌전)
-                         min_v=0.1):
-  """
-  v_ego    : m/s
-  curvature: 1/m  (sign 포함)
-  a_target : [a_min, a_max] (m/s^2)
-  a_lat_max: 허용 최대 횡가속 (m/s^2)
-
-  safety_ratio:
-    a_lat_max에 소프트 마진을 주는 비율.
-    예) a_lat_max=4, safety_ratio=0.7 -> 실사용 한계 2.8로 계산.
-
-  return   : [a_min, 제한된 a_max]
-  """
-  if v_ego < min_v or a_lat_max <= 0.0:
-    return a_target
-
-  a_lat_eff = abs(a_lat_max) * float(safety_ratio)
-
-  # 횡가속
-  a_y_abs = abs((v_ego * v_ego) * curvature)
-
-  # 남은 종가속 여유 (원형 경계)
-  if a_y_abs >= a_lat_eff:
-    a_x_allowed = 0.0
-  else:
-    a_x_allowed = math.sqrt(a_lat_eff * a_lat_eff - a_y_abs * a_y_abs)
-
-  # a_target = [min, max] 중 max만 제한
-  return [a_target[0], min(a_target[1], a_x_allowed)]
 
 class LongitudinalPlanner:
   def __init__(self, CP, init_v=0.0, init_a=0.0, dt=DT_MDL):
@@ -95,9 +58,15 @@ class LongitudinalPlanner:
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.prev_accel_clip = [ACCEL_MIN, ACCEL_MAX]
     self.output_a_target = 0.0
+    self.output_a_target_base = 0.0
     self.output_v_target_now = 0.0
     self.output_j_target_now = 0.0
     self.output_should_stop = False
+    self.lead_preview = 0.0
+    self.lead_preview_action_time = 0.0
+    self.lead_preview_accel = 0.0
+    self.lead_track_ids = [-1, -1]
+    self.lead_track_frames = [0, 0]
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
     self.a_desired_trajectory = np.zeros(CONTROL_N)
@@ -107,10 +76,23 @@ class LongitudinalPlanner:
     self.vCluRatio = 1.0
     self.reset_decel_timer = 0
     self.reset_decel_start_a = 0.0
-    
+
     self.v_cruise_kph = 0.0
 
     self.params = Params()
+
+  def update_lead_tracks(self, radar_state):
+    for index, lead in enumerate((radar_state.leadOne, radar_state.leadTwo)):
+      track_id = int(lead.radarTrackId) if lead.status and lead.radar and lead.radarTrackId >= 0 else -1
+      if track_id >= 0 and track_id == self.lead_track_ids[index]:
+        self.lead_track_frames[index] += 1
+      elif track_id >= 0:
+        self.lead_track_ids[index] = track_id
+        self.lead_track_frames[index] = 1
+      else:
+        self.lead_track_ids[index] = -1
+        self.lead_track_frames[index] = 0
+    return tuple(self.lead_track_frames)
 
   @staticmethod
   def parse_model(model_msg):
@@ -170,7 +152,11 @@ class LongitudinalPlanner:
       accel_limits = [A_CRUISE_MIN, carrot.get_carrot_accel(v_ego)]
       curvature_future = get_future_curvature(sm['modelV2'], sm['controlsState'].desiredCurvature)
       a_lat_max = 3.0
-      accel_limits_turns = limit_accel_in_turns(v_ego, curvature_future, accel_limits, a_lat_max)
+      accel_limits_turns = limit_accel_in_turns(
+        v_ego, curvature_future, accel_limits, a_lat_max,
+        model_msg=sm['modelV2'], v_cruise=v_cruise,
+        current_curvature=sm['controlsState'].curvature,
+      )
     else:
       accel_limits = [ACCEL_MIN, ACCEL_MAX]
       accel_limits_turns = [ACCEL_MIN, ACCEL_MAX]
@@ -179,7 +165,7 @@ class LongitudinalPlanner:
       self.v_desired_filter.x = v_ego
       # Clip aEgo to cruise limits to prevent large accelerations when becoming active
       self.a_desired = np.clip(sm['carState'].aEgo, accel_limits[0], accel_limits[1])
-      
+
       self.mpc.prev_a = np.full(N+1, self.a_desired) ## carrot
 
       self.reset_decel_timer = int(RESET_DECEL_RAMP_TIME / self.dt)
@@ -212,14 +198,50 @@ class LongitudinalPlanner:
 
     if force_slow_decel:
       v_cruise = 0.0
+    cutin_predecel_limit = (
+      get_cutin_predecel_accel_limit(sm['radarState'])
+      if not reset_state and not sm['carState'].gasPressed
+      else None
+    )
     # clip limits, cannot init MPC outside of bounds
     accel_limits_turns[0] = min(accel_limits_turns[0], self.a_desired + 0.05)
-    accel_limits_turns[1] = max(accel_limits_turns[1], self.a_desired - 0.05)
+    accel_limits_turns[1] = apply_cutin_predecel_accel_limit(
+      accel_limits_turns[1],
+      self.a_desired,
+      cutin_predecel_limit,
+    )
 
-    self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality, jerk_factor = carrot.jerk_factor_apply, a_change_cost_starting = carrot.aChangeCostStarting)
+    lead_track_frames = self.update_lead_tracks(sm['radarState'])
+    # Response strength is a driver preference at every following-distance level.
+    lead_accel_response_enabled = (
+      carrot.leadAccelResponse > 0
+      and not carrot.lane_change_active
+      and not reset_state
+      and not sm['carState'].gasPressed
+      and not force_slow_decel
+      and accel_limits_turns[1] > 0.0
+      and not self.output_should_stop
+    )
     self.mpc.set_accel_limits(accel_limits_turns[0], accel_limits_turns[1])
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
-    self.mpc.update(carrot, reset_state, sm['radarState'], v_cruise, x, v, a, j, personality=sm['selfdriveState'].personality)
+    self.mpc.update(
+      carrot, reset_state, sm['radarState'], v_cruise, x, v, a, j,
+      personality=sm['selfdriveState'].personality,
+      prev_accel_constraint=prev_accel_constraint,
+      jerk_factor=carrot.jerk_factor,
+      a_change_cost_starting=carrot.aChangeCostStarting,
+      lead_accel_response_enabled=lead_accel_response_enabled,
+      lead_gap_enabled=(
+        not reset_state and not sm['carState'].gasPressed
+        and not force_slow_decel and not carrot.lane_change_active
+      ),
+      cutout_relief_enabled=(
+        not reset_state and not sm['carState'].gasPressed
+        and not force_slow_decel and not self.output_should_stop
+      ),
+      lead_track_frames=lead_track_frames,
+      measured_a_ego=sm['carState'].aEgo,
+    )
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
@@ -250,8 +272,62 @@ class LongitudinalPlanner:
     vEgoStopping = self.params.get_float("VEgoStopping") * 0.01
     action_t =  longitudinalActuatorDelay + DT_MDL
 
-    output_a_target_mpc, output_should_stop_mpc, output_v_target_mpc, _ = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
-                                                                        action_t=action_t, vEgoStopping=vEgoStopping)
+    output_a_target_base, output_should_stop_mpc, output_v_target_mpc, _ = get_accel_from_plan(
+      self.v_desired_trajectory,
+      self.a_desired_trajectory,
+      CONTROL_N_T_IDX,
+      action_t=action_t,
+      vEgoStopping=vEgoStopping,
+    )
+
+    lead_index = 1 if self.mpc.source == 'lead1' else 0
+    leads = (sm['radarState'].leadOne, sm['radarState'].leadTwo)
+    lead = leads[lead_index]
+    preview_enabled = (
+      self.mpc.mode == 'acc'
+      and not reset_state
+      and not sm['carState'].gasPressed
+      and not sm['carState'].brakePressed
+    )
+    preview_request = get_lead_preview_request(
+      carrot.myDrivingMode,
+      lead_status=(
+        preview_enabled
+        and lead.status
+        and lead.radar
+        and lead.radarTrackId >= 0
+      ),
+      a_lead=lead.aLeadK,
+      a_ego=sm['carState'].aEgo,
+    )
+    if preview_enabled:
+      # Losing radar support stops requesting preview; it must not erase an
+      # existing braking correction in one frame. Release on the current MPC
+      # trajectory, without retaining the old lead or delaying new braking.
+      requested_preview = rate_limit_preview(
+        preview_request.offset_s,
+        self.lead_preview,
+      )
+      self.lead_preview = clip_preview_offset(action_t, requested_preview)
+      self.lead_preview_accel = preview_request.lead_accel_signal
+      self.lead_preview_action_time = action_t + self.lead_preview
+    else:
+      self.lead_preview = 0.0
+      self.lead_preview_accel = 0.0
+      self.lead_preview_action_time = action_t
+
+    output_a_target_preview, _, _, _ = get_accel_from_plan(
+      self.v_desired_trajectory,
+      self.a_desired_trajectory,
+      CONTROL_N_T_IDX,
+      action_t=self.lead_preview_action_time,
+      vEgoStopping=vEgoStopping,
+    )
+    output_a_target_mpc = apply_preview_target(
+      output_a_target_base,
+      output_a_target_preview,
+      carrot.myDrivingMode,
+    ) if preview_enabled else output_a_target_base
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
     output_v_target_now_e2e = sm['modelV2'].action.desiredVelocity
@@ -269,19 +345,41 @@ class LongitudinalPlanner:
     #  accel_clip[idx] = np.clip(accel_clip[idx], self.prev_accel_clip[idx] - 0.05, self.prev_accel_clip[idx] + 0.05)
     #self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
     #self.prev_accel_clip = accel_clip
+    self.output_a_target_base = output_a_target_base
     self.output_a_target = output_a_target
     self.output_v_target_now = output_v_target_now
     self.output_j_target_now = self.j_desired_trajectory[0]
 
-  def publish(self, sm, pm, carrot):
+  def publish(
+    self,
+    sm,
+    pm,
+    carrot,
+    *,
+    planner_execution_time=0.0,
+    live_tracks_mono_time=0,
+    fast_lead_mask=0,
+    fast_lead_track_id=-1,
+    planning_trigger="modelV2",
+    fast_radar_execution_time=0.0,
+    fast_lead_reason="inactive",
+  ):
     plan_send = messaging.new_message('longitudinalPlan')
 
     plan_send.valid = sm.all_checks(service_list=['carState', 'controlsState', 'selfdriveState'])
 
     longitudinalPlan = plan_send.longitudinalPlan
     longitudinalPlan.modelMonoTime = sm.logMonoTime['modelV2']
-    longitudinalPlan.processingDelay = (plan_send.logMonoTime / 1e9) - sm.logMonoTime['modelV2']
+    longitudinalPlan.deprecated.radarStateMonoTime = sm.logMonoTime['radarState']
+    longitudinalPlan.processingDelay = (plan_send.logMonoTime - sm.logMonoTime['modelV2']) / 1e9
     longitudinalPlan.solverExecutionTime = self.mpc.solve_time
+    longitudinalPlan.plannerExecutionTime = float(planner_execution_time)
+    longitudinalPlan.liveTracksMonoTime = int(live_tracks_mono_time)
+    longitudinalPlan.fastLeadTrackId = int(fast_lead_track_id)
+    longitudinalPlan.fastLeadMask = int(fast_lead_mask)
+    longitudinalPlan.planningTrigger = planning_trigger
+    longitudinalPlan.fastRadarExecutionTime = float(fast_radar_execution_time)
+    longitudinalPlan.fastLeadReason = fast_lead_reason
 
     longitudinalPlan.speeds = self.v_desired_trajectory.tolist()
     longitudinalPlan.accels = self.a_desired_trajectory.tolist()
@@ -292,6 +390,12 @@ class LongitudinalPlanner:
     longitudinalPlan.fcw = self.fcw
 
     longitudinalPlan.aTarget = float(self.output_a_target)
+    longitudinalPlan.aTargetBase = float(self.output_a_target_base)
+    longitudinalPlan.leadPreviewSeconds = float(self.lead_preview)
+    longitudinalPlan.leadPreviewActionTime = float(self.lead_preview_action_time)
+    longitudinalPlan.leadPreviewAccel = float(self.lead_preview_accel)
+    longitudinalPlan.aChangeCost = float(self.mpc.a_change_cost)
+    longitudinalPlan.trafficStopModelLeadOffset = float(carrot.trafficStopModelLeadOffset)
     longitudinalPlan.vTargetNow = float(self.output_v_target_now)
     longitudinalPlan.jTargetNow = float(self.output_j_target_now)
     longitudinalPlan.shouldStop = bool(self.output_should_stop)

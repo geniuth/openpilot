@@ -292,13 +292,13 @@ class CarState(CarStateBase):
     # DISABLE_RADAR: 부팅 시 레이더 무력화(interface.init)가 실패하면 롱컨 폴트를 유발하므로 표시
     ret.radarDisableFailed = RADAR_DISABLE_STATE["error"] and bool(self.CP.flags & VolkswagenFlags.DISABLE_RADAR)
 
-    # EA가 실제 개입 중인 단계(3~6)는 비치명 폴트로 올린다 (commaai/opendbc). 평시 2(STANDBY).
-    # EA_01은 STOCK_EA_PRESENT일 때만 파싱된다.
+    # Report EA as a non-critical fault while it is actively intervening (phases 3-6, commaai/opendbc).
+    # Reads 2 (STANDBY) in normal driving. EA_01 is only parsed when STOCK_EA_PRESENT.
     if self.CP.flags & VolkswagenFlags.STOCK_EA_PRESENT:
       ret.carFaultedNonCritical = cam_cp.vl["EA_01"]["EA_Funktionsstatus"] in (3, 4, 5, 6)
 
-    # ACC 종류: 게이트웨이 하네스에서는 순정 레이더의 ACC_18에서 실측값을 읽는다 (commaai/opendbc,
-    # MK1/MK2 로그 RX CRC 전수 통과 확인). 카메라 하네스는 레이더가 조용하므로 2 고정 유지.
+    # ACC type: on the gateway harness read it from the stock radar's ACC_18 (commaai/opendbc;
+    # RX CRC verified on MK1/MK2 logs). Camera harness keeps the radar silent, keep 2.
     if self.CP.networkLocation == NetworkLocation.gateway:
       self.acc_type = ext_cp.vl["ACC_18"]["ACC_Typ"]
     else:

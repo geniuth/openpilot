@@ -55,8 +55,42 @@ CUT_IN_THRESHOLD = 0.50
 CUT_OUT_THRESHOLD = 0.50
 CORNER_CUT_IN_THRESHOLD = 0.30
 FRONT_CUT_IN_THRESHOLD = 0.67
+TURNING_CORNER_PATH_MIN_ABS_YAW_RATE_RAD_S = 0.20
+TURNING_CORNER_PATH_MIN_ABS_YREL_M = 5.0
+TURNING_CORNER_PATH_MIN_OFFSET_DISCREPANCY_M = 3.0
 CUT_IN_CONFIRMATION_S = 0.35
 CUT_IN_BOUNDARY_HOLD_S = 0.40
+CORNER_PREDECEL_CONFIRMATION_S = 0.10
+CORNER_PREDECEL_HOLD_S = 0.20
+CORNER_PREDECEL_MIN_DREL_M = 8.0
+CORNER_PREDECEL_MAX_DREL_M = 45.0
+CORNER_PREDECEL_MIN_ABS_DPATH_M = 2.40
+CORNER_PREDECEL_MAX_ABS_DPATH_M = 3.40
+CORNER_PREDECEL_MIN_CLOSING_SPEED_MPS = 1.50
+CORNER_PREDECEL_MAX_TTC_S = 8.0
+CORNER_PREDECEL_MIN_SHORT_INWARD_RATE_MPS = 0.45
+CORNER_PREDECEL_MIN_LONG_INWARD_RATE_MPS = 0.25
+CORNER_PREDECEL_MIN_REPORTED_INWARD_MPS = 0.40
+CORNER_PREDECEL_MIN_INWARD_DISPLACEMENT_M = 0.35
+CORNER_PREDECEL_MIN_DIRECTIONAL_CONSISTENCY = 0.90
+CORNER_PREDECEL_MIN_INWARD_SAMPLE_RATIO = 0.80
+CLOSE_LOW_SPEED_PREDECEL_MAX_VEGO_MPS = 12.0
+CLOSE_LOW_SPEED_PREDECEL_MIN_DREL_M = 2.0
+CLOSE_LOW_SPEED_PREDECEL_MAX_DREL_M = CORNER_PREDECEL_MIN_DREL_M
+CLOSE_LOW_SPEED_PREDECEL_MIN_ABS_DPATH_M = 2.20
+CLOSE_LOW_SPEED_PREDECEL_MAX_ABS_DPATH_M = 3.00
+CLOSE_LOW_SPEED_PREDECEL_MIN_VLEAD_MPS = 2.0
+CLOSE_LOW_SPEED_PREDECEL_MIN_VLEAD_RATIO = 0.50
+CLOSE_LOW_SPEED_PREDECEL_MIN_CLOSING_SPEED_MPS = 0.50
+CLOSE_LOW_SPEED_PREDECEL_MAX_ENTRY_TIME_S = 1.85
+CLOSE_LOW_SPEED_PREDECEL_MIN_ENTRY_TIME_S = 0.50
+CLOSE_LOW_SPEED_PREDECEL_MIN_SHORT_INWARD_RATE_MPS = 0.30
+CLOSE_LOW_SPEED_PREDECEL_MIN_LONG_INWARD_RATE_MPS = 0.25
+CLOSE_LOW_SPEED_PREDECEL_MIN_REPORTED_INWARD_MPS = 0.20
+CLOSE_LOW_SPEED_PREDECEL_MIN_INWARD_DISPLACEMENT_M = 0.28
+CLOSE_LOW_SPEED_PREDECEL_MIN_DIRECTIONAL_CONSISTENCY = 0.90
+CLOSE_LOW_SPEED_PREDECEL_MIN_INWARD_SAMPLE_RATIO = 0.68
+CLOSE_LOW_SPEED_PREDECEL_MIN_MOTION_SUPPORT = 0.80
 URGENT_NEAR_PATH_CONFIRMATION_S = 0.10
 URGENT_NEAR_PATH_MAX_DREL_M = 5.0
 URGENT_NEAR_PATH_MAX_CLEARANCE_M = 0.45
@@ -72,6 +106,7 @@ NEAR_SIDE_DIRECTIONAL_MIN_LONG_INWARD_RATE_MPS = 0.15
 NEAR_SIDE_DIRECTIONAL_MIN_MOTION_SUPPORT = 0.90
 LANE_BOUNDARY_ENTRY_MIN_REPORTED_INWARD_MPS = 0.10
 LANE_BOUNDARY_ENTRY_MIN_MOTION_CONSISTENCY = 0.50
+LANE_BOUNDARY_ENTRY_MIN_INWARD_DISPLACEMENT_M = 0.35
 MAX_HISTORY_S = 2.0
 SHORT_HISTORY_S = 0.45
 LONG_HISTORY_S = 1.50
@@ -142,6 +177,34 @@ def radar_motion_sensitivity(
     directional_min_consistency=(
       _DIRECTIONAL_MIN_CONSISTENCIES[clamped_level]
     ),
+  )
+
+
+def turning_corner_path_entry_allowed(
+  source: str,
+  y_rel: float,
+  d_path: float,
+  yaw_rate_rad_s: float,
+  *,
+  cross_sensor_confirmed: bool = False,
+) -> bool:
+  """Reject curve-projection aliases from a corner radar without front support.
+
+  On a tight turn, a physically distant side target can project close to the
+  curved model path and imitate inward motion. Keep genuine close-side entries
+  and cross-sensor-confirmed targets eligible.
+  """
+  if cross_sensor_confirmed or not source.startswith("corner"):
+    return True
+  if not all(math.isfinite(value) for value in (
+    y_rel, d_path, yaw_rate_rad_s,
+  )):
+    return True
+  return not (
+    abs(yaw_rate_rad_s) >= TURNING_CORNER_PATH_MIN_ABS_YAW_RATE_RAD_S
+    and abs(y_rel) >= TURNING_CORNER_PATH_MIN_ABS_YREL_M
+    and abs(y_rel) - abs(d_path)
+    >= TURNING_CORNER_PATH_MIN_OFFSET_DISCREPANCY_M
   )
 
 
@@ -252,6 +315,192 @@ class RadarMotionCutIn:
 @dataclass(frozen=True)
 class RadarMotionDecision:
   confirmed: tuple[RadarMotionCutIn, ...]
+
+
+def corner_cutin_predecel_score(
+  prediction: RadarMotionPrediction,
+  d_rel: float,
+  v_rel: float,
+  *,
+  v_ego: float | None = None,
+  cross_sensor_confirmed: bool = False,
+) -> float:
+  """Return a strong, SCC-independent adjacent-lane approach risk score.
+
+  This deliberately does not relax normal CUT-IN confirmation. It recognizes
+  either a fast-closing distant target or a close low-speed moving target that
+  is independently paired with front radar. Both paths require sustained
+  measured inward motion. The score is used only for bounded pre-deceleration.
+  """
+  sensor = getattr(
+    prediction,
+    "sensor",
+    "corner" if str(getattr(prediction, "source", "")).startswith("corner") else "front",
+  )
+  if (
+    sensor != "corner"
+    or bool(getattr(prediction, "current_path_occupancy", False))
+    or int(getattr(prediction, "history_count", 0)) < 12
+  ):
+    return 0.0
+  d_rel = _finite(d_rel, math.inf)
+  v_rel = _finite(v_rel)
+  v_ego = _finite(v_ego, math.nan)
+  abs_d_path = abs(prediction.d_path)
+  side = math.copysign(1.0, prediction.d_path)
+  inward_short = -side * prediction.d_path_rate_short
+  inward_long = -side * prediction.d_path_rate_long
+  reported_inward = -side * prediction.reported_normal_speed
+  close_entry_time_s = (
+    max(0.0, abs_d_path - PATH_OVERLAP_HALF_WIDTH_M)
+    / max(min(inward_short, inward_long), 1e-3)
+  )
+  v_lead = v_ego + v_rel
+  close_low_speed_entry = (
+    bool(cross_sensor_confirmed)
+    and math.isfinite(v_ego)
+    and 0.0 < v_ego <= CLOSE_LOW_SPEED_PREDECEL_MAX_VEGO_MPS
+    and CLOSE_LOW_SPEED_PREDECEL_MIN_DREL_M
+    <= d_rel
+    < CLOSE_LOW_SPEED_PREDECEL_MAX_DREL_M
+    and CLOSE_LOW_SPEED_PREDECEL_MIN_ABS_DPATH_M
+    <= abs_d_path
+    <= CLOSE_LOW_SPEED_PREDECEL_MAX_ABS_DPATH_M
+    and v_rel <= -CLOSE_LOW_SPEED_PREDECEL_MIN_CLOSING_SPEED_MPS
+    and v_lead >= CLOSE_LOW_SPEED_PREDECEL_MIN_VLEAD_MPS
+    and v_lead >= CLOSE_LOW_SPEED_PREDECEL_MIN_VLEAD_RATIO * v_ego
+    and close_entry_time_s <= CLOSE_LOW_SPEED_PREDECEL_MAX_ENTRY_TIME_S
+    and inward_short
+    >= CLOSE_LOW_SPEED_PREDECEL_MIN_SHORT_INWARD_RATE_MPS
+    and inward_long
+    >= CLOSE_LOW_SPEED_PREDECEL_MIN_LONG_INWARD_RATE_MPS
+    and reported_inward
+    >= CLOSE_LOW_SPEED_PREDECEL_MIN_REPORTED_INWARD_MPS
+    and prediction.directional_inward_displacement_m
+    >= CLOSE_LOW_SPEED_PREDECEL_MIN_INWARD_DISPLACEMENT_M
+    and prediction.directional_consistency
+    >= CLOSE_LOW_SPEED_PREDECEL_MIN_DIRECTIONAL_CONSISTENCY
+    and prediction.directional_inward_sample_ratio
+    >= CLOSE_LOW_SPEED_PREDECEL_MIN_INWARD_SAMPLE_RATIO
+    and prediction.motion_consistency
+    >= CLOSE_LOW_SPEED_PREDECEL_MIN_MOTION_SUPPORT
+    and prediction.recent_motion_support
+    >= CLOSE_LOW_SPEED_PREDECEL_MIN_MOTION_SUPPORT
+  )
+  if close_low_speed_entry:
+    entry_urgency = (
+      CLOSE_LOW_SPEED_PREDECEL_MAX_ENTRY_TIME_S - close_entry_time_s
+    ) / (
+      CLOSE_LOW_SPEED_PREDECEL_MAX_ENTRY_TIME_S
+      - CLOSE_LOW_SPEED_PREDECEL_MIN_ENTRY_TIME_S
+    )
+    return max(0.20, min(1.0, entry_urgency))
+
+  if (
+    not CORNER_PREDECEL_MIN_DREL_M
+    <= d_rel
+    <= CORNER_PREDECEL_MAX_DREL_M
+    or not CORNER_PREDECEL_MIN_ABS_DPATH_M
+    <= abs_d_path
+    <= CORNER_PREDECEL_MAX_ABS_DPATH_M
+    or v_rel > -CORNER_PREDECEL_MIN_CLOSING_SPEED_MPS
+  ):
+    return 0.0
+  ttc_s = d_rel / max(-v_rel, 0.1)
+  if (
+    ttc_s > CORNER_PREDECEL_MAX_TTC_S
+    or inward_short < CORNER_PREDECEL_MIN_SHORT_INWARD_RATE_MPS
+    or inward_long < CORNER_PREDECEL_MIN_LONG_INWARD_RATE_MPS
+    or reported_inward < CORNER_PREDECEL_MIN_REPORTED_INWARD_MPS
+    or prediction.directional_inward_displacement_m
+    < CORNER_PREDECEL_MIN_INWARD_DISPLACEMENT_M
+    or prediction.directional_consistency
+    < CORNER_PREDECEL_MIN_DIRECTIONAL_CONSISTENCY
+    or prediction.directional_inward_sample_ratio
+    < CORNER_PREDECEL_MIN_INWARD_SAMPLE_RATIO
+  ):
+    return 0.0
+  return max(0.0, min(1.0, (
+    CORNER_PREDECEL_MAX_TTC_S - ttc_s
+  ) / (CORNER_PREDECEL_MAX_TTC_S - 2.5)))
+
+
+class CornerCutInPredecelTracker:
+  """Confirm strong early corner motion and bridge short radar dropouts."""
+
+  def __init__(
+    self,
+    confirmation_s: float = CORNER_PREDECEL_CONFIRMATION_S,
+    hold_s: float = CORNER_PREDECEL_HOLD_S,
+  ) -> None:
+    self.confirmation_s = float(confirmation_s)
+    self.hold_s = float(hold_s)
+    self._started_at: dict[tuple[str, int], float] = {}
+    self._last_seen_at: dict[tuple[str, int], float] = {}
+    self._last_candidate: dict[tuple[str, int], RadarMotionCutIn] = {}
+    self._confirmed: set[tuple[str, int]] = set()
+
+  @staticmethod
+  def _key(candidate: RadarMotionCutIn) -> tuple[str, int]:
+    prediction = candidate.prediction
+    return prediction.source, prediction.continuity_id
+
+  def reset(self) -> None:
+    self._started_at.clear()
+    self._last_seen_at.clear()
+    self._last_candidate.clear()
+    self._confirmed.clear()
+
+  def update(
+    self,
+    time_s: float,
+    candidates: Iterable[RadarMotionCutIn],
+  ) -> RadarMotionCutIn | None:
+    time_s = float(time_s)
+    current_keys: set[tuple[str, int]] = set()
+    for candidate in candidates:
+      if candidate.score <= 0.0:
+        continue
+      key = self._key(candidate)
+      current_keys.add(key)
+      self._started_at.setdefault(key, time_s)
+      self._last_seen_at[key] = time_s
+      previous = self._last_candidate.get(key)
+      self._last_candidate[key] = (
+        candidate
+        if previous is None or candidate.score >= previous.score
+        else RadarMotionCutIn(candidate.prediction, previous.score)
+      )
+
+    for key in tuple(self._started_at):
+      last_seen = self._last_seen_at.get(key, -math.inf)
+      if (
+        key not in current_keys
+        and (
+          key not in self._confirmed
+          or time_s - last_seen > self.hold_s
+        )
+      ):
+        self._started_at.pop(key, None)
+        self._last_seen_at.pop(key, None)
+        self._last_candidate.pop(key, None)
+        self._confirmed.discard(key)
+
+    self._confirmed.update(
+      key
+      for key in current_keys
+      if time_s - self._started_at[key] + 1e-6 >= self.confirmation_s
+    )
+
+    confirmed = [
+      self._last_candidate[key]
+      for key in self._confirmed
+      if (
+        key in self._last_candidate
+        and time_s - self._last_seen_at[key] <= self.hold_s
+      )
+    ]
+    return max(confirmed, key=lambda candidate: candidate.score, default=None)
 
 
 @dataclass(frozen=True)
@@ -907,6 +1156,10 @@ class RadarMotionPredictor:
       "front": {},
       "corner": {},
     }
+    self._retired_states: dict[str, dict[int, _TrackState]] = {
+      "front": {},
+      "corner": {},
+    }
     self._next_continuity_id = 1
     self._ego_distance_m = 0.0
     self._ego_x_m = 0.0
@@ -921,18 +1174,21 @@ class RadarMotionPredictor:
     self._next_continuity_id += 1
     return state
 
+  def _retire_state(self, sensor: str, state: _TrackState) -> None:
+    self._retired_states[sensor][state.continuity_id] = state
+
   @staticmethod
-  def _continuous(
+  def _continuity_cost(
     state: _TrackState,
     observation: _Observation,
     config: _SourceConfig,
-  ) -> bool:
+  ) -> float | None:
     if not state.observations:
-      return True
+      return 0.0
     previous = state.observations[-1]
     dt = observation.time_s - previous.time_s
     if dt <= 0.0 or dt > config.missing_hold_s:
-      return False
+      return None
     recent = _window(tuple(state.observations), SHORT_HISTORY_S)
     path_slope, _, _ = _spatial_fit(recent)
     d_path_rate = path_slope * previous.path_velocity
@@ -945,12 +1201,82 @@ class RadarMotionPredictor:
       + 0.25 * abs(previous.path_velocity) * dt
     )
     lateral_limit = config.lateral_jump_m + 0.25 * abs(d_path_rate) * dt
-    return (
-      abs(observation.path_x_world - predicted_path_x_world)
-      <= longitudinal_limit
-      and abs(observation.d_path - predicted_d_path) <= lateral_limit
-      and abs(observation.v_rel - previous.v_rel) <= config.velocity_jump_mps
+    longitudinal_error = abs(
+      observation.path_x_world - predicted_path_x_world
     )
+    lateral_error = abs(observation.d_path - predicted_d_path)
+    velocity_error = abs(observation.v_rel - previous.v_rel)
+    if (
+      longitudinal_error > longitudinal_limit
+      or lateral_error > lateral_limit
+      or velocity_error > config.velocity_jump_mps
+    ):
+      return None
+    return (
+      longitudinal_error / max(longitudinal_limit, 1.0e-3)
+      + lateral_error / max(lateral_limit, 1.0e-3)
+      + velocity_error / max(config.velocity_jump_mps, 1.0e-3)
+    )
+
+  @classmethod
+  def _continuous(
+    cls,
+    state: _TrackState,
+    observation: _Observation,
+    config: _SourceConfig,
+  ) -> bool:
+    return cls._continuity_cost(state, observation, config) is not None
+
+  def _reassociate_state(
+    self,
+    sensor: str,
+    key: tuple[str, int],
+    observation: _Observation,
+    config: _SourceConfig,
+    unavailable_continuity_ids: set[int],
+  ) -> _TrackState | None:
+    """Continue a physical corner target across raw object-ID handoffs.
+
+    Corner object slots can change every few frames while position and
+    velocity remain continuous. Only absent same-source keys are eligible, so
+    two simultaneously visible targets cannot be merged merely because they
+    pass close to one another.
+    """
+    if sensor != "corner":
+      return None
+    states = self._states[sensor]
+    retired_states = self._retired_states[sensor]
+    matches = []
+    for old_key, state in states.items():
+      if (
+        old_key == key
+        or old_key[0] != key[0]
+        or state.continuity_id in unavailable_continuity_ids
+      ):
+        continue
+      cost = self._continuity_cost(state, observation, config)
+      if cost is not None:
+        matches.append((cost, -state.last_seen_s, old_key, state, False))
+    for state in retired_states.values():
+      if (
+        state.source != key[0]
+        or state.continuity_id in unavailable_continuity_ids
+      ):
+        continue
+      cost = self._continuity_cost(state, observation, config)
+      if cost is not None:
+        matches.append((cost, -state.last_seen_s, None, state, True))
+    if not matches:
+      return None
+    _, _, old_key, state, was_retired = min(
+      matches, key=lambda match: match[:2],
+    )
+    if was_retired:
+      retired_states.pop(state.continuity_id, None)
+    elif old_key is not None:
+      states.pop(old_key, None)
+    states[key] = state
+    return state
 
   def _prediction(
     self,
@@ -1147,17 +1473,9 @@ class RadarMotionPredictor:
       + (0.45 if not enough_history else 0.0)
     )
 
-    enter_limit = PATH_OVERLAP_HALF_WIDTH_M
-    exit_limit = PATH_OVERLAP_HALF_WIDTH_M + PATH_STATE_HYSTERESIS_M
-    was_inside = state.inside_latched
-    if state.inside_latched:
-      state.inside_latched = abs(observation.d_path) <= exit_limit
-    else:
-      state.inside_latched = abs(observation.d_path) <= enter_limit
-    if not was_inside and state.inside_latched:
-      state.entry_time_s = observation.time_s if enough_history else None
-    elif not state.inside_latched:
-      state.entry_time_s = None
+    self._update_path_occupancy_state(
+      state, observation, enough_history,
+    )
     path_entry_age_s = (
       observation.time_s - state.entry_time_s
       if state.entry_time_s is not None
@@ -1323,7 +1641,7 @@ class RadarMotionPredictor:
       and abs(observation.d_path)
       <= LANE_BOUNDARY_STRADDLE_HALF_WIDTH_M
       and directional_inward_displacement
-      >= NEAR_SIDE_DIRECTIONAL_MIN_DISPLACEMENT_M
+      >= LANE_BOUNDARY_ENTRY_MIN_INWARD_DISPLACEMENT_M
       and directional_consistency
       >= NEAR_SIDE_DIRECTIONAL_MIN_CONSISTENCY
       and directional_inward_sample_ratio
@@ -1522,6 +1840,8 @@ class RadarMotionPredictor:
     scoped_points: Sequence[
       tuple[Any, float, ModelPathProjection]
     ] | None = None,
+    prediction_identities: Iterable[tuple[str, int]] | None = None,
+    allow_low_speed_identities: Iterable[tuple[str, int]] = (),
   ) -> dict[tuple[str, int], RadarMotionPrediction]:
     time_s = float(time_s)
     v_ego = _finite(v_ego)
@@ -1546,6 +1866,11 @@ class RadarMotionPredictor:
       for key, state in tuple(states.items()):
         if time_s - state.last_seen_s > hold_s:
           states.pop(key)
+      for continuity_id, state in tuple(
+        self._retired_states[sensor].items()
+      ):
+        if time_s - state.last_seen_s > hold_s:
+          self._retired_states[sensor].pop(continuity_id)
 
     point_values = tuple(points)
     scoped_points = (
@@ -1564,16 +1889,27 @@ class RadarMotionPredictor:
       (_source(point), int(getattr(point, "track_id", getattr(point, "trackId", -1))))
       for point, _, _ in scoped_points
     }
+    requested_prediction_identities = (
+      None
+      if prediction_identities is None
+      else frozenset(prediction_identities)
+    )
+    low_speed_identities = frozenset(allow_low_speed_identities)
     for point in point_values:
       source = _source(point)
       sensor = _sensor(source)
       track_id = int(getattr(point, "track_id", getattr(point, "trackId", -1)))
       key = (source, track_id)
       if bool(getattr(point, "measured", False)) and key not in scoped_keys:
-        self._states[sensor].pop(key, None)
+        state = self._states[sensor].pop(key, None)
+        if state is not None:
+          self._retire_state(sensor, state)
 
     predictions: dict[tuple[str, int], RadarMotionPrediction] = {}
     ego_projection = project_to_model_path(path, 0.0, 0.0)
+    cos_heading = math.cos(self._ego_heading_rad)
+    sin_heading = math.sin(self._ego_heading_rad)
+    prepared = []
     for point, d_rel, projection in scoped_points:
       source = _source(point)
       sensor = _sensor(source)
@@ -1588,11 +1924,14 @@ class RadarMotionPredictor:
         "vLead",
         _value(point, "v_rel", "vRel") + v_ego,
       )
-      if abs(v_lead) <= POSITION_ONLY_MAX_ABS_VLEAD_MPS:
-        self._states[sensor].pop(key, None)
+      if (
+        abs(v_lead) <= POSITION_ONLY_MAX_ABS_VLEAD_MPS
+        and key not in low_speed_identities
+      ):
+        state = self._states[sensor].pop(key, None)
+        if state is not None:
+          self._retire_state(sensor, state)
         continue
-      cos_heading = math.cos(self._ego_heading_rad)
-      sin_heading = math.sin(self._ego_heading_rad)
       yv_rel = _value(point, "yv_rel", "yvRel")
       target_vx, target_vy = radar_target_velocity_in_ego_frame(
         v_lead,
@@ -1649,10 +1988,55 @@ class RadarMotionPredictor:
         ),
         d_path=d_path,
       )
+      prepared.append((
+        source,
+        sensor,
+        config,
+        track_id,
+        key,
+        observation,
+      ))
+
+    # Reserve every exact raw-ID association that is also physically
+    # continuous. Remaining measurements may then claim only unreserved
+    # trajectories, which handles simultaneous object-slot swaps without
+    # stealing the history of a stable target processed later in the frame.
+    reserved_continuity_ids = {
+      state.continuity_id
+      for _, sensor, config, _, key, observation in prepared
+      if (
+        (state := self._states[sensor].get(key)) is not None
+        and self._continuous(state, observation, config)
+      )
+    }
+    claimed_continuity_ids: set[int] = set()
+    for (
+      source,
+      sensor,
+      config,
+      track_id,
+      key,
+      observation,
+    ) in prepared:
       state = self._states[sensor].get(key)
-      if state is None or not self._continuous(state, observation, config):
-        state = self._new_state(source, time_s)
-        self._states[sensor][key] = state
+      if state is not None and not self._continuous(
+        state, observation, config,
+      ):
+        self._states[sensor].pop(key, None)
+        self._retire_state(sensor, state)
+        state = None
+      if state is None:
+        state = self._reassociate_state(
+          sensor,
+          key,
+          observation,
+          config,
+          claimed_continuity_ids | reserved_continuity_ids,
+        )
+        if state is None:
+          state = self._new_state(source, time_s)
+          self._states[sensor][key] = state
+      claimed_continuity_ids.add(state.continuity_id)
       state.observations.append(observation)
       while (
         state.observations
@@ -1660,7 +2044,7 @@ class RadarMotionPredictor:
       ):
         state.observations.popleft()
       state.last_seen_s = time_s
-      if (
+      prediction_visible = (
         key in visible_keys
         or (
           sensor == "corner"
@@ -1669,9 +2053,35 @@ class RadarMotionPredictor:
             observation.d_path,
           )
         )
+      )
+      if (
+        prediction_visible
+        and (
+          requested_prediction_identities is None
+          or key in requested_prediction_identities
+        )
       ):
         predictions[key] = self._prediction(
           state, track_id, observation, path, config,
+        )
+      elif prediction_visible:
+        # The front cut-out tracker retains every physical history so a new
+        # leadOne has its full past immediately, but only the requested active
+        # identity needs the expensive regression and horizon prediction.
+        long = _window(tuple(state.observations), LONG_HISTORY_S)
+        long_path_span = (
+          max(value.path_x_world for value in long)
+          - min(value.path_x_world for value in long)
+          if len(long) >= 2
+          else 0.0
+        )
+        self._update_path_occupancy_state(
+          state,
+          observation,
+          (
+            len(long) >= config.minimum_rate_samples
+            and long_path_span >= config.minimum_path_span_m
+          ),
         )
       elif (
         state.inside_latched
@@ -1683,6 +2093,24 @@ class RadarMotionPredictor:
         state.inside_latched = False
         state.entry_time_s = None
     return predictions
+
+  @staticmethod
+  def _update_path_occupancy_state(
+    state: _TrackState,
+    observation: _Observation,
+    enough_history: bool,
+  ) -> None:
+    enter_limit = PATH_OVERLAP_HALF_WIDTH_M
+    exit_limit = PATH_OVERLAP_HALF_WIDTH_M + PATH_STATE_HYSTERESIS_M
+    was_inside = state.inside_latched
+    if state.inside_latched:
+      state.inside_latched = abs(observation.d_path) <= exit_limit
+    else:
+      state.inside_latched = abs(observation.d_path) <= enter_limit
+    if not was_inside and state.inside_latched:
+      state.entry_time_s = observation.time_s if enough_history else None
+    elif not state.inside_latched:
+      state.entry_time_s = None
 
 
 class RadarMotionDecisionTracker:
@@ -1697,16 +2125,12 @@ class RadarMotionDecisionTracker:
     self.threshold = float(threshold)
     self.confirmation_s = float(confirmation_s)
     self.boundary_hold_s = float(boundary_hold_s)
-    self._started_at: dict[tuple[str, int, int], float] = {}
-    self._peak_score: dict[tuple[str, int, int], float] = {}
+    self._started_at: dict[tuple[str, int], float] = {}
+    self._peak_score: dict[tuple[str, int], float] = {}
 
   @staticmethod
-  def _key(prediction: RadarMotionPrediction) -> tuple[str, int, int]:
-    return (
-      prediction.source,
-      prediction.track_id,
-      prediction.continuity_id,
-    )
+  def _key(prediction: RadarMotionPrediction) -> tuple[str, int]:
+    return prediction.source, prediction.continuity_id
 
   def _confirmation_time_s(
     self,

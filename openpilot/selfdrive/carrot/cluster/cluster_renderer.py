@@ -16,6 +16,7 @@ import pyray as rl
 
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rot_from_euler
+from openpilot.selfdrive.carrot.deceleration_source import navigation_status_presentation
 
 from cluster_gles_dmabuf import DirectNv12DmabufError, create_tici_nv12_dmabuf_pool
 from cluster_gles_readback import DirectNv12ReadbackError, create_tici_direct_readback
@@ -59,6 +60,7 @@ from cluster_config import (
     RADAR_TO_CAMERA_M,
     RED,
     TEXT,
+    VEHICLE_NAVI,
     VEHICLE_LENGTH_M,
     WHITE,
     cluster_camera_view_is_road_camera,
@@ -129,6 +131,7 @@ TRIP_REPORT_PANEL_X = NAVI_LIVE_PANEL_X
 TRIP_REPORT_PANEL_Y = 1.0
 TRIP_REPORT_PANEL_W = NAVI_LIVE_PANEL_W
 TRIP_REPORT_PANEL_H = DESIGN_HEIGHT - 2.0
+TRIP_REPORT_CACHE_REFRESH_SECONDS = 1.0
 CAMERA_BACKGROUND_X = 0.0
 CAMERA_BACKGROUND_Y = 0.0
 CAMERA_BACKGROUND_W = NAVI_LIVE_PANEL_X
@@ -229,7 +232,12 @@ TOP_CRUISE_FONT_SIZE = 27.0 * DRIVE_STATUS_SCALE
 TOP_CRUISE_UNIT_FONT_SIZE = TOP_CRUISE_FONT_SIZE
 WIFI_STATUS_CENTER_X = 160
 WIFI_STATUS_ICON_SIZE = 48.0
-NAV_STATUS_CENTER_X = WIFI_STATUS_CENTER_X
+# Keep the badge to the right of the clock, clear of its text and stroke.
+EGPU_STATUS_CENTER_X = 455.0
+EGPU_STATUS_W = 76.0
+EGPU_STATUS_H = 34.0
+EGPU_STATUS_FONT_SIZE = 19.0
+NAV_STATUS_CENTER_X = WIFI_STATUS_CENTER_X - 22.0
 NAV_STATUS_CENTER_Y = 99.0
 NAV_STATUS_FONT_SIZE = 22.0
 LFA_STATUS_CENTER_X = 70
@@ -895,6 +903,11 @@ class ClusterUiRenderer:
         self._korean_font = None
         self._owns_korean_font = False
         self._capture_target = None
+        self._trip_report_target = None
+        self._trip_report_cache_key: tuple[object, ...] | None = None
+        self._trip_report_cache_valid = False
+        self._trip_report_cache_visible = False
+        self._trip_report_cache_next_refresh = 0.0
         self._portrait_upload_target = None
         self._portrait_upload_target_size: tuple[int, int] | None = None
         self._nv12_pack_y_target = None
@@ -988,16 +1001,24 @@ class ClusterUiRenderer:
     def set_theme_mode(self, theme_mode: str) -> None:
         self.theme_mode = normalize_cluster_theme_mode(theme_mode)
         self._theme = current_cluster_theme(self.theme_mode)
+        self._invalidate_trip_report_cache()
 
     def set_screen_mode(self, screen_mode: int) -> None:
         self.screen_mode = normalize_cluster_screen_mode(screen_mode)
+        self._invalidate_trip_report_cache()
 
     def set_panel_layout(self, panel_layout: int) -> None:
         self.panel_layout = normalize_cluster_panel_layout(panel_layout)
+        self._invalidate_trip_report_cache()
 
     def set_display_preferences(self, language: str, is_metric: bool) -> None:
         self.language = normalize_cluster_language(language, default=CLUSTER_LANGUAGE_KO)
         self.is_metric = bool(is_metric)
+        self._invalidate_trip_report_cache()
+
+    def _invalidate_trip_report_cache(self) -> None:
+        self._trip_report_cache_valid = False
+        self._trip_report_cache_next_refresh = 0.0
 
     def _text(self, key: str) -> str:
         return cluster_text(self.language, key)
@@ -1188,6 +1209,13 @@ class ClusterUiRenderer:
         if self._capture_target is not None:
             rl.unload_render_texture(self._capture_target)
             self._capture_target = None
+        if self._trip_report_target is not None:
+            rl.unload_render_texture(self._trip_report_target)
+            self._trip_report_target = None
+            self._trip_report_cache_key = None
+            self._trip_report_cache_valid = False
+            self._trip_report_cache_visible = False
+            self._trip_report_cache_next_refresh = 0.0
         if self._portrait_upload_target is not None:
             rl.unload_render_texture(self._portrait_upload_target)
             self._portrait_upload_target = None
@@ -1294,6 +1322,7 @@ class ClusterUiRenderer:
 
     def render_frame(self, state: ClusterUiState) -> None:
         self.open()
+        self._prepare_trip_report_cache(state)
         profile_stage = self._profile_start()
         rl.begin_drawing()
         self._profile_add("render_frame.begin_drawing", profile_stage)
@@ -1314,6 +1343,7 @@ class ClusterUiRenderer:
         paused: bool = False,
     ) -> None:
         self.open()
+        self._prepare_trip_report_cache(state)
         profile_stage = self._profile_start()
         rl.begin_drawing()
         self._profile_add("render_route_frame.begin_drawing", profile_stage)
@@ -1442,6 +1472,61 @@ class ClusterUiRenderer:
         profile_stage = self._profile_start()
         self._draw_alert_overlay(getattr(state, "alert", None))
         self._profile_add("render.alert", profile_stage)
+
+    def _prepare_trip_report_cache(self, state: ClusterUiState, now: float | None = None) -> None:
+        """Refresh the expensive trip-report panel outside the active frame target."""
+        if self._effective_screen_mode(state) != CLUSTER_SCREEN_MODE_TRIP_REPORT:
+            self._trip_report_cache_visible = False
+            return
+
+        refresh_time = time.monotonic() if now is None else float(now)
+        theme = self._current_theme()
+        cache_key = (
+            theme,
+            self.language,
+            self.is_metric,
+            self.panel_layout,
+            int(self.width),
+            int(self.height),
+        )
+        needs_refresh = (
+            not self._trip_report_cache_visible
+            or not self._trip_report_cache_valid
+            or self._trip_report_target is None
+            or self._trip_report_cache_key != cache_key
+            or refresh_time >= self._trip_report_cache_next_refresh
+        )
+        if needs_refresh:
+            profile_stage = self._profile_start()
+            self._refresh_trip_report_cache(state)
+            self._trip_report_cache_key = cache_key
+            self._trip_report_cache_valid = True
+            self._trip_report_cache_next_refresh = refresh_time + TRIP_REPORT_CACHE_REFRESH_SECONDS
+            self._profile_add("trip_report_cache.refresh", profile_stage)
+        self._trip_report_cache_visible = True
+
+    def _refresh_trip_report_cache(self, state: ClusterUiState) -> None:
+        target_width = int(round(TRIP_REPORT_PANEL_W))
+        target_height = int(round(TRIP_REPORT_PANEL_H))
+        if self._trip_report_target is None:
+            self._trip_report_target = rl.load_render_texture(target_width, target_height)
+            rl.set_texture_filter(
+                self._trip_report_target.texture,
+                rl.TextureFilter.TEXTURE_FILTER_BILINEAR,
+            )
+
+        panel_x = self._information_panel_x(TRIP_REPORT_PANEL_X)
+        rl.begin_texture_mode(self._trip_report_target)
+        try:
+            rl.clear_background(rl_color((0, 0, 0, 0)))
+            rl.rl_push_matrix()
+            rl.rl_translatef(-panel_x, -TRIP_REPORT_PANEL_Y, 0.0)
+            try:
+                self._draw_trip_report_panel_contents(state)
+            finally:
+                rl.rl_pop_matrix()
+        finally:
+            rl.end_texture_mode()
 
     def _clear_world(self) -> None:
         theme = self._current_theme()
@@ -2161,6 +2246,7 @@ class ClusterUiRenderer:
         if uv_offset < stride * y_scanlines or byte_count < uv_offset + stride * uv_scanlines:
             raise RuntimeError("NV12 render target byte layout is inconsistent")
 
+        self._prepare_trip_report_cache(state)
         profile_stage = self._profile_start()
         target = self._get_capture_target()
         self._profile_add("render_to_nv12.get_capture_target", profile_stage)
@@ -2406,6 +2492,7 @@ class ClusterUiRenderer:
         output_height: int | None = None,
     ):
         self.open(hidden=self.hidden)
+        self._prepare_trip_report_cache(state)
         profile_stage = self._profile_start()
         target = self._get_capture_target()
         self._profile_add("render_to_image.get_capture_target", profile_stage)
@@ -4083,13 +4170,18 @@ class ClusterUiRenderer:
                 anchor="center",
             )
         navi_connected = bool(state.navi_dashboard is not None and state.navi_dashboard.connected)
-        if state.external_nav_active or navi_connected:
+        navi_status = navigation_status_presentation(
+            getattr(state, "vehicle_navi_available", False),
+            state.external_nav_active or navi_connected,
+        )
+        if navi_status is not None:
+            navi_label, navi_color_mode = navi_status
             self._draw_text_with_stroke(
-                "NAV",
+                navi_label,
                 NAV_STATUS_CENTER_X,
                 NAV_STATUS_CENTER_Y,
                 NAV_STATUS_FONT_SIZE,
-                GREEN,
+                VEHICLE_NAVI if navi_color_mode == 3 else AMBER,
                 (10, 13, 16),
                 2,
                 anchor="center",
@@ -5927,6 +6019,34 @@ class ClusterUiRenderer:
             self._draw_percent_bar(cell_x, line_y + 19, cell_w, 6, percent, color)
 
     def _draw_trip_report_panel(self, state: ClusterUiState) -> None:
+        target = getattr(self, "_trip_report_target", None)
+        if not getattr(self, "_trip_report_cache_valid", False) or target is None:
+            self._draw_trip_report_panel_contents(state)
+            return
+
+        panel_x = self._information_panel_x(TRIP_REPORT_PANEL_X)
+        source = rl.Rectangle(
+            0.0,
+            0.0,
+            float(target.texture.width),
+            -float(target.texture.height),
+        )
+        destination = rl.Rectangle(
+            panel_x,
+            TRIP_REPORT_PANEL_Y,
+            TRIP_REPORT_PANEL_W,
+            TRIP_REPORT_PANEL_H,
+        )
+        rl.draw_texture_pro(
+            target.texture,
+            source,
+            destination,
+            rl.Vector2(0.0, 0.0),
+            0.0,
+            rl_color(WHITE),
+        )
+
+    def _draw_trip_report_panel_contents(self, state: ClusterUiState) -> None:
         report = state.trip_report or TripReportState()
         stats = self._system_stats.sample()
         theme = self._current_theme()
@@ -6660,11 +6780,27 @@ class ClusterUiRenderer:
             and state.cruise_gap is None
             and not self._cruise_set_visible(state)
             and state.lfa_active is None
+            and not state.egpu_active
         ):
             return
 
         self._draw_network_status(state, TOP_STATUS_CENTER_Y + WIFI_STATUS_ICON_SIZE * 0.5)
+        self._draw_egpu_status(state)
         self._draw_lfa_status_icon(state, TOP_STATUS_CENTER_Y + LFA_STATUS_ICON_SIZE * 0.5)
+
+    def _draw_egpu_status(self, state: ClusterUiState) -> None:
+        if not state.egpu_active:
+            return
+        rect = rl.Rectangle(
+            EGPU_STATUS_CENTER_X - EGPU_STATUS_W * 0.5,
+            TOP_STATUS_CENTER_Y - EGPU_STATUS_H * 0.5,
+            EGPU_STATUS_W,
+            EGPU_STATUS_H,
+        )
+        rl.draw_rectangle_rounded(rect, 0.35, 8, rl_color((0, 0, 0), 150))
+        rl.draw_rectangle_rounded_lines_ex(rect, 0.35, 8, 2.0, rl_color(GREEN))
+        self._draw_text("eGPU", EGPU_STATUS_CENTER_X, TOP_STATUS_CENTER_Y + 1.0,
+                        EGPU_STATUS_FONT_SIZE, GREEN, anchor="center")
 
     def _draw_drive_status_box(
         self,
@@ -6909,6 +7045,10 @@ class ClusterUiRenderer:
             override_color = (
                 GREEN
                 if state.cruise_override_color_mode == 1
+                else AMBER
+                if state.cruise_override_color_mode == 4
+                else VEHICLE_NAVI
+                if state.cruise_override_color_mode == 3
                 else CRUISE_OVERRIDE_APPLY_COLOR
                 if state.cruise_override_color_mode == 2
                 else theme.text

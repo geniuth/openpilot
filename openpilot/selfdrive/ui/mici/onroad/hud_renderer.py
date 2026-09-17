@@ -5,9 +5,15 @@ import pyray as rl
 from dataclasses import dataclass
 from typing import Optional
 from openpilot.common.constants import CV
+from openpilot.selfdrive.carrot.deceleration_source import (
+  deceleration_source_presentation,
+  external_navigation_connected,
+  navigation_status_presentation,
+)
 # from openpilot.selfdrive.ui.mici.onroad.torque_bar import TorqueBar # 아이콘에 토크 적용: 토크바 미사용
 from openpilot.selfdrive.ui.mici.onroad import blend_colors
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
+from openpilot.system.hardware.usbgpu import usbgpu_badge_state
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -39,7 +45,7 @@ class SetSpeedOverrideState:
   active: bool
   speed_kph: float
   label: str
-  speed_color_mode: int # 0: white, 1: green, 2: orange
+  speed_color_mode: int # 0: white, 1: eco green, 2: orange, 3: vehicle-navigation blue, 4: external-navigation green
   force_persist: bool
 
 
@@ -73,13 +79,12 @@ class SetSpeedOverride:
       desired_source = ""
 
     if desired_speed is not None and 0 < desired_speed < 200 and desired_speed < set_speed_kph:
-      label = desired_source.strip() or "apply"
-      label = label[:8]  # 너무 길면 UI 깨짐 방지 (원하면 길이 조절)
+      label, speed_color_mode = deceleration_source_presentation(desired_source)
       return SetSpeedOverrideState(
         active=True,
         speed_kph=desired_speed,
         label=label,
-        speed_color_mode=2,
+        speed_color_mode=speed_color_mode,
         force_persist=True,   # 조건 유지되는 동안 계속 표시
       )
 
@@ -294,7 +299,49 @@ class HudRenderer(Widget):
 
     self._draw_steering_wheel(rect)
 
+    self._draw_egpu_badge(rect)
+
     self._draw_cruise_speed_animation(rect)
+
+  def _draw_egpu_badge(self, rect: rl.Rectangle) -> None:
+    # Keep runtime state visible while the shared USB hub re-enumerates; a
+    # transient missing sysfs sample must not hide loading or failure details.
+    if not (ui_state.usbgpu_present or ui_state.usbgpu_active or
+            ui_state.usbgpu_loading or ui_state.usbgpu_startup_failed):
+      return
+
+    state = usbgpu_badge_state(ui_state.usbgpu_compiled, ui_state.usbgpu_loading,
+                               ui_state.usbgpu_active, ui_state.usbgpu_startup_failed,
+                               ui_state.usbgpu_compile_pending)
+    text = "eGPU REBOOT" if state == "compile_pending" else "eGPU"
+    font_size = 22
+    text_size = measure_text_cached(self._font_semi_bold, text, font_size)
+    pad_x, pad_y = 10, 5
+    badge_w = text_size.x + pad_x * 2
+    badge = rl.Rectangle(
+      rect.x + rect.width - badge_w - 24,
+      rect.y + 12,
+      badge_w,
+      text_size.y + pad_y * 2,
+    )
+    color = {
+      "active": rl.Color(0, 255, 0, 230),
+      "loading": rl.Color(255, 255, 0, 230),
+      "error": rl.Color(255, 0, 0, 230),
+      "compile_pending": rl.Color(255, 165, 0, 230),
+      "not_compiled": rl.Color(255, 165, 0, 230),
+      "ready": rl.Color(255, 255, 255, 210),
+    }[state]
+    rl.draw_rectangle_rounded(badge, 0.35, 8, rl.Color(0, 0, 0, 150))
+    rl.draw_rectangle_rounded_lines_ex(badge, 0.35, 8, 2, color)
+    rl.draw_text_ex(
+      self._font_semi_bold,
+      text,
+      rl.Vector2(badge.x + pad_x, badge.y + pad_y),
+      font_size,
+      0,
+      color,
+    )
 
   def _update_cruise_speed_animation(self, cruise_text: str) -> None:
     if self._cruise_speed_text_last == cruise_text:
@@ -742,6 +789,10 @@ class HudRenderer(Widget):
           set_color = rl.Color(0, 255, 0, 230)
         elif ov.speed_color_mode == 2:    # apply
           set_color = rl.Color(255, 165, 0, 230)
+        elif ov.speed_color_mode == 3:    # vehicle navigation CAN
+          set_color = rl.Color(199, 125, 255, 230)
+        elif ov.speed_color_mode == 4:    # external navigation
+          set_color = rl.Color(244, 172, 54, 230)
         else:
           set_color = rl.Color(0, 255, 0, 230)   # your sample is green
 
@@ -772,13 +823,30 @@ class HudRenderer(Widget):
     gap_size = measure_text_cached(self._font_semi_bold, gap_text, gap_font)
     draw_text_ui_style(gap_text, gap_center_x, gap_center_y, gap_font, rl.WHITE, font=self._font_display, border_width=1.0, shadow_offset=3.0, align="center", y_offset=0.0)
 
-    # active carrot
+    # Navigation availability is independent of speed-control state. Vehicle
+    # CAN candidates also change activeCarrot, so it cannot identify an
+    # external navigation connection.
     sm = ui_state.sm
-    active_carrot = sm['carrotMan'].activeCarrot
-    if active_carrot >= 2:
-      x = int(panel_x + panel_w * 0.60)
+    carrot_man = sm['carrotMan']
+    vehicle_navi_available = bool(getattr(carrot_man, "vehicleNaviAvailable", False))
+    try:
+      carrot_navi_connected = bool(
+        sm.alive['carrotNavi']
+        and sm.valid['carrotNavi']
+        and getattr(sm['carrotNavi'], "connected", False)
+      )
+    except Exception:
+      carrot_navi_connected = False
+    external_navi_connected = external_navigation_connected(
+      getattr(carrot_man, "remote", ""), carrot_navi_connected,
+    )
+    navi_status = navigation_status_presentation(vehicle_navi_available, external_navi_connected)
+    if navi_status is not None:
+      navi_label, navi_color_mode = navi_status
+      x = int(panel_x + panel_w * 0.60 - 26)
       y = int(panel_y + panel_h * 0.82)
-      draw_text_ui_style("NAV", x, y, 26, rl.GREEN, font=self._font_display, border_width=1.0, shadow_offset=8.0, align="left_top", y_offset=0.0)
+      navi_color = rl.Color(199, 125, 255, 230) if navi_color_mode == 3 else rl.Color(244, 172, 54, 230)
+      draw_text_ui_style(navi_label, x, y, 26, navi_color, font=self._font_display, border_width=1.0, shadow_offset=8.0, align="left_top", y_offset=0.0)
 
 
     # ----- gear (right side box with letter) -----

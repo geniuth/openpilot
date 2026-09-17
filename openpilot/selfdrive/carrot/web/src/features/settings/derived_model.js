@@ -1,5 +1,6 @@
 export const SETTING_DERIVED_IDS = Object.freeze({
   favoritesGroup: "__setting_favorites__",
+  searchGroup: "__setting_search__",
   profilesDivider: "__setting_profiles_divider__",
   profileGroupPrefix: "__setting_profile__:",
   categoryDividerPrefix: "__setting_category__:",
@@ -78,7 +79,7 @@ export function createSettingsDerivedModel(options = {}) {
   }
 
   function getFavoriteEntries() {
-    return favorites.map(findItemByName).filter(Boolean);
+    return favorites.map(findItemByName).filter((entry) => entry && !entry.item?.detail_parent);
   }
 
   function getProfileEntries(profile) {
@@ -155,7 +156,21 @@ export function createSettingsDerivedModel(options = {}) {
     if (group === SETTING_DERIVED_IDS.favoritesGroup) return getFavoriteEntries();
     const profile = getProfileByGroup(group);
     if (profile) return getProfileEntries(profile);
-    return (itemsByGroup[group] || []).map((item) => ({ group, item }));
+    return (itemsByGroup[group] || [])
+      .filter((item) => !item?.detail_parent)
+      .map((item) => ({ group, item }));
+  }
+
+  function getDetailEntries(group, parentName) {
+    const target = String(parentName || "").trim();
+    if (!target || isProfileGroup(group) || group === SETTING_DERIVED_IDS.favoritesGroup) {
+      return getItemEntriesForGroup(group).filter((entry) => entry.item?.name === target);
+    }
+    const items = itemsByGroup[group] || [];
+    const parent = items.find((item) => item?.name === target && !item?.detail_parent);
+    if (!parent) return [];
+    return [parent, ...items.filter((item) => String(item?.detail_parent || "") === target)]
+      .map((item) => ({ group, item }));
   }
 
   function getGroupMeta(group) {
@@ -196,6 +211,40 @@ export function createSettingsDerivedModel(options = {}) {
     return `${groupLabel} > ${sectionLabel}`;
   }
 
+  // Use catalog order, one live parameter per result (no profile duplicates).
+  // Include detail children and their parent context, so a feature search also
+  // finds controls normally tucked inside that feature's detail screen.
+  let inlineSearchIndex = null;
+  function searchItemEntries(query) {
+    const needle = String(query || "").trim().normalize("NFC").toLowerCase();
+    if (!needle) return { entries: [], total: 0 };
+    if (!inlineSearchIndex) {
+      const text = (node) => node
+        ? [node.name, node.title, node.etitle, node.ctitle, node.descr, node.edescr, node.cdescr]
+        : [];
+      const seen = new Set();
+      const ordered = groups.flatMap(({ group }) => (itemsByGroup[group] || []).map((item) => ({ group, item })))
+        .filter(({ item }) => {
+          if (!item?.name || seen.has(item.name)) return false;
+          seen.add(item.name);
+          return true;
+        });
+      inlineSearchIndex = ordered.map((entry) => {
+        const { group, item } = entry;
+        const parent = itemIndex.get(item.detail_parent)?.item;
+        const meta = getGroupMeta(group);
+        return {
+          entry,
+          haystack: [group, meta?.egroup, meta?.ko, meta?.en, meta?.zh,
+            getItemContextLabel(group, item), ...text(item), ...text(parent)]
+            .filter(Boolean).join("\n").normalize("NFC").toLowerCase(),
+        };
+      });
+    }
+    const matches = inlineSearchIndex.filter(({ haystack }) => haystack.includes(needle));
+    return { entries: matches.slice(0, 20).map(({ entry }) => entry), total: matches.length };
+  }
+
   function makeSearchEntry({ source, profile = null, group, item, sourceLabels }) {
     const groupLabel = getGroupLabel(group);
     const contextGroupLabel = getItemContextLabel(group, item);
@@ -233,6 +282,7 @@ export function createSettingsDerivedModel(options = {}) {
     groups.forEach((groupMeta) => {
       const group = groupMeta.group;
       (itemsByGroup[group] || []).forEach((item) => {
+        if (item?.detail_parent) return;
         entries.push(makeSearchEntry({ source: "carrot", group, item, sourceLabels: resolvedLabels }));
       });
     });
@@ -262,10 +312,12 @@ export function createSettingsDerivedModel(options = {}) {
     getValidFavoriteNames,
     getGroupsForDisplay,
     getItemEntriesForGroup,
+    getDetailEntries,
     getGroupMeta,
     getGroupLabel,
     getItemContextLabel,
     buildSearchEntries,
+    searchItemEntries,
   });
 }
 

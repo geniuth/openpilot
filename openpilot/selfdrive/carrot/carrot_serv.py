@@ -78,6 +78,11 @@ nav_type_mapping = {
 }
 
 import collections
+
+COUNTDOWN_NEW_TARGET_MIN_JUMP_M = 20.0
+SCHOOL_ZONE_GAS_OVERRIDE_TIMEOUT_S = 3.0
+
+
 class CarrotServ:
   def __init__(self):
     self.params = Params()
@@ -93,6 +98,7 @@ class CarrotServ:
     self.active_sdi_count_max = 200 # 20 sec
 
     self.active_kisa_count = 0
+    self.external_navigation_active = False
 
     self.nSdiType = -1
     self.nSdiSpeedLimit = 0
@@ -156,6 +162,7 @@ class CarrotServ:
     self.xSpdLimit = 0
     self.xSpdDist = 0
     self.xSpdType = -1
+    self.rear_camera_events = []
 
     self.xTurnInfo = -1
     self.xDistToTurn = 0
@@ -175,8 +182,10 @@ class CarrotServ:
     self.traffic_light_count = -1
     self.traffic_state = 0
 
-    self.left_spd_sec = 0
-    self.left_tbt_sec = 0
+    self.left_spd_sec = 100
+    self.left_tbt_sec = 100
+    self.speed_countdown_distance_last = 0.0
+    self.turn_countdown_distance_last = 0.0
     self.left_sec = 100
     self.max_left_sec = 100
     self.carrot_left_sec = 100
@@ -186,7 +195,11 @@ class CarrotServ:
     self.atc_paused = False
     self.atc_activate_count = 0
     self.gas_override_speed = 0
+    self.gas_pressed_state = False
+    self.speed_event_gas_pressed = False
     self.source_last = "none"
+    self.school_zone_gas_override_started_at = None
+    self.school_zone_suppressed = False
 
     self.carrot_navi_session_id = ""
     self.carrot_navi_speed_sequence = -1
@@ -212,8 +225,12 @@ class CarrotServ:
   def update_params(self):
     self.autoNaviSpeedBumpSpeed = float(self.params.get_int("AutoNaviSpeedBumpSpeed"))
     self.autoNaviSpeedBumpTime = float(self.params.get_int("AutoNaviSpeedBumpTime"))
+    self.autoNaviSpeedBumpEndDistance = float(min(5000, max(0, self.params.get_int("AutoNaviSpeedBumpEndDistance")))) * 0.01
     self.autoNaviSpeedCtrlEnd = float(self.params.get_int("AutoNaviSpeedCtrlEnd"))
+    self.autoNaviRearCameraHoldDistance = float(min(300, max(0, self.params.get_int("AutoNaviRearCameraHoldDistance"))))
     self.autoNaviSpeedCtrlMode = self.params.get_int("AutoNaviSpeedCtrlMode")
+    self.vehicleNaviCanControl = min(3, max(0, self.params.get_int("VehicleNaviCanControl")))
+    self.vehicleNaviSchoolZoneControl = self.params.get_bool("VehicleNaviSchoolZoneControl")
     self.vehicleSpeedCameraControlMode = min(3, max(0, self.params.get_int("VehicleSpeedCameraControlMode")))
     self.autoNaviSpeedSafetyFactor = float(self.params.get_int("AutoNaviSpeedSafetyFactor")) * 0.01
     self.autoNaviSpeedDecelRate = float(self.params.get_int("AutoNaviSpeedDecelRate")) * 0.01
@@ -347,24 +364,214 @@ class CarrotServ:
       speed_mps = math.sqrt(temp)
     return max(safe_speed_kph, min(250, speed_mps * 3.6))
 
+  def _external_navigation_connected(self):
+    # Connection freshness, not the presence of a camera/bump or active guidance.
+    return self.carrot_navi_active or self.active_count > 0 or self.active_kisa_count > 0
+
+  def _update_navigation_source(self):
+    external_active = self._external_navigation_connected()
+    changed = external_active != self.external_navigation_active
+    self.external_navigation_active = external_active
+    if changed:
+      self.rear_camera_events = []
+      self.speed_countdown_distance_last = self.turn_countdown_distance_last = 0.0
+      self.left_spd_sec = self.left_tbt_sec = 100
+      self.gas_override_speed = 0
+      self.school_zone_gas_override_started_at = None
+      self.school_zone_suppressed = False
+    return changed
+
+  def _rear_camera_speed(self, CS, delta_dist):
+    # TMAP EDC SDI 75/76: rear speed / rear signal-and-speed camera.
+    # Arm only on the final approach. Keep the wheel-distance endpoint even
+    # when the app removes the SDI at the camera or announces the next item.
+    hold_distance = self.autoNaviRearCameraHoldDistance
+    if (CS is None or delta_dist < 0 or not self.external_navigation_active or
+        self.autoNaviSpeedCtrlMode <= 0 or hold_distance <= 0 or self.carrot_navi_off_route):
+      self.rear_camera_events = []
+      return 250.0, 0.0
+
+    self.rear_camera_events = [event for event in self.rear_camera_events
+                               if event["target"] + hold_distance > self.totalDistance]
+    if (self.active_carrot > 1 and self.xSpdType in (75, 76) and
+        0 < self.xSpdDist <= 50 and self.xSpdLimit > 0):
+      target = self.totalDistance + self.xSpdDist
+      matching = next((event for event in self.rear_camera_events if abs(event["target"] - target) <= 40), None)
+      if matching is None:
+        self.rear_camera_events.append({"target": target, "speed": self.xSpdLimit})
+      else:
+        # Repeated zero/near-zero reports must not move the hold endpoint.
+        matching["speed"] = min(matching["speed"], self.xSpdLimit)
+
+    if not self.rear_camera_events:
+      return 250.0, 0.0
+    event = min(self.rear_camera_events, key=lambda event: event["speed"])
+    return event["speed"], max(0.0, event["target"] + hold_distance - self.totalDistance)
+
   def _vehicle_speed_camera_enabled(self, CS):
-    return (self.vehicleSpeedCameraControlMode > 0 and CS.speedLimit > 0 and CS.speedLimitDistance > 0 and
+    return (not self.external_navigation_active and
+            self.vehicleSpeedCameraControlMode > 0 and CS.speedLimit > 0 and CS.speedLimitDistance > 0 and
+            not (CS.schoolZoneActive and self.school_zone_suppressed) and
             not (self.vehicleSpeedCameraControlMode == 3 and CS.gasPressed))
 
-  def _apply_vehicle_speed_camera_gas_floor(self, CS, desired_speed, source, v_ego_kph, road_speed_limit_changed):
-    gas_floor_active = self.vehicleSpeedCameraControlMode == 2 and source == "hda"
-    if not gas_floor_active:
-      self.gas_override_speed = 0
+  def _speed_bump_control_active(self, distance):
+    return distance > self.autoNaviSpeedBumpEndDistance
+
+  def _vehicle_speed_bump_enabled(self, CS):
+    return (not self.external_navigation_active and self.vehicleNaviCanControl and self.autoNaviSpeedCtrlMode >= 2 and
+            self._speed_bump_control_active(CS.speedBumpDistance))
+
+  def _vehicle_school_zone_enabled(self, CS):
+    if not CS.schoolZoneActive:
+      self.school_zone_gas_override_started_at = None
+      self.school_zone_suppressed = False
+      return False
+    return (not self.external_navigation_active and
+            self.vehicleNaviSchoolZoneControl and self.vehicleSpeedCameraControlMode > 0 and not self.school_zone_suppressed and
+            not (self.vehicleSpeedCameraControlMode == 3 and CS.gasPressed))
+
+  def _vehicle_school_zone_speed(self, CS):
+    return 30 if self._vehicle_school_zone_enabled(CS) else 250
+
+  def _vehicle_section_zone_enabled(self, CS):
+    return (not self.external_navigation_active and self.vehicleNaviCanControl and self.vehicleSpeedCameraControlMode > 0 and
+            getattr(CS, "vehicleNaviSectionActive", False) and getattr(CS, "vehicleNaviSpeed", 0) > 0 and
+            not (self.vehicleSpeedCameraControlMode == 3 and CS.gasPressed))
+
+  def _vehicle_navigation_display(self, CS):
+    if self.external_navigation_active or CS is None or not self.vehicleNaviCanControl or not getattr(CS, "vehicleNaviActive", False):
+      return False, 0, False
+    if CS.schoolZoneActive:
+      speed = 30
+    elif getattr(CS, "vehicleNaviSpeed", 0) > 0:
+      speed = int(CS.vehicleNaviSpeed * self.autoNaviSpeedSafetyFactor)
+    elif self._speed_bump_control_active(CS.speedBumpDistance):
+      speed = int(self.autoNaviSpeedBumpSpeed)
     else:
-      reset_floor = (source != self.source_last or CS.vEgo < 0.1 or desired_speed > 150 or
-                     CS.brakePressed or road_speed_limit_changed)
-      if reset_floor:
+      speed = 0
+    return speed > 0, speed, bool(getattr(CS, "vehicleNaviSectionActive", False))
+
+  def _speed_countdown_distance(self, CS):
+    distances = []
+    legacy_bump_suppressed = self.xSpdType == 22 and self.autoNaviCountDownMode == 1
+    if self.external_navigation_active and self.xSpdDist > 0 and not legacy_bump_suppressed:
+      distances.append(self.xSpdDist)
+
+    vehicle_navi_active = (not self.external_navigation_active and CS is not None and self.vehicleNaviCanControl and
+                           getattr(CS, "vehicleNaviActive", False))
+    if vehicle_navi_active:
+      camera_distance = getattr(CS, "speedLimitDistance", 0)
+      if camera_distance > 0:
+        distances.append(camera_distance)
+      bump_distance = getattr(CS, "speedBumpDistance", 0)
+      if self.autoNaviCountDownMode >= 2 and bump_distance > 0:
+        distances.append(bump_distance)
+
+    return min(distances, default=0)
+
+  def _update_countdown_alert(self, left_sec, source, v_ego_kph):
+    if left_sec > 11:
+      self.left_sec = 100
+      self.max_left_sec = 100
+      self.carrot_left_sec = 100
+      self.sdi_inform = False
+      return
+
+    self.sdi_inform = source in ("cam", "hda")
+    self.max_left_sec = min(11, max(6, int(v_ego_kph / 10) + 1))
+    if left_sec != self.left_sec:
+      if left_sec == self.max_left_sec and self.sdi_inform:
+        self.carrot_left_sec = 11
+      elif 1 <= left_sec < self.max_left_sec:
+        self.carrot_left_sec = left_sec
+      elif left_sec == 0 and self.left_sec == 1:
+        self.carrot_left_sec = left_sec
+
+      self.left_sec = left_sec
+
+  @staticmethod
+  def _countdown_channel(distance, previous_distance, previous_left_sec, v_ego):
+    if distance <= 0:
+      return 100, 0.0, False
+
+    calculated = int(max(distance - v_ego, 1) / max(1, v_ego) + 0.5)
+    new_target = (previous_distance > 0 and
+                  distance - previous_distance > max(COUNTDOWN_NEW_TARGET_MIN_JUMP_M, v_ego * 2.0))
+    rearmed = new_target and previous_left_sec <= 11
+    left_sec = calculated if new_target else min(previous_left_sec, calculated)
+    return (100 if rearmed else left_sec), float(distance), rearmed
+
+  def _update_school_zone_gas_override(self, override_active):
+    if not override_active:
+      self.school_zone_gas_override_started_at = None
+      return
+
+    now = time.monotonic()
+    if self.school_zone_gas_override_started_at is None:
+      self.school_zone_gas_override_started_at = now
+    elif now - self.school_zone_gas_override_started_at >= SCHOOL_ZONE_GAS_OVERRIDE_TIMEOUT_S:
+      self.school_zone_suppressed = True
+
+  def _apply_speed_source_gas_floor(self, CS, desired_speed, source, v_ego_kph, road_speed_limit_changed):
+    speed_event_gas_rising = CS.gasPressed and not self.speed_event_gas_pressed
+    self.speed_event_gas_pressed = CS.gasPressed
+
+    if source in ("hda", "hda_section", "hda_bump", "school"):
+      # Vehicle speed bumps always allow an intentional accelerator override.
+      # Camera, section, and school sources follow mode 2 only after their
+      # target has fallen below the current speed and actual deceleration is
+      # requested.
+      gas_floor_active = source == "hda_bump" or self.vehicleSpeedCameraControlMode == 2
+      if not gas_floor_active:
         self.gas_override_speed = 0
+      else:
+        reset_floor = (source != self.source_last or CS.vEgo < 0.1 or desired_speed > 150 or
+                       CS.brakePressed or road_speed_limit_changed)
+        if reset_floor:
+          self.gas_override_speed = 0
+        if self.gas_override_speed <= 0:
+          if (speed_event_gas_rising and not CS.brakePressed and CS.vEgo >= 0.1 and
+              desired_speed <= 150 and desired_speed < v_ego_kph):
+            # A new accelerator input during active event deceleration means
+            # the driver wants to ignore the remaining slowdown.
+            self.gas_override_speed = v_ego_kph
+        elif CS.gasPressed:
+          # Keep the highest speed reached while overriding this event.
+          self.gas_override_speed = max(v_ego_kph, self.gas_override_speed)
+
+      self.source_last = source
+      override_active = gas_floor_active and desired_speed < self.gas_override_speed
+      if source == "school":
+        self._update_school_zone_gas_override(override_active)
+      elif not self.school_zone_suppressed:
+        self.school_zone_gas_override_started_at = None
+      if override_active:
+        return self.gas_override_speed, "gas"
+      return desired_speed, source
+
+    # Vehicle speed-camera modes must not change the existing accelerator
+    # override behavior for road limits, curves, or other navigation sources.
+    if source != self.source_last:
+      self.gas_override_speed = 0
+      self.gas_pressed_state = CS.gasPressed
+
+    reset_floor = (CS.vEgo < 0.1 or desired_speed > 150 or source in ["cam", "section", "police"] or
+                   CS.brakePressed or road_speed_limit_changed)
+    if reset_floor:
+      self.gas_override_speed = 0
+    elif source == "bump":
+      if self.gas_override_speed <= 0:
+        if speed_event_gas_rising and desired_speed < v_ego_kph:
+          self.gas_override_speed = v_ego_kph
       elif CS.gasPressed:
         self.gas_override_speed = max(v_ego_kph, self.gas_override_speed)
+    elif CS.gasPressed and not self.gas_pressed_state:
+      self.gas_override_speed = max(v_ego_kph, self.gas_override_speed)
+    else:
+      self.gas_pressed_state = False
 
     self.source_last = source
-    if gas_floor_active and desired_speed < self.gas_override_speed:
+    if desired_speed < self.gas_override_speed:
       return self.gas_override_speed, "gas"
     return desired_speed, source
 
@@ -438,6 +645,8 @@ class CarrotServ:
   def _get_sdi_descr(self, nSdiType):
     # 多语言映射：ko（韩语，原始），zh（简体中文），en（英文）。
     sdi_ko = {
+        75: "후면 과속 단속",
+        76: "후면 신호·과속 단속",
         0: "신호과속",
         1: "과속 (고정식)",
         2: "구간단속 시작",
@@ -508,6 +717,8 @@ class CarrotServ:
     }
 
     sdi_en = {
+        75: "Rear speed camera",
+        76: "Rear signal and speed camera",
         0: "Signal speed enforcement",
         1: "Speed camera (fixed)",
         2: "Section control start",
@@ -578,6 +789,8 @@ class CarrotServ:
     }
 
     sdi_zh = {
+        75: "后向测速摄像头",
+        76: "后向闯红灯及测速摄像头",
         0: "信号测速/闯灯拍照",
         1: "固定测速摄像头",
         2: "区间测速开始",
@@ -680,6 +893,7 @@ class CarrotServ:
       self.xSpdDist = 0
 
   def _reset_carrot_navi_sequences(self, session_id):
+    self.rear_camera_events = []
     self.carrot_navi_session_id = session_id
     self.carrot_navi_speed_sequence = -1
     self.carrot_navi_current_sequence = -1
@@ -699,6 +913,7 @@ class CarrotServ:
     self.carrot_navi_traffic_active = False
 
   def _clear_carrot_navi_control(self):
+    self.rear_camera_events = []
     self.active_count = 0
     self.active_sdi_count = 0
     self.carrot_navi_has_control = False
@@ -1117,15 +1332,11 @@ class CarrotServ:
       distanceTraveled = sm['selfdriveState'].distanceTraveled
       delta_dist = distanceTraveled - self.totalDistance
       self.totalDistance = distanceTraveled
-      if CS.speedLimit > 0 and self.active_carrot <= 1:
-        self.nRoadLimitSpeed = CS.speedLimit
     else:
       v_ego = v_ego_kph = 0
       delta_dist = 0
       CS = None
 
-    road_speed_limit_changed = True if self.nRoadLimitSpeed != self.nRoadLimitSpeed_last else False
-    self.nRoadLimitSpeed_last = self.nRoadLimitSpeed
     #self.bearing = self.nPosAngle #self._update_gps(v_ego, sm)
     self.bearing = self._update_gps(v_ego, sm, gps_service)
 
@@ -1135,6 +1346,11 @@ class CarrotServ:
     self.active_count = max(self.active_count - 1, 0)
     self.active_sdi_count = max(self.active_sdi_count - 1, 0)
     self.active_kisa_count = max(self.active_kisa_count - 1, 0)
+    navigation_source_changed = self._update_navigation_source()
+    if not self.external_navigation_active and CS is not None and CS.speedLimit > 0:
+      self.nRoadLimitSpeed = CS.speedLimit
+    road_speed_limit_changed = self.nRoadLimitSpeed != self.nRoadLimitSpeed_last
+    self.nRoadLimitSpeed_last = self.nRoadLimitSpeed
     if self.active_kisa_count > 0:
       self.active_carrot = 2
 
@@ -1161,6 +1377,7 @@ class CarrotServ:
     if self.active_carrot <= 1 or self.active_kisa_count > 0:
       self.update_nav_instruction(sm)
 
+    rear_camera_speed, rear_camera_remaining = self._rear_camera_speed(CS, delta_dist)
     if self.xSpdType < 0 or (self.xSpdType not in [100,101] and self.xSpdDist <= 0) or (self.xSpdType in [100,101] and self.xSpdDist < -250):
       self.xSpdType = -1
       self.xSpdDist = self.xSpdLimit = 0
@@ -1172,9 +1389,18 @@ class CarrotServ:
       self.xTurnInfoNext = -1
 
     sdi_speed = 250
-    vehicle_speed_camera_active = False
+    vehicle_camera_speed = 250
+    vehicle_speed_camera_active = CS is not None and self._vehicle_speed_camera_enabled(CS)
+    vehicle_bump_active = CS is not None and self._vehicle_speed_bump_enabled(CS)
+    vehicle_bump_speed = 250
+    vehicle_school_zone_speed = 250
+    vehicle_section_zone_speed = 250
     ### 과속카메라, 사고방지턱
-    if self.xSpdLimit > 0 and (self.xSpdDist > 0 or self.xSpdType in [100, 101]) and self.active_carrot > 0:
+    legacy_sdi_active = (self.external_navigation_active and
+                         self.xSpdLimit > 0 and (self.xSpdDist > 0 or self.xSpdType in [100, 101]) and
+                         self.active_carrot > 0 and
+                         (self.xSpdType != 22 or self._speed_bump_control_active(self.xSpdDist)))
+    if legacy_sdi_active:
       safe_sec = self.autoNaviSpeedBumpTime if self.xSpdType == 22 else self.autoNaviSpeedCtrlEnd
       decel = self.autoNaviSpeedDecelRate
       sdi_speed = min(sdi_speed, self.calculate_current_speed(self.xSpdDist, self.xSpdLimit, safe_sec, decel))
@@ -1182,14 +1408,27 @@ class CarrotServ:
       if self.xSpdType == 4 or (self.xSpdType in [100, 101] and self.xSpdDist <= 0):
         sdi_speed = self.xSpdLimit
         self.active_carrot = 4
-    elif CS is not None and self._vehicle_speed_camera_enabled(CS):
-      sdi_speed = min(sdi_speed,
-                      self.calculate_current_speed(CS.speedLimitDistance,
-                                                   CS.speedLimit * self.autoNaviSpeedSafetyFactor,
-                                                   self.autoNaviSpeedCtrlEnd,
-                                                   self.autoNaviSpeedDecelRate))
+    if vehicle_speed_camera_active:
+      vehicle_camera_speed = self.calculate_current_speed(CS.speedLimitDistance,
+                                                          CS.speedLimit * self.autoNaviSpeedSafetyFactor,
+                                                          self.autoNaviSpeedCtrlEnd,
+                                                          self.autoNaviSpeedDecelRate)
       #self.active_carrot = 6
-      vehicle_speed_camera_active = True
+
+    if vehicle_bump_active:
+      vehicle_bump_speed = self.calculate_current_speed(CS.speedBumpDistance,
+                                                        self.autoNaviSpeedBumpSpeed,
+                                                        self.autoNaviSpeedBumpTime,
+                                                        self.autoNaviSpeedDecelRate)
+      self.active_carrot = 5
+
+    if CS is not None:
+      vehicle_school_zone_speed = self._vehicle_school_zone_speed(CS)
+      if vehicle_school_zone_speed < 250:
+        self.active_carrot = 6
+      if self._vehicle_section_zone_enabled(CS):
+        vehicle_section_zone_speed = CS.vehicleNaviSpeed * self.autoNaviSpeedSafetyFactor
+        self.active_carrot = 4
 
     #print(f"sdi_speed: {sdi_speed}, vehicle_speed_camera_active: {vehicle_speed_camera_active}, xSpdType: {self.xSpdType}, xSpdDist: {self.xSpdDist}, active_carrot: {self.active_carrot}, v_ego_kph: {v_ego_kph}, nRoadLimitSpeed: {self.nRoadLimitSpeed}")
     ### TBT 속도제어
@@ -1219,13 +1458,21 @@ class CarrotServ:
       self.atcType = "none"
 
 
-    sdi_source = ("hda" if vehicle_speed_camera_active else "bump" if self.xSpdType == 22 else
-                  "section" if self.xSpdType == 4 else "police" if self.xSpdType == 100 else
+    rear_camera_holding = rear_camera_speed < 250 and rear_camera_speed <= sdi_speed
+    sdi_speed = min(sdi_speed, rear_camera_speed)
+    if rear_camera_holding:
+      self.active_carrot = 3
+    sdi_source = ("cam" if rear_camera_holding else "bump" if self.xSpdType == 22 else "section" if self.xSpdType == 4 else
+                  "police" if self.xSpdType == 100 else
                   "waze" if self.xSpdType == 101 else "cam")
     speed_n_sources = [
       (atc_desired, "atc"),
       (atc_desired_next, "atc2"),
       (sdi_speed, sdi_source),
+      (vehicle_camera_speed, "hda"),
+      (vehicle_bump_speed, "hda_bump"),
+      (vehicle_school_zone_speed, "school"),
+      (vehicle_section_zone_speed, "hda_section"),
       (limit_speed, "road"),
     ]
     if self.turnSpeedControlMode in [1,2]:
@@ -1239,14 +1486,10 @@ class CarrotServ:
       speed_n_sources.append((route_speed, "route"))
       #speed_n_sources.append((self.calculate_current_speed(dist, speed * self.mapTurnSpeedFactor, 0, 1.2), "route"))
 
-    model_turn_speed = max(sm['modelV2'].meta.modelTurnSpeed, self.autoCurveSpeedLowerLimit)
-    if model_turn_speed < 200 and abs(vturn_speed) < 120:
-      speed_n_sources.append((model_turn_speed, "model"))
-
     desired_speed, source = min(speed_n_sources, key=lambda x: x[0])
 
     if CS is not None:
-      desired_speed, source = self._apply_vehicle_speed_camera_gas_floor(
+      desired_speed, source = self._apply_speed_source_gas_floor(
         CS, desired_speed, source, v_ego_kph, road_speed_limit_changed,
       )
 
@@ -1254,38 +1497,25 @@ class CarrotServ:
 
     left_spd_sec = 100
     left_tbt_sec = 100
+    speed_countdown_rearmed = False
+    turn_countdown_rearmed = False
     if self.autoNaviCountDownMode > 0:
-      if self.xSpdType == 22 and self.autoNaviCountDownMode == 1: # speed bump
-        pass
-      else:
-        if self.xSpdDist > 0:
-          left_spd_sec = min(self.left_spd_sec, int(max(self.xSpdDist - v_ego, 1) / max(1, v_ego) + 0.5))
-
-      if self.xDistToTurn > 0:
-        left_tbt_sec = min(self.left_tbt_sec, int(max(self.xDistToTurn - v_ego, 1) / max(1, v_ego) + 0.5))
+      speed_countdown_distance = self._speed_countdown_distance(CS)
+      left_spd_sec, self.speed_countdown_distance_last, speed_countdown_rearmed = self._countdown_channel(
+        speed_countdown_distance, self.speed_countdown_distance_last, self.left_spd_sec, v_ego,
+      )
+      left_tbt_sec, self.turn_countdown_distance_last, turn_countdown_rearmed = self._countdown_channel(
+        self.xDistToTurn, self.turn_countdown_distance_last, self.left_tbt_sec, v_ego,
+      )
+    else:
+      self.speed_countdown_distance_last = 0.0
+      self.turn_countdown_distance_last = 0.0
 
     self.left_spd_sec = left_spd_sec
     self.left_tbt_sec = left_tbt_sec
 
-    left_sec = min(left_spd_sec, left_tbt_sec)
-
-    if left_sec > 11:
-      self.left_sec = 100
-      self.max_left_sec = 100
-    else:
-      self.sdi_inform = True if source in ["cam", "hda"] else False
-      self.max_left_sec = min(11, max(6, int(v_ego_kph/10) + 1))
-
-    if left_sec != self.left_sec:
-      if left_sec == self.max_left_sec and self.sdi_inform:
-        self.carrot_left_sec = 11
-      elif 1 <= left_sec < self.max_left_sec:
-        self.carrot_left_sec = left_sec
-      elif left_sec == 0 and self.left_sec == 1:
-        self.carrot_left_sec = left_sec
-
-      self.left_sec = left_sec
-
+    left_sec = 100 if navigation_source_changed or speed_countdown_rearmed or turn_countdown_rearmed else min(left_spd_sec, left_tbt_sec)
+    self._update_countdown_alert(left_sec, source, v_ego_kph)
 
     self._update_cmd()
     msg = messaging.new_message('carrotMan')
@@ -1306,6 +1536,11 @@ class CarrotServ:
     msg.carrotMan.szTBTMainText = self.szTBTMainText
     msg.carrotMan.desiredSpeed = int(desired_speed)
     msg.carrotMan.desiredSource = source
+    vehicle_navi_active, vehicle_navi_speed, vehicle_navi_section_active = self._vehicle_navigation_display(CS)
+    msg.carrotMan.vehicleNaviActive = vehicle_navi_active
+    msg.carrotMan.vehicleNaviSpeed = vehicle_navi_speed
+    msg.carrotMan.vehicleNaviSectionActive = vehicle_navi_section_active
+    msg.carrotMan.vehicleNaviAvailable = bool(getattr(CS, "vehicleNaviAvailable", False))
     msg.carrotMan.carrotCmdIndex = int(self.carrotCmdIndex)
     msg.carrotMan.carrotCmd = self.carrotCmd
     msg.carrotMan.carrotArg = self.carrotArg
@@ -1319,6 +1554,9 @@ class CarrotServ:
     msg.carrotMan.nGoPosDist = self.nGoPosDist
     msg.carrotMan.nGoPosTime = self.nGoPosTime
     msg.carrotMan.szSdiDescr = self._get_sdi_descr(-1 if self.nSdiType == 0 and self.nSdiDist == 0 else self.nSdiType)
+    if rear_camera_holding and source == "cam":
+      label = {"ko": "후면단속 속도 유지", "en": "Rear camera speed hold", "zh": "后向测速限速保持"}.get(self.lang, "Rear camera speed hold")
+      msg.carrotMan.szSdiDescr = f"{label} {math.ceil(rear_camera_remaining)}m"
 
     #coords_str = ";".join([f"{x},{y}" for x, y in coords])
     coords_str = ";".join([f"{x:.2f},{y:.2f},{d:.2f}" for (x, y), d in zip(coords, distances, strict=False)])

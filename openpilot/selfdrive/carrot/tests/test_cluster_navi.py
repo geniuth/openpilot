@@ -15,11 +15,12 @@ CLUSTER_DIR = Path(__file__).resolve().parents[1] / "cluster"
 sys.path.insert(0, str(CLUSTER_DIR))
 
 from cluster_config import (
+  AMBER,
   DARK_CLUSTER_THEME,
-  GREEN,
   LIGHT_CLUSTER_THEME,
   RADAR_TO_CAMERA_M,
   RED,
+  VEHICLE_NAVI,
   VEHICLE_LENGTH_M,
   WHITE,
 )
@@ -65,6 +66,7 @@ from cluster_renderer import (
   TPMS_STATUS_VALUE_CENTER_Y,
   TPMS_STATUS_WHEEL_H,
   TPMS_STATUS_WHEEL_W,
+  WIFI_STATUS_CENTER_X,
   ClusterUiRenderer,
 )
 
@@ -1098,11 +1100,11 @@ def test_nav_status_is_centered_below_wifi_and_keeps_clock(
 
   assert draws[0][0][0] == "12:34:56"
   assert draws[1] == ((
-    "NAV",
+    "NAVI",
     NAV_STATUS_CENTER_X,
     NAV_STATUS_CENTER_Y,
     NAV_STATUS_FONT_SIZE,
-    GREEN,
+    AMBER,
     (10, 13, 16),
     2,
   ), {"anchor": "center", "cache": True})
@@ -1120,6 +1122,49 @@ def test_nav_status_hides_without_external_navigation():
   ))
 
   assert draws == []
+
+
+def test_external_nav_status_uses_orange_navi_and_takes_priority():
+  renderer = object.__new__(ClusterUiRenderer)
+  draws = []
+  renderer._draw_text_with_stroke = lambda *args, **kwargs: draws.append((args, kwargs))
+
+  renderer._draw_center_clock(SimpleNamespace(
+    center_clock_text=None,
+    external_nav_active=True,
+    vehicle_navi_available=True,
+    navi_dashboard=SimpleNamespace(connected=True),
+  ))
+
+  assert draws == [( (
+    "NAVI",
+    NAV_STATUS_CENTER_X,
+    NAV_STATUS_CENTER_Y,
+    NAV_STATUS_FONT_SIZE,
+    AMBER,
+    (10, 13, 16),
+    2,
+  ), {"anchor": "center", "cache": True})]
+
+
+def test_vehicle_nav_status_uses_lavender_vnavi_without_external_navigation():
+  renderer = object.__new__(ClusterUiRenderer)
+  draws = []
+  renderer._draw_text_with_stroke = lambda *args, **kwargs: draws.append((args, kwargs))
+
+  renderer._draw_center_clock(SimpleNamespace(
+    center_clock_text=None,
+    external_nav_active=False,
+    vehicle_navi_available=True,
+    navi_dashboard=None,
+  ))
+
+  assert draws[0][0][0] == "vNAVI"
+  assert draws[0][0][4] == VEHICLE_NAVI
+
+
+def test_navigation_status_moves_one_character_left_of_wifi():
+  assert NAV_STATUS_CENTER_X == WIFI_STATUS_CENTER_X - NAV_STATUS_FONT_SIZE
 
 
 def test_parser_accepts_direct_projection_dict():

@@ -1,5 +1,7 @@
 import pytest
 
+from types import SimpleNamespace
+
 from openpilot.common.constants import CV
 from openpilot.selfdrive.carrot.carrot_serv import CarrotServ
 
@@ -41,6 +43,7 @@ def _serv():
   serv.carrot_navi_vehicle_sequence = -1
   serv.carrot_navi_route_sequence = -1
   serv.carrot_navi_active = False
+  serv.external_navigation_active = False
   serv.carrot_navi_has_control = False
   serv.carrot_navi_road_limit_valid = False
   serv.carrot_navi_off_route = False
@@ -53,8 +56,10 @@ def _serv():
   serv.nRoadLimitSpeed_counter = 0
   serv.active_kisa_count = 0
   serv.autoNaviSpeedCtrlMode = 3
+  serv.vehicleNaviCanControl = True
   serv.autoNaviSpeedSafetyFactor = 1.0
   serv.autoNaviSpeedBumpSpeed = 20
+  serv.autoNaviSpeedBumpEndDistance = 0.0
   serv.is_metric = True
   serv.roadcate = 8
   serv.nRoadLimitSpeed = 30
@@ -128,6 +133,28 @@ def _message():
     "laneCurrent": {"meta": _meta(1, present=False)},
     "navigationStatus": {"meta": _meta(1, present=False)},
   }
+
+
+@pytest.mark.parametrize("disconnect", ("connected", "alive", "valid"))
+def test_7714_connected_without_guidance_owns_navigation_until_disconnect(disconnect):
+  serv = _serv()
+  sm = _SubMaster({"schemaVersion": 1, "connected": True, "sessionId": "idle"})
+  assert not serv._update_carrot_navi(sm)
+  assert serv._external_navigation_connected()
+  assert serv._update_navigation_source()
+  assert serv.external_navigation_active
+  sm.updated["carrotNavi"] = False
+  assert not serv._update_carrot_navi(sm)
+  assert serv._external_navigation_connected()
+
+  sm.updated["carrotNavi"] = True
+  if disconnect == "connected":
+    sm.data["connected"] = False
+  else:
+    getattr(sm, disconnect)["carrotNavi"] = False
+  assert not serv._update_carrot_navi(sm)
+  assert serv._update_navigation_source()
+  assert not serv.external_navigation_active
 
 
 def test_applies_new_navi_control_without_resetting_distance_on_heartbeat():
@@ -325,3 +352,66 @@ def test_waze_alert_without_road_limit_has_no_speed_target():
   assert serv.xSpdType == 101
   assert serv.xSpdLimit == 0
   assert serv.xSpdDist == 200
+
+
+def test_vehicle_navi_speed_bump_requires_both_settings_and_distance():
+  serv = _serv()
+  car_state = SimpleNamespace(speedBumpDistance=120.0)
+
+  assert serv._vehicle_speed_bump_enabled(car_state)
+
+  serv.vehicleNaviCanControl = False
+  assert not serv._vehicle_speed_bump_enabled(car_state)
+
+  serv.vehicleNaviCanControl = True
+  serv.autoNaviSpeedCtrlMode = 1
+  assert not serv._vehicle_speed_bump_enabled(car_state)
+
+  serv.autoNaviSpeedCtrlMode = 2
+  car_state.speedBumpDistance = 0.0
+  assert not serv._vehicle_speed_bump_enabled(car_state)
+
+
+@pytest.mark.parametrize('mode, expected_source, expected_speed', [(0, 'road', 200), (1, 'vturn', 110), (2, 'route', 70), (3, 'route', 70)])
+def test_curve_selection_ignores_retired_model_speed(monkeypatch, mode, expected_source, expected_speed):
+  from openpilot.selfdrive.carrot import carrot_serv
+
+  class Params:
+    def __init__(self, *_args):
+      pass
+
+    def get(self, key):
+      return str({'AutoCurveSpeedLowerLimit': 20, 'TurnSpeedControlMode': mode,
+                  'MapTurnSpeedFactor': 100, 'ModelTurnSpeedFactor': 80}.get(key, 0))
+
+    def get_int(self, key):
+      return int(self.get(key))
+
+    def get_float(self, key):
+      return float(self.get(key))
+
+    def get_bool(self, key):
+      return bool(self.get_int(key))
+
+  monkeypatch.setattr(carrot_serv, 'Params', Params)
+  serv = CarrotServ()
+  monkeypatch.setattr(serv, '_update_carrot_navi', lambda _sm: False)
+  monkeypatch.setattr(serv, '_update_gps', lambda *_args: 0.)
+  monkeypatch.setattr(serv, 'update_nav_instruction', lambda _sm: None)
+  monkeypatch.setattr(serv, 'update_auto_turn', lambda *_args: (250., 'none', 250., 0.))
+  monkeypatch.setattr(serv, '_vehicle_navigation_display', lambda _cs: (False, 0, False))
+
+  class SubMaster(dict):
+    alive = {'carState': False, 'selfdriveState': False, 'navInstruction': False}
+
+  sm = SubMaster(modelV2=SimpleNamespace(meta=SimpleNamespace(modelTurnSpeed=16.)))
+  sent = {}
+  pm = SimpleNamespace(send=lambda name, message: sent.update({name: message}))
+  serv.update_navi('', sm, pm, 110., [], [], 70., 'gpsLocationExternal')
+  result = sent['carrotMan'].carrotMan
+  assert (result.desiredSource, result.desiredSpeed) == (expected_source, expected_speed)
+  # The old 120 km/h gate must not produce a new source or a 20 km/h target.
+  serv.update_navi('', sm, pm, 125., [], [], 70., 'gpsLocationExternal')
+  result = sent['carrotMan'].carrotMan
+  assert result.desiredSource == expected_source
+  assert result.desiredSpeed == (125 if mode == 1 else expected_speed)

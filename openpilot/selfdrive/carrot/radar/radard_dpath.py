@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 from openpilot.cereal import car, log, messaging
@@ -11,6 +10,8 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import Priority, config_realtime_process
 from openpilot.common.swaglog import cloudlog
 from opendbc.car.hyundai.values import HyundaiExtFlags
+from openpilot.selfdrive.carrot.radar import effective_radar_track_mode
+from openpilot.selfdrive.carrot.radar_motion.coordinates import device_yaw_to_radar
 from openpilot.selfdrive.carrot.radar_motion import (
   DPathRadarController,
 )
@@ -21,6 +22,7 @@ CORNER_RADAR_FLAGS = int(
   | HyundaiExtFlags.CORNER_RADAR_OBJECTS_180
   | HyundaiExtFlags.CORNER_RADAR_OBJECTS_430
 )
+PRODUCTION_CUT_IN_SENSITIVITY = 3
 EMPTY_LEAD = {
   "dRel": 0.0,
   "yRel": 0.0,
@@ -40,6 +42,8 @@ EMPTY_LEAD = {
   "radarTrackId": -1,
   "jLead": 0.0,
   "score": 0.0,
+  "cutOutTime": 0.0,
+  "cutOutConfidence": 0.0,
 }
 
 
@@ -64,7 +68,7 @@ def _yaw_rate(live_pose: Any) -> float:
     and bool(getattr(live_pose, "sensorsOK", False))
   ):
     value = float(getattr(angular_velocity, "z", 0.0))
-    return value if math.isfinite(value) else 0.0
+    return device_yaw_to_radar(value)
   return 0.0
 
 
@@ -80,18 +84,21 @@ class DPathRadarD:
 
   def __init__(self, CP: car.CarParams) -> None:
     params = Params()
+    enable_radar_tracks = effective_radar_track_mode(
+      CP.brand,
+      CP.radarUnavailable,
+      params.get_int("EnableRadarTracks"),
+    )
     self.controller = DPathRadarController(
       prefer_corner_radar=corner_radar_enabled(
         CP,
         params.get_int("EnableCornerRadar"),
       ),
-      enable_radar_tracks=params.get_int("EnableRadarTracks"),
-      cut_in_sensitivity=params.get_int(
-        "CarrotRadarCutInSensitivity",
-      ),
+      enable_radar_tracks=enable_radar_tracks,
+      cut_in_sensitivity=PRODUCTION_CUT_IN_SENSITIVITY,
       front_radar_measurement_delay_s=float(CP.radarDelay),
+      production_live_tracks=True,
     )
-    self.params = params
     self.radar_state = log.RadarState.new_message()
     self.radar_state_valid = False
 
@@ -117,9 +124,6 @@ class DPathRadarD:
       model=sm["modelV2"],
       yaw_rate_rad_s=_yaw_rate(sm["livePose"]),
       radar_to_model_time_s=model_time_s - radar_time_s,
-      radar_reaction_factor=(
-        self.params.get_float("RadarReactionFactor") * 0.01
-      ),
     )
     self.radar_state.leadOne = output.lead_one or empty_lead()
     self.radar_state.leadTwo = output.lead_two or empty_lead()
@@ -129,6 +133,7 @@ class DPathRadarD:
     self.radar_state.leadsCenter = output.leads_center
     self.radar_state.leadsRight = output.leads_right
     self.radar_state.leadsCutIn = output.leads_cutin
+    self.radar_state.leadCutInRisk = output.lead_cutin_risk or empty_lead()
     self.radar_state.leadsLeft2 = output.leads_left2
     self.radar_state.leadsRight2 = output.leads_right2
 

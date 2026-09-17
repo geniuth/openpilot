@@ -33,6 +33,7 @@ from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 
 from openpilot.selfdrive.carrot.carrot_controls import CarrotControls
+from openpilot.selfdrive.carrot.carrot_man_input import get_carrot_man
 
 State = log.SelfdriveState.OpenpilotState
 LaneChangeState = log.LaneChangeState
@@ -40,6 +41,14 @@ LaneChangeDirection = log.LaneChangeDirection
 LAT_CURVATURE_SATURATION_ACCEL = 0.1  # infiniteCable2 LatControlCurvature: 곡률 기반 steer_limited 임계 (m/s^2 환산)
 
 ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
+
+
+def lateral_control_allowed(selfdrive_active: bool, always_lateral: bool, lat_enabled: bool,
+                            steer_fault_temporary: bool, steer_fault_permanent: bool,
+                            below_min_speed: bool, standstill: bool, steer_at_standstill: bool) -> bool:
+  return ((selfdrive_active or always_lateral) and lat_enabled and
+          not steer_fault_temporary and not steer_fault_permanent and
+          ((standstill and steer_at_standstill) or (not standstill and not below_min_speed)))
 
 
 class Controls:
@@ -138,9 +147,12 @@ class Controls:
     #self.soft_hold_active = CS.softHoldActive #car.OnroadEvent.EventName.softHold in [e.name for e in self.sm['onroadEvents']]
 
     # Check which actuators can be enabled
-    standstill = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, MIN_LATERAL_CONTROL_SPEED) or CS.standstill
-    CC.latActive = ((self.sm['selfdriveState'].active or lateral_enabled) and CS.latEnabled and
-                    not CS.steerFaultTemporary and not CS.steerFaultPermanent and not standstill)
+    below_min_speed = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, MIN_LATERAL_CONTROL_SPEED)
+    # This Tesla engagement change must not relax other brands' speed gates.
+    steer_at_standstill = self.CP.brand == "tesla" and self.CP.steerAtStandstill
+    CC.latActive = lateral_control_allowed(self.sm['selfdriveState'].active, lateral_enabled, CS.latEnabled,
+                                           CS.steerFaultTemporary, CS.steerFaultPermanent, below_min_speed,
+                                           CS.standstill, steer_at_standstill)
     CC.latActive = self.carrot_controls.lat_suspend_control(CS, CC.latActive)
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
 
@@ -272,7 +284,8 @@ class Controls:
     CC.cruiseControl.override = CC.enabled and not CC.longActive and self.CP.openpilotLongitudinalControl
     CC.cruiseControl.cancel = CS.cruiseState.enabled and (not CC.enabled or not self.CP.pcmCruise)
 
-    desired_kph = min(CS.vCruiseCluster, self.sm['carrotMan'].desiredSpeed)
+    carrot_man = get_carrot_man(self.sm)
+    desired_kph = CS.vCruiseCluster if carrot_man is None else min(CS.vCruiseCluster, carrot_man.desiredSpeed)
     setSpeed = float(desired_kph * CV.KPH_TO_MS)
     speeds = self.sm['longitudinalPlan'].speeds
     if len(speeds):

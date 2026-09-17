@@ -4,7 +4,9 @@ import uuid
 
 from aiohttp import web
 
+from ...services.git_state import read_auto_update_state
 from ...services.git_status import get_git_status
+from ...services.device_info import get_tools_device_info
 from . import jobs
 from .actions import validate_action
 from .dispatcher import dispatch_sync, run_tool_job
@@ -100,7 +102,12 @@ async def api_tools_git_status(request: web.Request) -> web.Response:
     for name in ("force", "refresh")
   )
   status = await get_git_status(force=force)
-  return web.json_response({"ok": True, **status})
+  return web.json_response({"ok": True, **status, "auto_update": read_auto_update_state()})
+
+
+async def api_tools_device_info(_request: web.Request) -> web.Response:
+  """Read the local, non-setting support metadata used by Tools > Info."""
+  return web.json_response({"ok": True, "info": await asyncio.to_thread(get_tools_device_info)})
 
 
 def register(app: web.Application) -> None:
@@ -112,3 +119,4 @@ def register(app: web.Application) -> None:
   app.router.add_delete("/api/tools/jobs", api_tools_jobs_clear)
   app.router.add_post("/api/tools/jobs/notice", api_tools_jobs_notice)
   app.router.add_get("/api/tools/git_status", api_tools_git_status)
+  app.router.add_get("/api/tools/device_info", api_tools_device_info)

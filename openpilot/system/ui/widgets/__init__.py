@@ -7,12 +7,22 @@ from typing import TypeVar
 from collections.abc import Callable
 from openpilot.system.ui.lib.application import gui_app, MousePos, MAX_TOUCH_SLOTS, MouseEvent
 
+
+class _StandaloneDevice:
+  awake = True
+
+
 try:
-  from openpilot.selfdrive.ui.ui_state import device
+  from openpilot.common.params import UnknownKeyName
 except ImportError:
-  class Device:
-    awake = True
-  device = Device()
+  # A clean source install runs the AGNOS updater before params_pyx is built.
+  device = _StandaloneDevice()
+else:
+  try:
+    from openpilot.selfdrive.ui.ui_state import device
+  except (ImportError, UnknownKeyName):
+    # Also tolerate a stale params_pyx binary during an OS transition.
+    device = _StandaloneDevice()
 
 W = TypeVar('W', bound='Widget')
 

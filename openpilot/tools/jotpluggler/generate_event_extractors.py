@@ -18,7 +18,11 @@ SCALAR_KINDS = {
   "enum": "Enum",
 }
 NESTED_TYPE_KINDS = {"struct", "list"}
-IGNORED_TYPE_KINDS = {"void", "text", "data", "interface", "anyPointer"}
+IGNORED_TYPE_KINDS = {"void", "data", "interface", "anyPointer"}
+
+# Model trajectories use 33 samples. Keep longer lists collapsed to avoid
+# turning raw tensors and other large payloads into thousands of plot series.
+MAX_EXPANDED_SCALAR_LIST_SIZE = 33
 
 
 def cxx_string(value):
@@ -94,6 +98,9 @@ class Generator:
   def emit_node(self, indent, type_kind, type_proto, schema, expr, path, path_expr, dynamic_path):
     if not self.node_emits(type_kind, type_proto, schema):
       return
+    if type_kind == "text":
+      self.emit(indent, f"append_text_point({path_expr if dynamic_path else cxx_string(path)}, tm, {expr}, series);")
+      return
     kind = scalar_kind(type_proto)
     if kind is not None:
       double_expr = self.scalar_double_expr(expr, kind)
@@ -137,7 +144,7 @@ class Generator:
     conditions = []
     if proto.discriminantValue != NO_DISCRIMINANT:
       conditions.append(f"{reader_expr}.which() == static_cast<decltype({reader_expr}.which())>({proto.discriminantValue})")
-    if proto.which() == "slot" and type_kind in NESTED_TYPE_KINDS:
+    if proto.which() == "slot" and type_kind in NESTED_TYPE_KINDS | {"text"}:
       conditions.append(has_call)
 
     if conditions:
@@ -171,7 +178,7 @@ class Generator:
 
     elem_scalar = scalar_kind(elem_type)
     if elem_scalar is not None:
-      self.emit(indent, f"if ({list_expr}.size() <= 16) {{")
+      self.emit(indent, f"if ({list_expr}.size() <= {MAX_EXPANDED_SCALAR_LIST_SIZE}) {{")
       index_var = self.tmp("i")
       self.emit(indent + 2, f"for (uint {index_var} = 0; {index_var} < {list_expr}.size(); ++{index_var}) {{")
       item_series = self.tmp("item_series")
@@ -180,6 +187,15 @@ class Generator:
         self.emit_enum_capture(indent + 4, f"{item_series}->path", enum_names(schema.elementType))
       self.emit(indent + 4, f"append_fixed_scalar_point({item_series}, tm, {self.scalar_double_expr(f'{list_expr}[{index_var}]', elem_scalar)});")
       self.emit(indent + 2, "}")
+      self.emit(indent, "}")
+      return
+
+    if elem_kind == "text":
+      index_var = self.tmp("i")
+      self.emit(indent, f"for (uint {index_var} = 0; {index_var} < {list_expr}.size(); ++{index_var}) {{")
+      item_path = self.tmp("item_path")
+      self.emit(indent + 2, f"const std::string {item_path} = {base_path_var} + \"/\" + std::to_string({index_var});")
+      self.emit(indent + 2, f"append_text_point({item_path}, tm, {list_expr}[{index_var}], series);")
       self.emit(indent, "}")
       return
 
@@ -197,6 +213,8 @@ class Generator:
       self.emit(indent, "}")
 
   def node_emits(self, type_kind, type_proto, schema, seen=frozenset()):
+    if type_kind == "text":
+      return True
     if scalar_kind(type_proto) is not None:
       return True
     if type_kind == "struct":
@@ -228,6 +246,8 @@ class Generator:
       elem_kind = elem_type.which()
       if elem_kind in IGNORED_TYPE_KINDS:
         return False
+      if elem_kind == "text":
+        return True
       if scalar_kind(elem_type) is not None:
         return True
       if elem_kind == "struct":

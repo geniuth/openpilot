@@ -237,6 +237,15 @@
 
           <!-- CarrotPilot Groups -->
           <div id="carrotTabContent">
+            <form id="settingInlineSearch" class="setting-inline-search" role="search">
+              <label id="settingInlineSearchLabel" for="settingInlineSearchInput">설정 찾기</label>
+              <div class="setting-inline-search__field">
+                <input id="settingInlineSearchInput" type="search" placeholder="예: 감속, TF" autocomplete="off" spellcheck="false" enterkeyhint="search" aria-describedby="settingInlineSearchHint" />
+                <button id="settingInlineSearchClear" type="button" aria-label="검색어 지우기" hidden>×</button>
+              </div>
+              <div id="settingInlineSearchHint" class="setting-inline-search__hint">이름·설명·분류로 검색 · 최대 20개</div>
+              <output id="settingInlineSearchStatus" class="setting-inline-search__status" aria-live="polite"></output>
+            </form>
             <div id="groupList"></div>
           </div>
 
@@ -283,6 +292,24 @@
       </div>
 
       <div class="tools-scroll-stack">
+        <section id="egpuModelCard" class="egpu-model-card" hidden aria-live="polite">
+          <div class="egpu-model-card__icon" aria-hidden="true">HB</div>
+          <div class="egpu-model-card__body">
+            <div class="egpu-model-card__heading">
+              <strong id="egpuModelTitle">eGPU big model</strong>
+              <span id="egpuModelState" class="egpu-model-card__state">Checking</span>
+            </div>
+            <p id="egpuModelDetail" class="egpu-model-card__detail"></p>
+            <div id="egpuModelProgress" class="egpu-model-card__progress" hidden>
+              <div class="egpu-model-card__track"><span id="egpuModelProgressBar"></span></div>
+            </div>
+            <div class="egpu-model-card__footer">
+              <span id="egpuModelAmount" class="egpu-model-card__amount"></span>
+              <button id="btnEgpuCompileRestart" class="btn egpu-model-card__action" type="button" hidden>Restart &amp; compile</button>
+            </div>
+          </div>
+        </section>
+
         <div id="toolsPrimaryActions" class="tools-primary-actions ui-action-grid ui-action-grid--quick mb-md" role="group" aria-label="Tools shortcuts">
           <button id="btnToolsCarSelect" class="btn" type="button">Car Select</button>
           <button id="btnToolsLanguage" class="btn" type="button" aria-haspopup="dialog">Language</button>
@@ -323,7 +350,6 @@
               <button id="btnResetCalib" class="btn btn--danger">Reset Calib</button>
               <button id="btnSendTmuxLog" class="btn">capture tmux</button>
               <button id="btnSendTmuxServerLog" class="btn">send tmux</button>
-              <button id="btnInstallRequired" class="btn">install shapely</button>
               <button id="btnDeleteVideos" class="btn btn--danger">delete all videos</button>
               <button id="btnDeleteLogs" class="btn btn--danger">delete all logs</button>
               <button id="btnRebuildAll" class="smallBtn btn--danger">Rebuild All</button>

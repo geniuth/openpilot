@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <cassert>
+#include <cinttypes>
 #include <cerrno>
 #include <memory>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 #include "cereal/gen/cpp/car.capnp.h"
@@ -16,6 +19,7 @@
 #include "common/swaglog.h"
 #include "common/timing.h"
 #include "common/util.h"
+#include "selfdrive/pandad/spi_alert.h"
 #include "system/hardware/hw.h"
 
 #define MAX_IR_PANDA_VAL 50
@@ -23,6 +27,7 @@
 #define SATURATE_IL 1000
 
 ExitHandler do_exit;
+static std::atomic<bool> pandad_is_onroad = false;
 
 bool check_all_connected(const std::vector<Panda *> &pandas) {
   for (Panda *panda : pandas) {
@@ -61,6 +66,12 @@ Panda *connect(std::string serial, uint32_t index) {
 
 void can_send_thread(std::vector<Panda *> pandas, bool fake_send) {
   util::set_thread_name("pandad_can_send");
+  if (!Hardware::PC()) {
+    int err = util::set_realtime_priority(55);
+    if (err != 0) {
+      LOGE("failed to raise Panda CAN send thread priority: %d", err);
+    }
+  }
 
   AlignedBuffer aligned_buf;
   std::unique_ptr<Context> context(Context::create());
@@ -77,9 +88,12 @@ void can_send_thread(std::vector<Panda *> pandas, bool fake_send) {
 
     capnp::FlatArrayMessageReader cmsg(aligned_buf.align(msg.get()));
     cereal::Event::Reader event = cmsg.getRoot<cereal::Event>();
+    const uint64_t recv_ns = nanos_since_boot();
+    const uint64_t event_ns = event.getLogMonoTime();
+    const uint64_t queue_age_ns = recv_ns >= event_ns ? recv_ns - event_ns : 0U;
 
     // Don't send if older than 1 second
-    if ((nanos_since_boot() - event.getLogMonoTime() < 1e9) && !fake_send) {
+    if ((queue_age_ns < 1e9) && !fake_send) {
       for (Panda *panda : pandas) {
         LOGT("sending sendcan to panda: %s", (panda->hw_serial()).c_str());
         panda->can_send(event.getSendcan());
@@ -110,6 +124,87 @@ void can_recv(const std::vector<Panda *> &pandas, PubMaster *pm) {
       canData[i].setSrc(raw_can_data[i].src);
     }
     pm->send("can", msg);
+  }
+}
+
+void can_recv_thread(std::vector<Panda *> pandas) {
+  util::set_thread_name("pandad_can_recv");
+  if (!Hardware::PC()) {
+    int err = util::set_realtime_priority(56);
+    if (err != 0) {
+      LOGE("failed to raise Panda CAN receive thread priority: %d", err);
+    }
+  }
+
+  RateKeeper rk("pandad_can_recv", 100);
+  PubMaster pm({"can"});
+
+  while (!do_exit && check_all_connected(pandas)) {
+    can_recv(pandas, &pm);
+    rk.keepTime();
+  }
+}
+
+void spi_error_report_thread() {
+  util::set_thread_name("pandad_spi_diag");
+  Params params;
+  uint64_t observed_sequence = get_panda_spi_error_sequence();
+  PandaSpiErrorEvent pending_event;
+  bool has_pending_event = false;
+  PandaSpiAlertTracker alert_tracker;
+
+  while (!do_exit) {
+    const uint64_t now_ms = millis_since_boot();
+    const uint64_t current_sequence = get_panda_spi_error_sequence();
+    const bool is_onroad = pandad_is_onroad.load(std::memory_order_relaxed);
+    alert_tracker.update_onroad(is_onroad, now_ms);
+
+    if (!is_onroad) {
+      // Ignore startup/offroad SPI activity and discard an alert candidate when
+      // ignition drops during the confirmation delay.
+      observed_sequence = current_sequence;
+      has_pending_event = false;
+    } else {
+      if (current_sequence != observed_sequence) {
+        const uint64_t event_count = current_sequence - observed_sequence;
+        pending_event = get_latest_panda_spi_error_event();
+        observed_sequence = current_sequence;
+        const bool terminal_failure = pending_event.final_result < 0;
+        if (alert_tracker.observe(now_ms, event_count, terminal_failure)) {
+          has_pending_event = true;
+          LOGW("spi_tmux_candidate_diag: sequence=%" PRIu64 ", events=%" PRIu64
+               ", endpoint=0x%x, first_result=%d, final_result=%d"
+               ", attempts=%u, recoveries=%u, tx_len=%u, max_rx_len=%u, timeout_ms=%u"
+               ", phase=%s, lock_us=%" PRIu64
+               ", turnaround_us=%" PRIu64 ", hack_us=%" PRIu64
+               ", dack_us=%" PRIu64 ", recovery_us=%" PRIu64
+               ", total_us=%" PRIu64 ", recovery_restarts=%u",
+               pending_event.sequence, event_count, pending_event.endpoint,
+               pending_event.result, pending_event.final_result,
+               pending_event.attempts, pending_event.recoveries,
+               pending_event.tx_len, pending_event.max_rx_len,
+               pending_event.timeout_ms, pending_event.phase.c_str(), pending_event.lock_us,
+               pending_event.turnaround_us, pending_event.hack_us, pending_event.dack_us,
+               pending_event.recovery_us, pending_event.total_us, pending_event.recovery_restarts);
+        }
+      }
+
+      if (has_pending_event && alert_tracker.ready(now_ms)) {
+        const std::string pending_reason = params.get("CarrotException");
+        if (pending_reason.empty()) {
+          params.put("CarrotException", "spi_error");
+          LOGW("spi_tmux_trigger: queued CarrotException=spi_error");
+          alert_tracker.mark_capture_requested();
+          has_pending_event = false;
+        } else if (pending_reason == "spi_error") {
+          LOGW("spi_tmux_trigger: coalesced with CarrotException=spi_error");
+          alert_tracker.mark_capture_requested();
+          has_pending_event = false;
+        }
+      }
+    }
+
+    util::sleep_for(100);
   }
 }
 
@@ -170,6 +265,7 @@ void fill_panda_can_state(cereal::PandaState::PandaCanState::Builder &cs, const 
 }
 
 std::optional<bool> send_panda_states(PubMaster *pm, const std::vector<Panda *> &pandas, bool is_onroad, bool spoofing_started) {
+  static std::unordered_map<std::string, uint16_t> spi_checksum_counts;
   bool ignition_local = false;
   const uint32_t pandas_cnt = pandas.size();
 
@@ -188,13 +284,32 @@ std::optional<bool> send_panda_states(PubMaster *pm, const std::vector<Panda *> 
                                      (pandas[0]->hw_type == cereal::PandaState::PandaType::DOS) &&
                                      (pandas[1]->hw_type == cereal::PandaState::PandaType::RED_PANDA);
 
-  for (Panda *panda : pandas) {
+  for (size_t panda_index = 0; panda_index < pandas.size(); ++panda_index) {
+    Panda *panda = pandas[panda_index];
     auto health_opt = panda->get_state();
     if (!health_opt) {
       return std::nullopt;
     }
 
     health_t health = *health_opt;
+
+    const std::string panda_serial = panda->hw_serial();
+    const std::string log_source = "panda[" + std::to_string(panda_index) + "]";
+    const uint16_t spi_checksum_error_count = health.spi_checksum_error_count_pkt;
+    auto [checksum_it, inserted] = spi_checksum_counts.try_emplace(panda_serial, spi_checksum_error_count);
+    if (inserted) {
+      cloudlog_e(CLOUDLOG_WARNING, log_source.c_str(), __LINE__, __func__,
+                 "SPI checksum: serial=%s, total=%u, delta=0, baseline=1",
+                 panda_serial.c_str(), spi_checksum_error_count);
+    } else if (checksum_it->second != spi_checksum_error_count) {
+      const bool reset = spi_checksum_error_count < checksum_it->second;
+      const uint32_t delta = reset ? spi_checksum_error_count :
+                             spi_checksum_error_count - checksum_it->second;
+      cloudlog_e(CLOUDLOG_WARNING, log_source.c_str(), __LINE__, __func__,
+                 "SPI checksum: serial=%s, total=%u, delta=%u, baseline=0, reset=%d",
+                 panda_serial.c_str(), spi_checksum_error_count, delta, reset);
+      checksum_it->second = spi_checksum_error_count;
+    }
 
     std::array<can_health_t, PANDA_CAN_CNT> can_health{};
     for (uint32_t i = 0; i < PANDA_CAN_CNT; i++) {
@@ -303,7 +418,7 @@ void send_peripheral_state(Panda *panda, PubMaster *pm) {
   pm->send("peripheralState", msg);
 }
 
-void process_panda_state(const std::vector<Panda *> &pandas, PubMaster *pm, bool engaged, bool is_onroad, bool spoofing_started) {
+std::optional<bool> process_panda_state(const std::vector<Panda *> &pandas, PubMaster *pm, bool engaged, bool is_onroad, bool spoofing_started) {
   std::vector<std::string> connected_serials;
   connected_serials.reserve(pandas.size());
   for (Panda *panda : pandas) {
@@ -313,7 +428,7 @@ void process_panda_state(const std::vector<Panda *> &pandas, PubMaster *pm, bool
   auto ignition_opt = send_panda_states(pm, pandas, is_onroad, spoofing_started);
   if (!ignition_opt) {
     LOGE("Failed to get ignition_opt");
-    return;
+    return std::nullopt;
   }
 
   // check if we should have pandad reconnect
@@ -342,6 +457,8 @@ void process_panda_state(const std::vector<Panda *> &pandas, PubMaster *pm, bool
   for (Panda *panda : pandas) {
     panda->send_heartbeat(engaged);
   }
+
+  return ignition_opt;
 }
 
 void process_peripheral_state(Panda *panda, PubMaster *pm, bool no_fan_control) {
@@ -408,6 +525,32 @@ void process_peripheral_state(Panda *panda, PubMaster *pm, bool no_fan_control) 
   }
 }
 
+void log_panda_serial(size_t panda_index, const std::string &log) {
+  const bool has_register_fault = log.find("Register 0x") != std::string::npos;
+  const bool has_spi_diag = (log.find("SPI:") != std::string::npos) ||
+                            (log.find("incorrect header") != std::string::npos) ||
+                            (log.find("incorrect data checksum") != std::string::npos);
+  const std::string log_source = "panda[" + std::to_string(panda_index) + "]";
+
+  size_t line_start = 0;
+  while (line_start < log.size()) {
+    const size_t line_end = log.find('\n', line_start);
+    std::string line = log.substr(line_start, line_end - line_start);
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+
+    if (!line.empty()) {
+      const int level = has_register_fault ? CLOUDLOG_ERROR :
+                        has_spi_diag ? CLOUDLOG_WARNING : CLOUDLOG_DEBUG;
+      cloudlog_e(level, log_source.c_str(), __LINE__, __func__, "%s", line.c_str());
+    }
+
+    if (line_end == std::string::npos) break;
+    line_start = line_end + 1;
+  }
+}
+
 void pandad_run(std::vector<Panda *> &pandas) {
   const bool no_fan_control = getenv("NO_FAN_CONTROL") != nullptr;
   const bool spoofing_started = getenv("STARTED") != nullptr;
@@ -415,20 +558,22 @@ void pandad_run(std::vector<Panda *> &pandas) {
 
   // Start the CAN send thread
   std::thread send_thread(can_send_thread, pandas, fake_send);
+  // Keep CAN receive cadence independent from slower status and serial work.
+  std::thread recv_thread(can_recv_thread, pandas);
+  // Params and tmux notification stay off the latency-sensitive SPI threads.
+  std::thread spi_diag_thread(spi_error_report_thread);
 
   Params params;
   RateKeeper rk("pandad", 100);
   SubMaster sm({"selfdriveState"});
-  PubMaster pm({"can", "pandaStates", "peripheralState"});
+  PubMaster pm({"pandaStates", "peripheralState"});
   PandaSafety panda_safety(pandas);
   Panda *peripheral_panda = pandas[0];
   bool engaged = false;
   bool is_onroad = false;
 
-  // Main loop: receive CAN data and process states
+  // Main loop: process lower-rate state, peripheral, and diagnostic work.
   while (!do_exit && check_all_connected(pandas)) {
-    can_recv(pandas, &pm);
-
     // Process peripheral state at 20 Hz
     if (rk.frame() % 5 == 0) {
       process_peripheral_state(peripheral_panda, &pm, no_fan_control);
@@ -439,8 +584,12 @@ void pandad_run(std::vector<Panda *> &pandas) {
       sm.update(0);
       engaged = sm.allAliveAndValid({"selfdriveState"}) && sm["selfdriveState"].getSelfdriveState().getEnabled();
       is_onroad = params.getBool("IsOnroad");
-      process_panda_state(pandas, &pm, engaged, is_onroad, spoofing_started);
-      panda_safety.configureSafetyMode(is_onroad);
+      pandad_is_onroad.store(is_onroad, std::memory_order_relaxed);
+      const auto ignition_opt = process_panda_state(pandas, &pm, engaged, is_onroad, spoofing_started);
+      // A vehicle sleep can drop ignition without ending the onroad session.
+      // Reset on a known ignition drop, and always preserve offroad cleanup even
+      // when a Panda state read fails.
+      panda_safety.configureSafetyMode(is_onroad && ignition_opt.value_or(true));
     }
 
     // Send out peripheralState at 2Hz
@@ -448,15 +597,14 @@ void pandad_run(std::vector<Panda *> &pandas) {
       send_peripheral_state(peripheral_panda, &pm);
     }
 
-    // Forward logs from pandas to cloudlog if available
-    for (Panda *panda : pandas) {
-      std::string log = panda->serial_read();
-      if (!log.empty()) {
-        if (log.find("Register 0x") != std::string::npos) {
-          // Log register divergent faults as errors
-          LOGE("%s", log.c_str());
-        } else {
-          LOGD("%s", log.c_str());
+    // Forward logs from pandas to cloudlog if available. Panda retains serial
+    // output, so 10 Hz is enough while avoiding a control SPI transfer every tick.
+    if (rk.frame() % 10 == 0) {
+      for (size_t i = 0; i < pandas.size(); ++i) {
+        Panda *panda = pandas[i];
+        std::string log = panda->serial_read();
+        if (!log.empty()) {
+          log_panda_serial(i, log);
         }
       }
     }
@@ -473,7 +621,9 @@ void pandad_run(std::vector<Panda *> &pandas) {
     }
   }
 
+  recv_thread.join();
   send_thread.join();
+  spi_diag_thread.join();
 }
 
 void pandad_main_thread(std::vector<std::string> serials) {

@@ -12,7 +12,9 @@ sys.path.insert(0, str(CLUSTER_DIR))
 from cluster_live import (
   LIVE_SERVICES_BASE,
   OpenpilotLiveSource,
+  deceleration_source_presentation,
   deceleration_source_display_label,
+  live_route_parser,
   standby_state,
 )
 import cluster_live
@@ -22,14 +24,17 @@ from cluster_models import ClusterAlert
 @pytest.mark.parametrize(
   ("source", "expected"),
   (
-    ("cam", "cam:n"),
-    ("hda", "cam:v"),
-    ("route", "route:v"),
-    ("vturn", "turn:c"),
-    ("model", "turn:c"),
-    ("atc", "turn:n"),
-    ("section", "section:n"),
-    ("longsource:c", "longsource:c"),
+    ("cam", "cam"),
+    ("hda", "cam"),
+    ("hda_section", "section"),
+    ("hda_bump", "bump"),
+    ("school", "school"),
+    ("route", "route"),
+    ("vturn", "vturn"),
+    ("model", "model"),
+    ("atc", "turn"),
+    ("section", "section"),
+    ("longsource:c", "longsour"),
     ("custom-source", "custom-s"),
     (None, "apply"),
   ),
@@ -39,15 +44,18 @@ def test_deceleration_source_display_label(source, expected) -> None:
 
 
 @pytest.mark.parametrize(
-  ("desired_source", "expected_label"),
+  ("desired_source", "expected_label", "expected_mode"),
   (
-    ("cam", "cam:n"),
-    ("hda", "cam:v"),
-    ("route", "route:v"),
-    ("model", "turn:c"),
+    ("cam", "cam", 4),
+    ("hda", "cam", 3),
+    ("hda_section", "section", 3),
+    ("hda_bump", "bump", 3),
+    ("school", "school", 3),
+    ("route", "route", 4),
+    ("model", "model", 2),
   ),
 )
-def test_live_deceleration_override_adds_source_origin(desired_source, expected_label) -> None:
+def test_live_deceleration_override_presents_navigation_origin(desired_source, expected_label, expected_mode) -> None:
   source = object.__new__(OpenpilotLiveSource)
   source._max_lateral_accel = 3.0
   source._energy_gauge_label = "fuel"
@@ -62,7 +70,98 @@ def test_live_deceleration_override_adds_source_origin(desired_source, expected_
 
   assert decorated.cruise_override_kph == 55.0
   assert decorated.cruise_override_label == expected_label
-  assert decorated.cruise_override_color_mode == 2
+  assert decorated.cruise_override_color_mode == expected_mode
+
+
+def test_live_hud_reads_active_egpu_param(monkeypatch) -> None:
+  source = object.__new__(OpenpilotLiveSource)
+  source._max_lateral_accel = 3.0
+  source._energy_gauge_label = "fuel"
+  source._carrot_navi_media = None
+  source._current_carrot_navi = lambda _now: None
+  source.params = SimpleNamespace(get_bool=lambda key: key == "UsbGpuActive")
+  source._service_data = lambda _service: None
+  source._service_alive = lambda _service: False
+  monkeypatch.setattr(cluster_live.time, "monotonic", lambda: 100.0)
+
+  decorated = source._with_live_hud_state(standby_state())
+
+  assert decorated.egpu_active
+
+
+def test_vehicle_navigation_deceleration_presents_actual_reason() -> None:
+  assert deceleration_source_presentation("hda") == ("cam", 3)
+  assert deceleration_source_presentation("hda_section") == ("section", 3)
+  assert deceleration_source_presentation("hda_bump") == ("bump", 3)
+  assert deceleration_source_presentation("school") == ("school", 3)
+
+
+def test_vehicle_navigation_availability_does_not_force_speed_with_cruise_off() -> None:
+  source = object.__new__(OpenpilotLiveSource)
+  source._max_lateral_accel = 3.0
+  source._energy_gauge_label = "fuel"
+  source._carrot_navi_media = None
+  source._current_carrot_navi = lambda _now: None
+  carrot_man = SimpleNamespace(
+    activeCarrot=0,
+    desiredSpeed=250.0,
+    desiredSource="none",
+    vehicleNaviActive=True,
+    vehicleNaviSpeed=105,
+    vehicleNaviAvailable=True,
+  )
+  source._service_data = lambda service: carrot_man if service == "carrotMan" else None
+  source._service_alive = lambda _service: False
+  source._service_valid = lambda _service: False
+
+  decorated = source._with_live_hud_state(standby_state())
+
+  assert decorated.cruise_display_state == "off"
+  assert decorated.cruise_override_kph is None
+  assert decorated.cruise_override_label is None
+  assert decorated.cruise_override_color_mode == 0
+  assert decorated.vehicle_navi_available
+
+
+def test_external_navigation_deceleration_presents_actual_reason() -> None:
+  assert deceleration_source_presentation("cam") == ("cam", 4)
+  assert deceleration_source_presentation("bump") == ("bump", 4)
+  assert deceleration_source_presentation("route") == ("route", 4)
+
+
+@pytest.mark.parametrize(
+  ("active_carrot", "desired_source", "legacy_remote", "carrot_navi_connected", "expected"),
+  (
+    (5, "hda_bump", "", False, False),
+    (6, "school", "", False, False),
+    (3, "cam", "", False, False),
+    (0, "none", "192.168.0.2", False, True),
+    (5, "hda_bump", "192.168.0.2", False, True),
+    (0, "none", "", True, True),
+  ),
+)
+def test_external_navigation_connection_does_not_follow_speed_control_state(
+  active_carrot, desired_source, legacy_remote, carrot_navi_connected, expected,
+) -> None:
+  source = object.__new__(OpenpilotLiveSource)
+  source._max_lateral_accel = 3.0
+  source._energy_gauge_label = "fuel"
+  source._carrot_navi_media = None
+  source._current_carrot_navi = lambda _now: None
+  carrot_man = SimpleNamespace(
+    activeCarrot=active_carrot,
+    desiredSpeed=55.0,
+    desiredSource=desired_source,
+    remote=legacy_remote,
+  )
+  carrot_navi = SimpleNamespace(connected=carrot_navi_connected)
+  source._service_data = lambda service: carrot_man if service == "carrotMan" else carrot_navi if service == "carrotNavi" else None
+  source._service_alive = lambda service: carrot_navi_connected if service == "carrotNavi" else False
+  source._service_valid = lambda service: carrot_navi_connected if service == "carrotNavi" else False
+
+  decorated = source._with_live_hud_state(replace(standby_state(), cruise_kph=100, cruise_display_state="engaged"))
+
+  assert decorated.external_nav_active is expected
 
 
 @pytest.mark.parametrize(
@@ -88,6 +187,18 @@ def test_live_cluster_avoids_unused_gps_subscriptions_after_trace_removal() -> N
   assert "livePose" in LIVE_SERVICES_BASE
   assert "gpsLocationExternal" not in LIVE_SERVICES_BASE
   assert "gpsLocation" not in LIVE_SERVICES_BASE
+
+
+def test_live_cluster_uses_authoritative_recorded_cutin_without_recomputation() -> None:
+  parser = live_route_parser()
+
+  def fail_if_called(*_args) -> None:
+    raise AssertionError("live cluster must not recompute CUT-IN from liveTracks")
+
+  parser._update_offline_cutin = fail_if_called
+  parser._update_live_tracks(SimpleNamespace(points=()), 1.0)
+
+  assert not parser.recompute_cutins
 
 
 def test_live_onroad_state_is_unknown_until_device_state_is_alive() -> None:

@@ -4,6 +4,9 @@ import asyncio
 import time
 from typing import Any
 
+from openpilot.common.async_process import run_process
+from openpilot.common.repo_update import RepoBusyError, repo_lock
+
 
 REPO_DIR = "/data/openpilot"
 GIT_STATUS_TTL = 600.0
@@ -42,16 +45,7 @@ def _error_state(message: str, **extra: Any) -> dict[str, Any]:
 
 async def _git(args: list[str], timeout: float = GIT_TIMEOUT) -> tuple[int, str]:
   try:
-    proc = await asyncio.create_subprocess_exec(
-      "git",
-      *args,
-      cwd=REPO_DIR,
-      stdout=asyncio.subprocess.PIPE,
-      stderr=asyncio.subprocess.STDOUT,
-    )
-    out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    out = (out_bytes or b"").decode("utf-8", "replace").strip()
-    return int(proc.returncode or 0), out
+    return await run_process(["git", *args], cwd=REPO_DIR, timeout=timeout)
   except asyncio.TimeoutError:
     return 124, "timeout"
   except Exception as exc:
@@ -70,7 +64,9 @@ async def _resolve_tracking(branch: str) -> dict[str, str]:
 
   if branch:
     remote = await _git_text(["config", "--get", f"branch.{branch}.remote"])
-    merge_ref = await _git_text(["config", "--get", f"branch.{branch}.merge"])
+    merge_refs = (await _git_text(["config", "--get-all", f"branch.{branch}.merge"])).splitlines()
+    # The repair path reconnects duplicate entries to this selected branch.
+    merge_ref = f"refs/heads/{branch}" if len(set(merge_refs)) > 1 else next(iter(merge_refs), "")
     if remote and merge_ref.startswith("refs/heads/"):
       remote_branch = merge_ref[len("refs/heads/"):]
       upstream = f"{remote}/{remote_branch}"
@@ -100,6 +96,7 @@ async def _read_status() -> dict[str, Any]:
   if rc != 0 or inside.lower() != "true":
     return _error_state("not a git repository")
 
+  head = await _git_text(["rev-parse", "HEAD"])
   branch = await _git_text(["branch", "--show-current"])
   if not branch:
     branch = await _git_text(["rev-parse", "--short", "HEAD"])
@@ -122,6 +119,8 @@ async def _read_status() -> dict[str, Any]:
       "behind": 0,
       "ahead": 0,
       "branch": branch,
+      "head": head,
+      "target_head": "",
       "upstream": "",
       "remote": remote,
       "remote_branch": remote_branch,
@@ -137,6 +136,7 @@ async def _read_status() -> dict[str, Any]:
   parts = counts.split()
   ahead = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
   behind = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+  target_head = await _git_text(["rev-parse", upstream])
 
   return {
     "available": fetch_rc == 0,
@@ -144,6 +144,8 @@ async def _read_status() -> dict[str, Any]:
     "behind": behind,
     "ahead": ahead,
     "branch": branch,
+    "head": head,
+    "target_head": target_head,
     "upstream": upstream,
     "remote": remote,
     "remote_branch": remote_branch,
@@ -160,7 +162,11 @@ async def get_git_status(force: bool = False) -> dict[str, Any]:
   async with _lock_for_loop():
     if _cache and not force and (_now() - float(_cache.get("checked_at", 0))) < GIT_STATUS_TTL:
       return dict(_cache)
-    _cache = await _read_status()
+    try:
+      with repo_lock():
+        _cache = await _read_status()
+    except RepoBusyError:
+      return {**_error_state("Build or another Git operation is running"), "state": "busy"}
     return dict(_cache)
 
 

@@ -97,6 +97,32 @@ class TestSubMaster:
         else:
           assert not sm._check_avg_freq(service)
 
+  def test_variable_radar_frequency_contract(self):
+    for service in ("liveTracks", "longitudinalPlan"):
+      service_config = SERVICE_LIST[service]
+      assert service_config.frequency_range == (14., 25.)
+      for actual_freq in (14., 16., 20., 25.):
+        tracker = messaging.FrequencyTracker(
+          service_config.frequency,
+          100.,
+          False,
+          service_freq_range=service_config.frequency_range,
+        )
+        for frame in range(250):
+          tracker.record_recv_time(frame / actual_freq)
+        assert tracker.valid, f"{service} rejected its supported {actual_freq:g} Hz clock"
+
+  def test_variable_radar_frequency_contract_with_conflation(self):
+    service_config = SERVICE_LIST["liveTracks"]
+    tracker = messaging.FrequencyTracker(
+      service_config.frequency,
+      20.,
+      False,
+      service_freq_range=service_config.frequency_range,
+    )
+    assert tracker.min_freq == 14. * .8
+    assert tracker.max_freq == 20. * 1.2
+
   def test_alive(self):
     pass
 

@@ -12,11 +12,17 @@ class QueueSize(IntEnum):
 
 class Service:
   def __init__(self, should_log: bool, frequency: float, decimation: Optional[int] = None,
-               queue_size: QueueSize = QueueSize.SMALL):
+               queue_size: QueueSize = QueueSize.SMALL,
+               frequency_range: Optional[tuple[float, float]] = None):
     self.should_log = should_log
     self.frequency = frequency
     self.decimation = decimation
     self.queue_size = queue_size
+    self.frequency_range = frequency_range
+
+    if frequency_range is not None:
+      min_frequency, max_frequency = frequency_range
+      assert 0. < min_frequency <= frequency <= max_frequency
 
 
 _services: dict[str, tuple] = {
@@ -37,7 +43,9 @@ _services: dict[str, tuple] = {
   "peripheralState": (True, 2., 1),
   "radarState": (True, 20., 5),
   "roadEncodeIdx": (False, 20., 1),
-  "liveTracks": (True, 20.),
+  # Physical radar output varies by brand: GM 14 Hz, Tesla/Ford MRR about
+  # 16 Hz, most brands 20 Hz, and Volkswagen 25 Hz.
+  "liveTracks": (True, 20., None, QueueSize.SMALL, (14., 25.)),
   "sendcan": (True, 100., 139, QueueSize.MEDIUM),
   "logMessage": (True, 0., None, QueueSize.BIG),
   "errorLogMessage": (True, 0., 1, QueueSize.BIG),
@@ -48,7 +56,9 @@ _services: dict[str, tuple] = {
   "carState": (True, 100., 10),
   "carControl": (True, 100., 10),
   "carOutput": (True, 100., 10),
-  "longitudinalPlan": (True, 20., 10),
+  # modelV2-triggered plans run at 20 Hz; the fast physical-radar path follows
+  # the supported 14-25 Hz liveTracks range.
+  "longitudinalPlan": (True, 20., 10, QueueSize.SMALL, (14., 25.)),
   "lateralManeuverPlan": (True, 20.),
   "driverAssistance": (True, 20., 20),
   "procLog": (True, 0.5, 15, QueueSize.BIG),

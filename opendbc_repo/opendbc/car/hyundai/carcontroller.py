@@ -6,6 +6,7 @@ from opendbc.car import Bus, DT_CTRL, apply_driver_steer_torque_limits, common_f
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.carstate import CarState
+from opendbc.car.hyundai.stopping import CanfdStopping
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, Buttons, CarControllerParams, CAR, CAN_GEARS, HyundaiExtFlags
 from opendbc.car.interfaces import CarControllerBase
@@ -34,6 +35,7 @@ PRE_OVERRIDE_CONFIRM_FRAMES = 2
 PRE_OVERRIDE_MAX_TORQUE_DELTA = -10.0
 LOW_SPEED_ANGLE_RATE_RAMP_SPEED = 15.0 * CV.KPH_TO_MS
 MID_SPEED_ANGLE_RATE_LIMIT_SPEED = 40.0 * CV.KPH_TO_MS
+LARGE_ANGLE_UNWIND_RATE = 1.5  # deg/tick: allow a quicker return from the EPS fault-angle region
 CANFD_JERK_UPPER_MIN = 1.0
 CANFD_JERK_LIMIT_MAX = 5.0
 CANFD_JERK_ERROR_DELAY = 0.5
@@ -147,6 +149,13 @@ def apply_steer_angle_limits_physics(desired_sw_deg: float,
   if err > 20.0:
     max_sw_rate_deg_per_tick = min(max_sw_rate_deg_per_tick, 1.0)
 
+  # Once steering is in the large-angle region, do not make the return toward center wait on
+  # the normal low-speed/large-error cap. This only relaxes unwinding; winding farther into the
+  # turn keeps all existing limits.
+  unwinding_large_angle = abs(last_sw_deg) >= MAX_ANGLE and last_sw_deg * (target_sw - last_sw_deg) < 0.0
+  if unwinding_large_angle:
+    max_sw_rate_deg_per_tick = max(max_sw_rate_deg_per_tick, LARGE_ANGLE_UNWIND_RATE)
+
   max_drw_per_tick_deg = min(
     max_drw_per_tick_deg,
     max_sw_rate_deg_per_tick / steer_ratio
@@ -173,6 +182,9 @@ class CarController(CarControllerBase):
     self.angle_limit_counter = 0
 
     self.accel_last = 0
+    self.accel_value_last = 0.0
+    # Latch at controller startup so changing a setting cannot alter an ongoing stop.
+    self.canfd_stopping = CanfdStopping() if Params().get_bool("CanfdStopRetry") else None
     self.apply_torque_last = 0
     self.car_fingerprint = CP.carFingerprint
     self.last_button_frame = 0
@@ -218,6 +230,7 @@ class CarController(CarControllerBase):
     self.camera_scc_params = Params().get_int("HyundaiCameraSCC")
     self.is_ldws_car = Params().get_bool("IsLdwsCar")
     self.enable_corner_radar = 0
+    self.paddle_mode = Params().get_int("PaddleMode")
 
     self.steerDeltaUpOrg = self.steerDeltaUp = self.steerDeltaUpLC = self.params.STEER_DELTA_UP
     self.steerDeltaDownOrg = self.steerDeltaDown = self.steerDeltaDownLC = self.params.STEER_DELTA_DOWN
@@ -265,6 +278,7 @@ class CarController(CarControllerBase):
       self.canfd_debug = params.get_int("CanfdDebug")
       self.camera_scc_params = params.get_int("HyundaiCameraSCC")
       self.enable_corner_radar = params.get_int("EnableCornerRadar")
+      self.paddle_mode = params.get_int("PaddleMode")
 
     actuators = CC.actuators
     hud_control = CC.hudControl
@@ -512,22 +526,29 @@ class CarController(CarControllerBase):
         self.hyundai_jerk.check_carrot_cruise(CC, CS, hud_control, stopping, accel, actuators.aTarget)
 
         if True: #not camera_scc:
-          can_sends.extend(hyundaicanfd.create_ccnc_messages(self.CP, self.packer, self.CAN, self.frame, CC, CS, hud_control, apply_angle, left_lane_warning, right_lane_warning, self.enable_corner_radar, stopping, self.canfd_debug))
+          can_sends.extend(hyundaicanfd.create_ccnc_messages(
+            self.CP, self.packer, self.CAN, self.frame, CC, CS, hud_control, apply_angle,
+            left_lane_warning, right_lane_warning, self.enable_corner_radar, stopping,
+            self.canfd_debug, self.paddle_mode,
+          ))
           if hda2:
             can_sends.extend(hyundaicanfd.create_adrv_messages(self.CP, self.packer, self.CAN, self.frame))
           else:
             can_sends.extend(hyundaicanfd.create_fca_warning_light(self.CP, self.packer, self.CAN, self.frame))
         if self.frame % 2 == 0:
           if self.CP.flags & HyundaiFlags.CAMERA_SCC.value:
-            msg = hyundaicanfd.create_acc_control_scc2(self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping, CC.cruiseControl.override,
-                                                             set_speed_in_units, hud_control, self.hyundai_jerk, CS)
+            msg, self.accel_value_last = hyundaicanfd.create_acc_control_scc2(
+              self.packer, self.CAN, CC.enabled, self.accel_value_last, accel, stopping, CC.cruiseControl.override,
+              set_speed_in_units, hud_control, self.hyundai_jerk, CS, self.canfd_stopping,
+            )
             if msg is not None:
               can_sends.append(msg)
             can_sends.extend(hyundaicanfd.create_tcs_messages(self.packer, self.CAN, CS)) # for sorento SCC radar...
           else:
-            can_sends.append(hyundaicanfd.create_acc_control(self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping, CC.cruiseControl.override,
-                                                             set_speed_in_units, hud_control, self.hyundai_jerk.jerk_u, self.hyundai_jerk.jerk_l, CS))
-          self.accel_last = accel
+            can_sends.append(hyundaicanfd.create_acc_control(self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping,
+                                                             CC.cruiseControl.override, set_speed_in_units, hud_control,
+                                                             self.hyundai_jerk.jerk_u, self.hyundai_jerk.jerk_l, CS, self.canfd_stopping))
+            self.accel_last = accel
       else:
         # button presses
         if self.camera_scc_params == 3: # camera scc but stock long
@@ -600,7 +621,7 @@ class CarController(CarControllerBase):
 
   def create_button_messages(self, CC: structs.CarControl, CS: CarState, use_clu11: bool):
     can_sends = []
-    if CS.out.brakePressed or CS.out.brakeHoldActive:
+    if CS.out.brakePressed or CS.out.brakeHoldActive or CS.out.parkingBrake:
       return can_sends
     if use_clu11:
       if CS.clu11 is None:
@@ -675,6 +696,9 @@ class CarController(CarControllerBase):
     trigger_start = 6
     self.MainMode_ACC_trigger = max(trigger_min, self.MainMode_ACC_trigger - 1)
     self.LFA_trigger = max(trigger_min, self.LFA_trigger - 1)
+    if CS.out.brakeHoldActive or CS.out.parkingBrake:
+      self.MainMode_ACC_trigger = trigger_min
+      return
     if self.MainMode_ACC_trigger == trigger_min and self.LFA_trigger == trigger_min:
       if CC.enabled and not CS.MainMode_ACC and CS.out.vEgo > 3.:
         self.MainMode_ACC_trigger = trigger_start
@@ -699,6 +723,10 @@ class CarController(CarControllerBase):
 
 
   def make_spam_button(self, CC, CS):
+    if CS.out.brakePressed or CS.out.brakeHoldActive or CS.out.parkingBrake:
+      self.activateCruise = 0
+      return 0
+
     hud_control = CC.hudControl
     set_speed_in_units = hud_control.setSpeed * (CV.MS_TO_KPH if CS.is_metric else CV.MS_TO_MPH)
     target = int(set_speed_in_units+0.5)

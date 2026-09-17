@@ -40,6 +40,8 @@ OPENPILOT_ROOT = find_openpilot_root(Path(__file__).resolve().parent)
 if OPENPILOT_ROOT is not None:
     sys.path.insert(0, str(OPENPILOT_ROOT))
 
+from openpilot.selfdrive.carrot.deceleration_source import deceleration_source_presentation, external_navigation_connected
+
 LIVE_NAV_ROUTE_MAX_POINTS = 4096
 LIVE_NAVI_IMAGE_BASE64_MAX_CHARS = 2 * 1024 * 1024
 LIVE_NAVI_IMAGE_MAX_DIMENSION = 2048
@@ -47,31 +49,10 @@ ACCELERATION_DUE_TO_GRAVITY = 9.80665
 DEFAULT_MAX_LATERAL_ACCEL = 3.0
 SELFDRIVE_STATE_TIMEOUT_SECONDS = 5.0
 SELFDRIVE_UNRESPONSIVE_TIMEOUT_SECONDS = 10.0
-DECELERATION_SOURCE_LABELS = {
-    "cam": "cam:n",
-    "section": "section:n",
-    "bump": "bump:n",
-    "police": "police:n",
-    "waze": "waze:n",
-    "road": "road:n",
-    "atc": "turn:n",
-    "atc2": "turn:n",
-    "hda": "cam:v",
-    "route": "route:v",
-    "gas": "gas:v",
-    "vturn": "turn:c",
-    "model": "turn:c",
-    "turn": "turn:c",
-}
 
 
 def deceleration_source_display_label(source: str | None) -> str:
-    normalized = str(source or "").strip().lower()
-    if not normalized:
-        return "apply"
-    if normalized.endswith((":n", ":v", ":c")):
-        return normalized
-    return DECELERATION_SOURCE_LABELS.get(normalized, normalized[:8])
+    return deceleration_source_presentation(source)[0]
 
 
 def _limited_items(items: Any, max_items: int):
@@ -128,6 +109,13 @@ LIVE_CAN_SERVICES = ("can", "sendcan")
 NAVI_TRAFFIC_LIGHT_HOLD_SECONDS = 10.0
 
 
+def live_route_parser() -> RouteLogParser:
+    # radarState is authoritative in production. Recomputing CUT-IN from
+    # liveTracks here duplicates radard's per-track motion pipeline and makes
+    # the external HUD cost grow sharply with dense radar scenes.
+    return RouteLogParser(recompute_cutins=False)
+
+
 class OpenpilotLiveSource:
     def __init__(self, include_can: bool = False, timeout_ms: int = 0) -> None:
         try:
@@ -147,7 +135,7 @@ class OpenpilotLiveSource:
             self.log = None
         self.services = list(LIVE_SERVICES_BASE + (LIVE_CAN_SERVICES if include_can else ()))
         self.sm = messaging.SubMaster(self.services)
-        self.parser = RouteLogParser()
+        self.parser = live_route_parser()
         self.parser.trip_report_tracker.set_onroad(False)
         self.timeout_ms = max(0, int(timeout_ms))
         self.last_state: ClusterUiState | None = None
@@ -166,6 +154,8 @@ class OpenpilotLiveSource:
         self._held_navi_traffic_light: NaviTrafficLightInfo | None = None
         self._held_navi_traffic_light_received_t: float | None = None
         self._show_plot_mode = 0
+        self._egpu_active = False
+        self._next_egpu_param_read_t = 0.0
         self._hud_debug_mode = 0
         self._live_debug_enabled = False
         self._debug_plot_enabled = False
@@ -337,6 +327,15 @@ class OpenpilotLiveSource:
         return self.last_state
 
     def _with_live_hud_state(self, state: ClusterUiState) -> ClusterUiState:
+        now = time.monotonic()
+        if now >= getattr(self, "_next_egpu_param_read_t", 0.0):
+            params = getattr(self, "params", None)
+            try:
+                self._egpu_active = bool(params is not None and params.get_bool("UsbGpuActive"))
+            except Exception:
+                self._egpu_active = False
+            self._next_egpu_param_read_t = now + 1.0
+
         device_state = self._service_data("deviceState")
         onroad = self._service_alive("deviceState") and bool(safe_get(device_state, "started", False))
         car_state = self._service_data("carState")
@@ -398,20 +397,22 @@ class OpenpilotLiveSource:
             steering_output_kind = "torque"
 
         carrot_man = self._service_data("carrotMan")
-        active_carrot = safe_optional_float(carrot_man, "activeCarrot")
+        desired_source = str(safe_get(carrot_man, "desiredSource", "") or "").strip()
         navi_live = self._current_carrot_navi(time.monotonic())
         navi_dashboard = (
             self._carrot_navi_media.update(navi_live)
             if self._carrot_navi_media is not None else None
         )
-        navi_guidance_active = bool(
-            navi_live is not None
-            and (
-                navi_live.current is not None
-                or (navi_live.status is not None and navi_live.status.guidance_active)
-            )
+        carrot_navi = self._service_data("carrotNavi")
+        carrot_navi_connected = bool(
+            self._service_alive("carrotNavi")
+            and self._service_valid("carrotNavi")
+            and safe_get(carrot_navi, "connected", False)
         )
-        external_nav_active = (active_carrot is not None and active_carrot > 0.0) or navi_guidance_active
+        external_nav_active = external_navigation_connected(
+            safe_get(carrot_man, "remote", ""),
+            carrot_navi_connected or bool(navi_dashboard is not None and navi_dashboard.connected),
+        )
 
         speed_limit_kph, speed_limit_source = resolve_navi_speed_limit(
             state.speed_limit_kph,
@@ -429,6 +430,7 @@ class OpenpilotLiveSource:
             and self._service_valid("longitudinalPlan")
             else None
         )
+        vehicle_navi_available = bool(safe_get(carrot_man, "vehicleNaviAvailable", False))
         if state.cruise_kph is not None and state.cruise_display_state != "off":
             # Keep this priority and the thresholds in sync with mici's SetSpeedOverride.
             longitudinal_plan = self._service_data("longitudinalPlan")
@@ -439,17 +441,17 @@ class OpenpilotLiveSource:
                 cruise_override_color_mode = 1
             else:
                 desired_speed = safe_optional_float(carrot_man, "desiredSpeed")
-                desired_source = str(safe_get(carrot_man, "desiredSource", "") or "").strip()
                 if desired_speed is not None and 0.0 < desired_speed < 200.0 and desired_speed < state.cruise_kph:
                     cruise_override_kph = desired_speed
-                    cruise_override_label = deceleration_source_display_label(desired_source)
-                    cruise_override_color_mode = 2
+                    cruise_override_label, cruise_override_color_mode = deceleration_source_presentation(desired_source)
 
         return replace(
             state,
             onroad=onroad,
             alert=self._live_cluster_alert(state.alert, onroad),
+            egpu_active=getattr(self, "_egpu_active", False),
             external_nav_active=external_nav_active,
+            vehicle_navi_available=vehicle_navi_available,
             speed_limit_kph=speed_limit_kph,
             speed_limit_source=speed_limit_source,
             navi_live=navi_live,

@@ -376,14 +376,19 @@ ratio and is taller than before while the gap bars keep their own size/spacing;
 all four gap bars stay visible, sit close together, and bottom-align to the
 vehicle while inactive bars are gray and active bars use `#bb3d91`. Cruise set
 speed and `km/h` use the same font size and color; paused cruise keeps the set
-speed but draws it gray, and inactive cruise draws gray `--- km/h`. The orange
+speed but draws it gray, and inactive cruise draws gray `--- km/h`. The
 deceleration override keeps the selected `carrotMan.desiredSource` control
-value unchanged but annotates its displayed origin: navigation camera `cam:n`,
-vehicle/HDA camera `cam:v`, vehicle-side route curvature `route:v`, and
-comma-model turn prediction `turn:c`. Navigation TBT turn control displays
-`turn:n`; the label font scales down slightly for longer values such as
-`section:n` instead of dropping the origin suffix. The separate lane-change
-icon is not drawn. The LFA icon uses
+value unchanged. External navigation sources (`cam`, `section`, `bump`,
+`police`, `waze`, `road`, `atc`, `atc2`, and `route`) display their actual reason in orange.
+Vehicle
+CAN navigation sources (`hda`, `hda_bump`, and `school`) display their actual reason in
+lavender. Other sources retain concise labels: navigation TBT is `turn`, the
+lane/curvature candidate is `vturn`, model prediction is `model`, and gas
+override is `gas` in orange. Vehicle navigation availability does
+not force an auxiliary speed while cruise is off. The separate lane-change icon is
+not drawn. A vehicle-CAN source does not count as an external navigation
+session, so it does not replace the default driving-report panel; actual 7713/7714
+guidance still replaces that panel normally. The LFA icon uses
 `selfdrive/assets/icons_mici/carrot_wheel_org.png`, rotates by
 `-carState.steeringAngleDeg`, and recolors its white pixels green when LFA is
 active. When `controlsState.activeLaneLine` is true, the fixed
@@ -410,9 +415,14 @@ into one GPU texture at renderer startup, then each unchanged-size live pressure
 value is drawn inside its corresponding enlarged tire. It remains hidden only
 when all four pressure values are unavailable; individual missing values show
 `--`, and values below 31 psi are red. The surrounding area stays transparent. When
-external navigation is active or its dashboard is connected, the green `NAV`
-status appears below the Wi-Fi icon instead of the former lower-right `NAVI`
-label. The center clock, EV indicator, and fuel/DEF gauges are unchanged.
+legacy external navigation has a recent remote sender, or an alive and valid
+Carrot Navi v2 service reports `connected`, the orange `NAVI` status appears one
+character-width left of the Wi-Fi center. It takes priority over vehicle
+navigation availability. Once Hyundai CAN-FD `0x4BE` has been observed during
+the drive, lavender `vNAVI` appears in the same status slot instead. This
+availability status never follows `activeCarrot`, because vehicle-CAN speed
+candidates also change that control state. The center clock, EV indicator, and
+fuel/DEF gauges are unchanged.
 When `--fps` is omitted, `ClusterHudLiveFps` controls the render limit and is
 polled about once per second while running: `0` uncapped diagnostic mode, `1`
 10 Hz default, `2` 20 Hz, `3` 30 Hz, `4` 40 Hz, `5` 50 Hz, and `6` 60 Hz.

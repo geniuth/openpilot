@@ -7,7 +7,7 @@
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_opengl3_loader.h"
 #include "implot.h"
-#include "common/yuv.h"
+#include "libyuv.h"
 #include "msgq_repo/msgq/ipc.h"
 #include "tools/replay/framereader.h"
 
@@ -513,6 +513,10 @@ struct StreamPoller::Impl {
                           std::unordered_map<CanMessageId, size_t, CanMessageIdHash> *can_slots,
                           StreamExtractBatch *src) {
     for (RouteSeries &series : src->series) {
+      auto info_it = src->enum_info.find(series.path);
+      if (info_it != src->enum_info.end() && info_it->second.text_values) {
+        remap_text_series(&series, info_it->second, &dst->enum_info[info_it->first]);
+      }
       auto [it, inserted] = series_slots->try_emplace(series.path, dst->series.size());
       if (inserted) {
         dst->series.push_back(RouteSeries{.path = series.path});
@@ -537,7 +541,9 @@ struct StreamPoller::Impl {
                            std::make_move_iterator(src->timeline.end()));
     }
     for (auto &[path, info] : src->enum_info) {
-      dst->enum_info[path] = std::move(info);
+      if (!info.text_values) {
+        dst->enum_info[path] = std::move(info);
+      }
     }
     if (!src->car_fingerprint.empty()) {
       dst->car_fingerprint = src->car_fingerprint;
@@ -1173,14 +1179,14 @@ struct CameraFeedView::Impl {
       result.width = reader->width;
       result.height = reader->height;
       result.rgba.resize(static_cast<size_t>(result.width) * static_cast<size_t>(result.height) * 4U, 0);
-      yuv::nv12_to_rgba(decode_buffer.y,
-                        static_cast<int>(decode_buffer.stride),
-                        decode_buffer.uv,
-                        static_cast<int>(decode_buffer.stride),
-                        result.rgba.data(),
-                        result.width * 4,
-                        result.width,
-                        result.height);
+      libyuv::NV12ToABGR(decode_buffer.y,
+                         static_cast<int>(decode_buffer.stride),
+                         decode_buffer.uv,
+                         static_cast<int>(decode_buffer.stride),
+                         result.rgba.data(),
+                         result.width * 4,
+                         result.width,
+                         result.height);
       result.success = true;
       result.decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - decode_begin).count();
       publish_result(*request, std::move(result));
@@ -1203,14 +1209,14 @@ struct CameraFeedView::Impl {
           .height = reader->height,
         };
         prefetched.rgba.resize(static_cast<size_t>(prefetched.width) * static_cast<size_t>(prefetched.height) * 4U, 0);
-        yuv::nv12_to_rgba(decode_buffer.y,
-                          static_cast<int>(decode_buffer.stride),
-                          decode_buffer.uv,
-                          static_cast<int>(decode_buffer.stride),
-                          prefetched.rgba.data(),
-                          prefetched.width * 4,
-                          prefetched.width,
-                          prefetched.height);
+        libyuv::NV12ToABGR(decode_buffer.y,
+                           static_cast<int>(decode_buffer.stride),
+                           decode_buffer.uv,
+                           static_cast<int>(decode_buffer.stride),
+                           prefetched.rgba.data(),
+                           prefetched.width * 4,
+                           prefetched.width,
+                           prefetched.height);
         remember_cached_result(prefetched);
       }
     }

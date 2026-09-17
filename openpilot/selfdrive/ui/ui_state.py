@@ -8,6 +8,7 @@ from openpilot.cereal import messaging, car, log
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.modeld.helpers import active_usbgpu_compiled_path, usbgpu_compile_pending
 from openpilot.selfdrive.ui.carrot_param_cache import RealtimeUiParamSnapshot, TimedSnapshotCache, read_realtime_ui_params
 from openpilot.selfdrive.ui.lib.prime_state import PrimeState
 from openpilot.system.ui.lib.application import gui_app
@@ -58,10 +59,12 @@ class UIState:
         "liveParameters",
         "rawAudioData",
         "carrotMan",
+        "carrotNavi",
         "peripheralState",
         "liveDelay",
         "liveTorqueParameters",
         "lateralPlan",
+        "customReservedRawData0",
       ]
     )
 
@@ -102,7 +105,14 @@ class UIState:
     # Brightness and UI options
     self.show_brightness_ratio: float = 1.0
     self.show_model_view: int = 0
+    self.share_data: bool = False
     self.show_camera_with_cluster: bool = False
+    self.usbgpu_present: bool = False
+    self.usbgpu_compiled: bool = False
+    self.usbgpu_compile_pending: bool = False
+    self.usbgpu_loading: bool = False
+    self.usbgpu_active: bool = False
+    self.usbgpu_startup_failed: bool = False
 
     self.update_params()
 
@@ -208,7 +218,17 @@ class UIState:
     self.show_radar_info = self.params.get_int("ShowRadarInfo")
     self.show_brightness_ratio: float = self.params.get_int("ShowCustomBrightness") / 100.0
     self.show_model_view = self.params.get_int("ShowModelView")
+    self.share_data = self.params.get_bool("ShareData")
     self.show_camera_with_cluster = self.params.get_int("ShowCameraWithCluster") == 1
+    self.usbgpu_present = self.params.get_bool("UsbGpuPresent")
+    # Runtime may temporarily fall back to the previous model's PKL. Keep the
+    # UI completion state tied to the active model so that fallback use does
+    # not look like the newly downloaded model was already compiled.
+    self.usbgpu_compiled = active_usbgpu_compiled_path() is not None
+    self.usbgpu_compile_pending = usbgpu_compile_pending()
+    self.usbgpu_loading = self.params.get_bool("UsbGpuLoading")
+    self.usbgpu_active = self.params.get_bool("UsbGpuActive")
+    self.usbgpu_startup_failed = self.params.get_bool("UsbGpuStartupFailed")
 
     self._param_update_time = time.monotonic()
 

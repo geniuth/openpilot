@@ -5,13 +5,15 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import hashlib
 import json
 import math
 import os
+import pickle
 import shutil
 import sys
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Protocol
@@ -20,12 +22,16 @@ REPO_ROOT = Path(__file__).resolve().parents[5]
 if str(REPO_ROOT) not in sys.path:
   sys.path.insert(0, str(REPO_ROOT))
 
+from openpilot.selfdrive.carrot.radar_motion.coordinates import device_yaw_to_radar
 from openpilot.selfdrive.carrot.radar_motion import (
   CORNER_RADAR_MEASUREMENT_DELAY_S,
   CORNER_CUT_IN_THRESHOLD,
   CUT_IN_BOUNDARY_HOLD_S,
   CUT_IN_CONFIRMATION_S,
+  CornerCutInPredecelTracker,
+  DPathRadarController,
   DPathLeadCandidate,
+  DPathStationaryPrimaryHandoffTracker,
   DPathStationaryShadowTracker,
   DPathLeadTwoTracker,
   FrontRadarKinematicAssociator,
@@ -35,11 +41,13 @@ from openpilot.selfdrive.carrot.radar_motion import (
   RADAR_MOTION_MAX_TIME_SKEW_S,
   STATIONARY_MAX_ABS_VLEAD_MPS,
   RadarMotionDecisionTracker,
+  RadarMotionCutIn,
   RadarMotionPrediction,
   RadarMotionPredictor,
   VisionRadarMatcher,
   apply_vision_bracket_cutin_support,
   cutin_can_compete_with_primary,
+  corner_cutin_predecel_score,
   front_cutin_motion_supported,
   lead_from_vision,
   lead_duplicates_primary,
@@ -48,12 +56,33 @@ from openpilot.selfdrive.carrot.radar_motion import (
   match_dpath_primary_lead,
   prefer_front_radar_kinematics,
   radar_motion_sensitivity,
+  stationary_shadow_corner_supported,
+  turning_corner_path_entry_allowed,
   model_path_point_at_s,
   project_to_model_path,
   visible_motion_points,
   vision_lead_from_model,
   vision_only_lead_allowed,
 )
+from openpilot.selfdrive.carrot.radar_motion.occupancy_v2 import (
+  OccupancyEstimate,
+  OccupancyEvidence,
+  OccupancyStage,
+  RadarOccupancyModelV2,
+  early_control_eligible,
+)
+from openpilot.selfdrive.carrot.radar_motion.occupancy_v3 import (
+  RadarOccupancyModelV3,
+  V3Estimate,
+  V3Evidence,
+  V3Stage,
+)
+from openpilot.selfdrive.controls.lib.cutin_alert import (
+  CutinAlertCandidate,
+  CutinAlertTracker,
+  promoted_cutin_candidates,
+)
+from openpilot.selfdrive.carrot.radar_motion.lane_change_gap import LaneChangeGapPlan, LaneChangeGapTracker
 
 
 RADAR_TO_CAMERA = 1.52
@@ -85,13 +114,55 @@ STATIONARY_HANDOFF_MAX_YREL_DELTA_M = 1.5
 VALIDATION_SETTINGS_ENV = "CARROT_RADAR_VALIDATION_SETTINGS"
 VALIDATION_MOTION_MODES = ("normal", "front")
 VALIDATION_DEFAULT_SENSITIVITY = 3
+VISUAL_REPLAY_CACHE_VERSION = 4
 LEAD_ONE_RADAR_RGB = (246, 142, 55)
 LEAD_ONE_VISION_RGB = (72, 145, 255)
 LEAD_ONE_VISION_WEAK_RGB = (104, 205, 255)
 LEAD_ONE_VISION_INACTIVE_RGB = (112, 145, 160)
 LEAD_TWO_RGB = (245, 211, 72)
+LEAD_ONE_SPEED_RGB = (62, 205, 130)
+SCC_DISTANCE_RGB = (247, 94, 160)
+SCC_ACCEL_RGB = (247, 94, 160)
+CARROT_ACCEL_RGB = (62, 205, 130)
 VISION_LEAD_DISPLAY_MIN_PROBABILITY = 0.20
 VISION_LEAD_STRONG_DISPLAY_MIN_PROBABILITY = 0.40
+SCC_SAMPLE_MAX_AGE_S = 0.15
+LONGITUDINAL_PLAN_MAX_AGE_S = 0.20
+ACCEL_GRAPH_MIN_MPS2 = -4.0
+ACCEL_GRAPH_MAX_MPS2 = 2.0
+LEAD_SPEED_GRAPH_MAX_KPH = 140.0
+
+
+def radar_replay_source_fingerprint() -> str:
+  """Fingerprint every source file that changes cached lead decisions."""
+  digest = hashlib.sha256()
+  source_files = (
+    Path(__file__),
+    *sorted((CARROT_ROOT / "radar_motion").glob("*.py")),
+  )
+  for source_path in source_files:
+    digest.update(str(source_path.relative_to(REPO_ROOT)).encode("utf-8"))
+    digest.update(source_path.read_bytes())
+  return digest.hexdigest()[:20]
+
+
+def radar_replay_baseline_source_fingerprint() -> str:
+  """Fingerprint V1/V2 replay sources without V3 shadow-only code."""
+  digest = hashlib.sha256()
+  replay_source = Path(__file__).read_text(encoding="utf-8")
+  v3_start = replay_source.index("\ndef _v3_candidate(")
+  v3_end = replay_source.index("\ndef visual_replay_cache_path(")
+  ui_start = replay_source.index("\nclass SimulatorUI:")
+  replay_source = replay_source[:v3_start] + replay_source[v3_end:ui_start]
+  digest.update(replay_source.encode("utf-8"))
+  for source_path in sorted((CARROT_ROOT / "radar_motion").glob("*.py")):
+    if source_path.name == "occupancy_v3.py":
+      continue
+    digest.update(str(source_path.relative_to(REPO_ROOT)).encode("utf-8"))
+    digest.update(source_path.read_bytes())
+  return digest.hexdigest()[:20]
+
+
 VALIDATION_SENSITIVITY_LABELS = (
   "사용 안 함",
   "둔감",
@@ -206,6 +277,17 @@ class RadarFrame:
   yaw_rate_source: str = "unknown"
   steer_ratio: float = 14.0
   wheelbase: float = 2.8
+  scc_bus: int | None = None
+  scc_distance_m: float | None = None
+  scc_a_req_raw: float | None = None
+  carrot_a_target: float | None = None
+  lane_change_direction: int = 0
+  lane_change_active: bool = False
+  lane_change_blindspot: bool = False
+  path_times: tuple[float, ...] = ()
+  car_state_age_s: float = math.inf
+  lane_change_model_path: tuple[tuple[float, float], ...] = ()
+  lane_change_device_yaw: float | None = None
 
 
 @dataclass(frozen=True)
@@ -232,6 +314,7 @@ class Candidate:
   horizon_y: tuple[float, ...] = ()
   horizon_x_stds: tuple[float, ...] = ()
   horizon_y_stds: tuple[float, ...] = ()
+  continuity_id: int | None = None
 
   @property
   def eligible(self) -> bool:
@@ -258,6 +341,8 @@ class Selection:
   external_candidates: tuple[Candidate, ...] = ()
   active_external_candidates: tuple[Candidate, ...] = ()
   lead_two_tentative: bool | None = None
+  cutin_predecel_candidate: Candidate | None = None
+  lane_change_gap: LaneChangeGapPlan = field(default_factory=LaneChangeGapPlan)
 
 
 def lead_one_rgb(track_id: int | None) -> tuple[int, int, int]:
@@ -277,6 +362,7 @@ class ValidationReview:
   end_s: float
   scene: str
   target_track_ids: tuple[int, ...] = ()
+  forbidden_lead_one_ids: tuple[int, ...] = ()
   forbidden_lead_two_ids: tuple[int, ...] = ()
   validation_stage: str = "output"
   human_verified: bool = False
@@ -499,6 +585,12 @@ def lead_continuity_segments(
       previous_candidate = None
       continue
     point = (frame.time_s, float(candidate.d_rel), candidate.track_id)
+    physical_motion_handoff = (
+      previous_candidate is not None
+      and previous_candidate.source == candidate.source
+      and previous_candidate.continuity_id is not None
+      and previous_candidate.continuity_id == candidate.continuity_id
+    )
     stationary_handoff = (
       previous_candidate is not None
       and previous_candidate.v_lead is not None
@@ -522,7 +614,7 @@ def lead_continuity_segments(
       current[-1][2] != point[2]
       and (
         vision_radar_display_changed
-        or not stationary_handoff
+        or not (physical_motion_handoff or stationary_handoff)
       )
       or point[0] - current[-1][0] > 0.15
     ):
@@ -530,6 +622,67 @@ def lead_continuity_segments(
       current = []
     current.append(point)
     previous_candidate = candidate
+  if current:
+    segments.append(tuple(current))
+  return tuple(segments)
+
+
+def lead_speed_continuity_segments(
+  frames: Sequence[RadarFrame],
+  selections: Sequence[Selection],
+) -> tuple[tuple[tuple[float, float, int], ...], ...]:
+  """Return leadOne absolute-speed runs in km/h for the replay graph."""
+  if len(frames) != len(selections):
+    raise ValueError("lead selections must align with radar frames")
+  segments: list[tuple[tuple[float, float, int], ...]] = []
+  current: list[tuple[float, float, int]] = []
+  for frame, selection in zip(frames, selections, strict=True):
+    candidate = selection.lead_one
+    if (
+      candidate is None
+      or candidate.v_lead is None
+      or not math.isfinite(candidate.v_lead)
+    ):
+      if current:
+        segments.append(tuple(current))
+        current = []
+      continue
+    point = (
+      frame.time_s,
+      max(0.0, float(candidate.v_lead) * 3.6),
+      candidate.track_id,
+    )
+    if current and (
+      current[-1][2] != point[2]
+      or point[0] - current[-1][0] > 0.15
+    ):
+      segments.append(tuple(current))
+      current = []
+    current.append(point)
+  if current:
+    segments.append(tuple(current))
+  return tuple(segments)
+
+
+def frame_value_continuity_segments(
+  frames: Sequence[RadarFrame],
+  attribute: str,
+) -> tuple[tuple[tuple[float, float], ...], ...]:
+  """Return finite scalar frame values split across missing/stale samples."""
+  segments: list[tuple[tuple[float, float], ...]] = []
+  current: list[tuple[float, float]] = []
+  for frame in frames:
+    value = getattr(frame, attribute)
+    if value is None or not math.isfinite(value):
+      if current:
+        segments.append(tuple(current))
+        current = []
+      continue
+    point = (frame.time_s, float(value))
+    if current and point[0] - current[-1][0] > 0.15:
+      segments.append(tuple(current))
+      current = []
+    current.append(point)
   if current:
     segments.append(tuple(current))
   return tuple(segments)
@@ -799,6 +952,7 @@ def _shadow_candidate(prediction: RadarMotionPrediction) -> Candidate:
     horizon_y=tuple(sample.d_path for sample in samples),
     horizon_x_stds=tuple(sample.longitudinal_sigma for sample in samples),
     horizon_y_stds=tuple(sample.lateral_sigma for sample in samples),
+    continuity_id=prediction.continuity_id,
   )
 
 
@@ -822,6 +976,7 @@ def _controller_model(frame: RadarFrame) -> Any:
       for lead in frame.model_leads
     ),
     velocity=SimpleNamespace(x=(frame.v_ego,)),
+    laneLineProbs=frame.lane_probs,
   )
 
 
@@ -829,6 +984,8 @@ def _controller_candidate(
   frame: RadarFrame,
   lead: dict[str, Any] | None,
   reason: str,
+  continuity_by_identity: Mapping[tuple[str, int], int] | None = None,
+  track_aliases: Iterable[int] = (),
 ) -> Candidate | None:
   if lead is None or not lead.get("status"):
     return None
@@ -846,6 +1003,37 @@ def _controller_candidate(
     ),
     default=None,
   )
+  source = matched_point.source if matched_point is not None else ""
+  aliases: tuple[int, ...] = tuple(
+    sorted({int(value) for value in track_aliases if int(value) != track_id})
+  )
+  if matched_point is not None:
+    counterpart_is_front = matched_point.source.startswith("corner")
+    counterparts = tuple(
+      (
+        abs(point.d_rel - matched_point.d_rel) / 5.0
+        + abs(point.y_rel - matched_point.y_rel) / 2.0
+        + abs(point.v_lead - matched_point.v_lead) / 2.5,
+        point,
+      )
+      for point in frame.points
+      if (
+        point.measured
+        and (
+          point.source == "frontRadar"
+          if counterpart_is_front
+          else point.source.startswith("corner")
+        )
+        and abs(point.d_rel - matched_point.d_rel) <= 5.0
+        and abs(point.y_rel - matched_point.y_rel) <= 2.0
+        and abs(point.v_lead - matched_point.v_lead) <= 2.5
+      )
+    )
+    if counterparts:
+      aliases = tuple(sorted({
+        *aliases,
+        min(counterparts, key=lambda value: value[0])[1].track_id,
+      }))
   return Candidate(
     track_id=track_id,
     score=float(lead.get("score", lead.get("modelProb", 0.0))),
@@ -853,7 +1041,13 @@ def _controller_candidate(
     d_rel=d_rel,
     y_rel=y_rel,
     v_lead=float(lead.get("vLead", 0.0)),
-    source=matched_point.source if matched_point is not None else "",
+    source=source,
+    track_aliases=aliases,
+    continuity_id=(
+      continuity_by_identity.get((source, track_id))
+      if continuity_by_identity is not None
+      else None
+    ),
   )
 
 
@@ -969,6 +1163,7 @@ def prediction_with_validation_lookahead(
   if (
     prediction.current_path_occupancy
     or prediction.near_side_directional_entry
+    or prediction.lane_boundary_directional_entry
     or has_sustained_future_overlap
   ):
     return replace(
@@ -1004,6 +1199,7 @@ class RadarMotionShadowSelector:
     ] | None = None,
     lead_one_outputs: Sequence[dict[str, Any] | None] | None = None,
     maximum_lookahead_s: float = VALIDATION_DEFAULT_LOOKAHEAD_S,
+    enable_radar_tracks: int = 1,
   ) -> None:
     if motion_sensor not in (None, "corner", "front"):
       raise ValueError(f"unsupported radar motion sensor: {motion_sensor}")
@@ -1021,7 +1217,22 @@ class RadarMotionShadowSelector:
     self.maximum_lookahead_s = _validation_lookahead_s(
       maximum_lookahead_s,
     )
-    if lead_one_outputs is None:
+    self.enable_radar_tracks = int(enable_radar_tracks)
+    production_outputs = (
+      _production_controller_outputs(
+        frames,
+        motion_sensor=self.motion_sensor,
+        enable_radar_tracks=self.enable_radar_tracks,
+        cut_in_sensitivity=self.cut_in_sensitivity,
+      )
+      if self.enable_radar_tracks != 1
+      else (None,) * len(frames)
+    )
+    if self.enable_radar_tracks != 1:
+      lead_one_values = tuple(
+        output.lead_one for output in production_outputs
+      )
+    elif lead_one_outputs is None:
       matcher = VisionRadarMatcher()
       lead_one_results = []
       for frame in frames:
@@ -1041,7 +1252,8 @@ class RadarMotionShadowSelector:
           frame.path,
           time_s=frame.time_s,
           stationary_points=stationary_points,
-          enable_radar_tracks=1,
+          enable_radar_tracks=self.enable_radar_tracks,
+          yaw_rate_rad_s=frame.yaw_rate_rad_s,
         )
         if match is not None:
           lead_one_results.append(lead_from_vision_match(match))
@@ -1057,10 +1269,7 @@ class RadarMotionShadowSelector:
             if (
               vision is not None
               and vision_only_lead_allowed(
-                1,
-                side_cutin_supported=(
-                  matcher.vision_only_side_cutin_supported
-                ),
+                self.enable_radar_tracks,
               )
             )
             else None
@@ -1125,15 +1334,20 @@ class RadarMotionShadowSelector:
     front_kinematic_associator = FrontRadarKinematicAssociator()
     lead_two_tracker = DPathLeadTwoTracker()
     stationary_shadow_tracker = DPathStationaryShadowTracker()
+    stationary_primary_handoff_tracker = (
+      DPathStationaryPrimaryHandoffTracker()
+    )
     primary_cut_out_predictor = RadarMotionPredictor()
     decision_tracker = RadarMotionDecisionTracker(
       threshold=self.decision_threshold,
       confirmation_s=self.motion_sensitivity.confirmation_s,
     )
-    for frame, predictions, lead_one in zip(
+    predecel_tracker = CornerCutInPredecelTracker()
+    for frame, predictions, lead_one, production_output in zip(
       frames,
       trajectory_values,
       lead_one_values,
+      production_outputs,
       strict=True,
     ):
       selected_points = motion_points_at_model_time(
@@ -1210,6 +1424,67 @@ class RadarMotionShadowSelector:
         )
         for identity, prediction in predictions.items()
       }
+      allowed_predictions = {
+        identity: prediction
+        for identity, prediction in predictions.items()
+        if (
+          (point := point_by_identity.get(identity)) is not None
+          and turning_corner_path_entry_allowed(
+            prediction.source,
+            point.y_rel,
+            prediction.d_path,
+            frame.yaw_rate_rad_s,
+            cross_sensor_confirmed=(
+              identity in front_kinematic_matches
+            ),
+          )
+        )
+      }
+      predecel = predecel_tracker.update(
+        frame.time_s,
+        (
+          RadarMotionCutIn(
+            prediction,
+            corner_cutin_predecel_score(
+              prediction,
+              point.d_rel,
+              point.v_rel,
+              v_ego=frame.v_ego,
+              cross_sensor_confirmed=(
+                (prediction.source, prediction.track_id)
+                in front_kinematic_matches
+              ),
+            ),
+          )
+          for prediction in allowed_predictions.values()
+          if (
+            self.motion_sensitivity.cut_in_enabled
+            and (
+              point := point_by_identity.get(
+                (prediction.source, prediction.track_id),
+              )
+            ) is not None
+          )
+        ),
+      )
+      predecel_candidate = None
+      if predecel is not None:
+        point = point_by_identity.get((
+          predecel.prediction.source,
+          predecel.prediction.track_id,
+        ))
+        if point is not None:
+          predecel_candidate = replace(
+            _shadow_candidate(predecel.prediction),
+            score=predecel.score,
+            reason="corner CUT-IN pre-deceleration risk",
+            decision_threshold=0.0,
+            d_rel=point.d_rel,
+            y_rel=point.y_rel,
+            v_lead=point.v_lead,
+            stage="PRE-DECEL",
+            source=predecel.prediction.source,
+          )
       raw_diagnostics = tuple(sorted(
         (_shadow_candidate(prediction) for prediction in predictions.values()),
         key=lambda candidate: (
@@ -1221,7 +1496,7 @@ class RadarMotionShadowSelector:
       decision = decision_tracker.update(
         frame.time_s,
         (
-          predictions.values()
+          allowed_predictions.values()
           if self.motion_sensitivity.cut_in_enabled
           else ()
         ),
@@ -1251,6 +1526,7 @@ class RadarMotionShadowSelector:
           prediction.source,
           prediction.d_path_rate_long,
           d_rel=point.d_rel,
+          v_rel=point.v_rel,
           d_path=prediction.d_path,
           d_path_rate_short=getattr(
             prediction, "d_path_rate_short", prediction.d_path_rate_long,
@@ -1270,6 +1546,10 @@ class RadarMotionShadowSelector:
           ),
           directional_inward_sample_ratio=getattr(
             prediction, "directional_inward_sample_ratio", 0.0,
+          ),
+          corner_directional_entry=(
+            getattr(prediction, "near_side_directional_entry", False)
+            or getattr(prediction, "lane_boundary_directional_entry", False)
           ),
           tracked_close_entry=getattr(
             prediction, "front_tracked_close_entry", False,
@@ -1334,25 +1614,72 @@ class RadarMotionShadowSelector:
           ),
           confirmed_cutin=confirmed_cutin,
         ))
-      stationary_shadow_inputs = []
-      for point in visible_motion_points(
-        front_motion_points, frame.path, None,
-      ):
-        if point.radar_track_state < 2:
+      stationary_primary_candidates = []
+      for point in selected_points:
+        if not point.source.startswith("corner"):
           continue
         d_path = project_to_model_path(
           frame.path, point.d_rel, point.y_rel,
         ).d_path
-        stationary_shadow_inputs.append(DPathLeadCandidate(
-          lead=lead_from_radar_point(
-            point, d_path, 0.03, primary_cut_out_probability,
-          ),
+        stationary_primary_candidates.append(DPathLeadCandidate(
+          lead=lead_from_radar_point(point, d_path, 0.03, 0.0),
           source=point.source,
           track_id=point.track_id,
           continuity_id=0,
           retainable=True,
           confirmed_cutin=False,
         ))
+      stationary_primary_handoff = (
+        stationary_primary_handoff_tracker.update(
+          frame.time_s,
+          lead_one,
+          stationary_primary_candidates,
+          active_identity,
+        )
+      )
+      if (
+        stationary_primary_handoff is not None
+        and not any(
+          candidate.identity == stationary_primary_handoff.identity
+          for candidate in lead_candidates
+        )
+      ):
+        lead_candidates.append(stationary_primary_handoff)
+      stationary_shadow_inputs = []
+      for point in visible_motion_points(
+        front_motion_points, frame.path, None,
+      ):
+        identity = (point.source, point.track_id, 0)
+        retained_stationary_shadow = active_identity == identity
+        corner_supported = stationary_shadow_corner_supported(
+          point, all_aligned_points, frame.path,
+        )
+        if (
+          point.radar_track_state < 2
+          or not (corner_supported or retained_stationary_shadow)
+        ):
+          continue
+        d_path = project_to_model_path(
+          frame.path, point.d_rel, point.y_rel,
+        ).d_path
+        lead = lead_from_radar_point(
+          point, d_path, 0.03, primary_cut_out_probability,
+        )
+        candidate = DPathLeadCandidate(
+          lead=lead,
+          source=point.source,
+          track_id=point.track_id,
+          continuity_id=0,
+          retainable=True,
+          confirmed_cutin=False,
+        )
+        if corner_supported:
+          stationary_shadow_inputs.append(candidate)
+        if (
+          retained_stationary_shadow
+          and point.track_id != primary_track_id
+        ):
+          lead_candidates.append(candidate)
       stationary_shadow = stationary_shadow_tracker.update(
         frame.time_s,
         lead_one,
@@ -1455,15 +1782,32 @@ class RadarMotionShadowSelector:
       )
       selections.append(Selection(
         lead_one=_controller_candidate(
-          frame, lead_one, "RadarMotion leadOne",
+          frame,
+          lead_one,
+          "RadarMotion leadOne",
+          {
+            (prediction.source, prediction.track_id): prediction.continuity_id
+            for prediction in predictions.values()
+          },
         ),
         lead_two=_controller_candidate(
-          frame, lead_selection.lead_two, "RadarMotion leadTwo",
+          frame,
+          (
+            production_output.lead_two
+            if production_output is not None
+            else lead_selection.lead_two
+          ),
+          "RadarMotion leadTwo",
+          {
+            (prediction.source, prediction.track_id): prediction.continuity_id
+            for prediction in predictions.values()
+          },
         ),
         front_candidates=front,
         corner_candidates=corner,
         cutin_diagnostics=diagnostics,
         decision_cutin_candidates=decisions,
+        cutin_predecel_candidate=predecel_candidate,
       ))
     self.trajectories = trajectory_values
     self.lead_one_outputs = lead_one_values
@@ -1475,6 +1819,645 @@ class RadarMotionShadowSelector:
     return self.selections[frame_index]
 
 
+def _occupancy_v2_candidate(
+  estimate: OccupancyEstimate,
+  point: RadarPoint,
+) -> Candidate:
+  prediction = estimate.evidence
+  overlap_eta = (
+    "--"
+    if estimate.time_to_overlap_s is None
+    else f"{estimate.time_to_overlap_s:.2f}s"
+  )
+  time_gap = "--" if estimate.time_gap_s is None else f"{estimate.time_gap_s:.2f}s"
+  collision_eta = (
+    "--"
+    if estimate.time_to_collision_s is None
+    else f"{estimate.time_to_collision_s:.2f}s"
+  )
+  return Candidate(
+    track_id=prediction.track_id,
+    score=estimate.lead_score,
+    reason="probabilistic lane occupancy V2",
+    decision_threshold=0.0,
+    d_rel=point.d_rel,
+    y_rel=point.y_rel,
+    v_lead=point.v_lead,
+    base_score=estimate.risk_score,
+    temporal_score=estimate.confidence,
+    current_path_occupancy=prediction.current_path_occupancy,
+    stage=estimate.stage.name,
+    detail=(
+      f"occ={estimate.occupancy_score:.2f} "
+      + f"risk={estimate.risk_score:.2f} lead={estimate.lead_score:.2f} "
+      + f"intent={estimate.intent_score:.2f} conf={estimate.confidence:.2f} "
+      + f"clear={estimate.path_clearance_m:.2f}m "
+      + f"inward={estimate.inward_rate_mps:.2f}m/s eta={overlap_eta} "
+      + f"gap={time_gap} ttc={collision_eta} "
+      + f"urgency={estimate.control_urgency:.2f}"
+    ),
+    source=prediction.source,
+    continuity_id=prediction.continuity_id,
+  )
+
+
+class RadarOccupancyV2Selector:
+  """Replay V1 with the bounded early-control additions from occupancy V2."""
+
+  name = "probabilistic-occupancy-v2"
+
+  def __init__(
+    self,
+    frames: Sequence[RadarFrame],
+    *,
+    baseline: RadarMotionShadowSelector | None = None,
+    enable_radar_tracks: int = 2,
+  ) -> None:
+    baseline = baseline or RadarMotionShadowSelector(
+      frames,
+      enable_radar_tracks=enable_radar_tracks,
+    )
+    occupancy_model = RadarOccupancyModelV2()
+    front_associator = FrontRadarKinematicAssociator()
+    lead_two_tracker = DPathLeadTwoTracker()
+    selections: list[Selection] = []
+    estimate_series: list[tuple[OccupancyEstimate, ...]] = []
+
+    for index, (frame, predictions, lead_one) in enumerate(zip(
+      frames,
+      baseline.trajectories,
+      baseline.lead_one_outputs,
+      strict=True,
+    )):
+      selected_points = baseline.motion_points[index]
+      all_points = radar_points_at_model_time(frame)
+      front_matches = front_associator.update(all_points)
+      cross_sensor_identities = set(front_matches)
+      cross_sensor_identities.update(
+        (point.source, point.track_id)
+        for point in front_matches.values()
+      )
+      point_by_identity = {
+        (point.source, point.track_id): point
+        for point in selected_points
+      }
+      point_by_identity.update({
+        (point.source, point.track_id): point
+        for point in all_points
+        if (point.source, point.track_id) in predictions
+      })
+      vision = vision_lead_from_model(_controller_model(frame))
+      evidence_values: list[OccupancyEvidence] = []
+      point_by_v2_identity: dict[tuple[str, int], RadarPoint] = {}
+      for prediction in predictions.values():
+        identity = prediction.source, prediction.track_id
+        point = point_by_identity.get(identity)
+        if point is None:
+          continue
+        vision_supported = (
+          apply_vision_bracket_cutin_support(
+            prediction,
+            point,
+            all_points,
+            vision,
+            lead_one,
+          ).reason
+          == "vision-bracketed physical CUT-IN"
+        )
+        evidence = OccupancyEvidence(
+          source=prediction.source,
+          track_id=prediction.track_id,
+          continuity_id=prediction.continuity_id,
+          d_rel=point.d_rel,
+          v_rel=point.v_rel,
+          v_lead=point.v_lead,
+          v_ego=frame.v_ego,
+          d_path=prediction.d_path,
+          d_path_rate_short=prediction.d_path_rate_short,
+          d_path_rate_long=prediction.d_path_rate_long,
+          reported_normal_speed=prediction.reported_normal_speed,
+          normal_speed_disagreement=prediction.normal_speed_disagreement,
+          directional_inward_displacement_m=(
+            prediction.directional_inward_displacement_m
+          ),
+          directional_consistency=prediction.directional_consistency,
+          directional_inward_sample_ratio=(
+            prediction.directional_inward_sample_ratio
+          ),
+          motion_consistency=prediction.motion_consistency,
+          recent_motion_support=prediction.recent_motion_support,
+          history_count=prediction.history_count,
+          uncertainty=prediction.uncertainty,
+          current_path_occupancy=prediction.current_path_occupancy,
+          cross_sensor_confirmed=identity in cross_sensor_identities,
+          vision_supported=vision_supported,
+        )
+        evidence_values.append(evidence)
+        point_by_v2_identity[evidence.identity] = point
+
+      estimates = occupancy_model.update(frame.time_s, evidence_values)
+      estimate_series.append(estimates)
+      estimate_by_identity = {
+        estimate.evidence.identity: estimate
+        for estimate in estimates
+      }
+      diagnostics = tuple(sorted(
+        (
+          _occupancy_v2_candidate(
+            estimate,
+            point_by_v2_identity[estimate.evidence.identity],
+          )
+          for estimate in estimates
+        ),
+        key=lambda candidate: (
+          -OccupancyStage[candidate.stage],
+          -candidate.score,
+          candidate.d_rel if candidate.d_rel is not None else math.inf,
+        ),
+      ))
+      baseline_selection = baseline.selections[index]
+      control_eligible_identities = {
+        estimate.evidence.identity
+        for estimate in estimates
+        if early_control_eligible(estimate)
+      }
+      lead_candidates = []
+      continuity_by_identity = {}
+      for identity, point in point_by_identity.items():
+        prediction = predictions.get(identity)
+        if prediction is None:
+          continue
+        estimate = estimate_by_identity.get((
+          prediction.source,
+          prediction.continuity_id,
+        ))
+        if estimate is None:
+          continue
+        continuity_by_identity[identity] = prediction.continuity_id
+        lead_point = prefer_front_radar_kinematics(
+          point, all_points, front_matches,
+        )
+        lead_d_path = (
+          project_to_model_path(
+            frame.path, lead_point.d_rel, lead_point.y_rel,
+          ).d_path
+          if lead_point is not point
+          else prediction.d_path
+        )
+        lead = lead_from_radar_point(
+          lead_point,
+          lead_d_path,
+          0.03,
+          estimate.lead_score,
+        )
+        if lead_duplicates_primary(lead, lead_one):
+          control_eligible_identities.discard(estimate.evidence.identity)
+          if lead_two_tracker.active_identity == (
+            prediction.source,
+            prediction.track_id,
+            prediction.continuity_id,
+          ):
+            lead_two_tracker.reset()
+          continue
+        if estimate.evidence.identity not in control_eligible_identities:
+          continue
+        lead_candidates.append(DPathLeadCandidate(
+          lead=lead,
+          source=prediction.source,
+          track_id=prediction.track_id,
+          continuity_id=prediction.continuity_id,
+          retainable=estimate.stage >= OccupancyStage.LIMIT,
+          confirmed_cutin=estimate.stage >= OccupancyStage.LEAD,
+        ))
+
+      v2_limit_candidates = tuple(
+        candidate for candidate in diagnostics
+        if (
+          OccupancyStage[candidate.stage] >= OccupancyStage.LIMIT
+          and (candidate.source, candidate.continuity_id)
+          in control_eligible_identities
+        )
+      )
+      v2_decision_candidates = tuple(
+        candidate for candidate in diagnostics
+        if (
+          OccupancyStage[candidate.stage] >= OccupancyStage.LEAD
+          and (candidate.source, candidate.continuity_id)
+          in control_eligible_identities
+        )
+      )
+      baseline_decision_keys = {
+        (candidate.source, candidate.track_id)
+        for candidate in baseline_selection.decision_cutin_candidates
+      }
+      decision_candidates = (
+        baseline_selection.decision_cutin_candidates
+        + tuple(
+          candidate for candidate in v2_decision_candidates
+          if (candidate.source, candidate.track_id)
+          not in baseline_decision_keys
+        )
+      )
+      predecel_candidate = min(
+        (
+          *v2_limit_candidates,
+          *(
+            ()
+            if baseline_selection.cutin_predecel_candidate is None
+            else (baseline_selection.cutin_predecel_candidate,)
+          ),
+        ),
+        key=lambda candidate: (
+          candidate.d_rel if candidate.d_rel is not None else math.inf,
+          -float(candidate.base_score or 0.0),
+        ),
+        default=None,
+      )
+
+      lead_selection = lead_two_tracker.update(
+        frame.time_s,
+        lead_one,
+        lead_candidates,
+        frame.v_ego,
+      )
+      selected_ids = {
+        int(lead["radarTrackId"])
+        for lead in lead_selection.cutins
+      }
+      active_candidates = tuple(
+        candidate for candidate in v2_decision_candidates
+        if candidate.track_id in selected_ids
+      )
+      active_candidates = (
+        baseline_selection.active_cutin_candidates
+        + active_candidates
+      )
+      v2_lead_two = _controller_candidate(
+        frame,
+        lead_selection.lead_two,
+        "RadarOccupancy V2 leadTwo",
+        continuity_by_identity,
+      )
+      if (
+        v2_lead_two is None
+        and baseline_selection.lead_two is not None
+      ):
+        # V2 is an early-control augmentation. V1 retains ownership whenever
+        # no independently eligible V2 lead is ready.
+        v2_lead_two = baseline_selection.lead_two
+      selections.append(Selection(
+        lead_one=baseline_selection.lead_one,
+        lead_two=v2_lead_two,
+        front_candidates=tuple(
+          candidate for candidate in diagnostics
+          if not candidate.source.startswith("corner")
+        ),
+        corner_candidates=tuple(
+          candidate for candidate in diagnostics
+          if candidate.source.startswith("corner")
+        ),
+        cutin_diagnostics=diagnostics,
+        decision_cutin_candidates=decision_candidates,
+        active_cutin_candidates=active_candidates,
+        cutin_predecel_candidate=predecel_candidate,
+      ))
+
+    self.motion_sensor = baseline.motion_sensor
+    self.enable_radar_tracks = baseline.enable_radar_tracks
+    self.cut_in_sensitivity = baseline.cut_in_sensitivity
+    self.motion_sensitivity = baseline.motion_sensitivity
+    self.decision_threshold = baseline.decision_threshold
+    self.maximum_lookahead_s = baseline.maximum_lookahead_s
+    self.motion_points = baseline.motion_points
+    self.trajectories = baseline.trajectories
+    self.lead_one_outputs = baseline.lead_one_outputs
+    self.baseline = baseline
+    self.estimates = tuple(estimate_series)
+    self.selections = tuple(selections)
+
+  def select(
+    self,
+    frame: RadarFrame,
+    frame_index: int | None = None,
+  ) -> Selection:
+    del frame
+    if frame_index is None:
+      raise ValueError("occupancy V2 selector requires a frame index")
+    return self.selections[frame_index]
+
+
+def _v3_candidate(
+  estimate: V3Estimate,
+  candidate: Candidate,
+) -> Candidate:
+  evidence: V3Evidence = estimate.evidence
+  occupancy = evidence.occupancy
+  overlap = (
+    "--" if occupancy.time_to_overlap_s is None
+    else f"{occupancy.time_to_overlap_s:.2f}s"
+  )
+  return replace(
+    candidate,
+    score=estimate.score,
+    reason=f"V3 {estimate.reason}",
+    stage=estimate.stage.name,
+    detail=" ".join((
+      f"{estimate.reason} risk={occupancy.risk_score:.2f}",
+      f"lead={occupancy.lead_score:.2f}",
+      f"intent={occupancy.intent_score:.2f}",
+      f"conf={occupancy.confidence:.2f}",
+      f"urgency={occupancy.control_urgency:.2f}",
+      f"inward={occupancy.inward_rate_mps:.2f} eta={overlap}",
+    )),
+  )
+
+
+class RadarOccupancyV3Selector:
+  """V2 safety floor plus independent staged V3 control extensions."""
+
+  name = "radar-occupancy-v3"
+
+  def __init__(
+    self,
+    frames: Sequence[RadarFrame],
+    *,
+    baseline: RadarMotionShadowSelector | None = None,
+    v2_selector: RadarOccupancyV2Selector | None = None,
+    enable_radar_tracks: int = 2,
+    cut_in_sensitivity: int = VALIDATION_DEFAULT_SENSITIVITY,
+  ) -> None:
+    baseline = baseline or RadarMotionShadowSelector(
+      frames,
+      cut_in_sensitivity=cut_in_sensitivity,
+      enable_radar_tracks=enable_radar_tracks,
+    )
+    v2_selector = v2_selector or RadarOccupancyV2Selector(
+      frames,
+      baseline=baseline,
+      enable_radar_tracks=enable_radar_tracks,
+    )
+    model = RadarOccupancyModelV3()
+    associator = FrontRadarKinematicAssociator()
+    lead_two_tracker = DPathLeadTwoTracker()
+    selections: list[Selection] = []
+    estimate_series: list[tuple[V3Estimate, ...]] = []
+
+    for index, (frame, predictions, primary, base_selection, v2_estimates) in enumerate(zip(
+      frames,
+      baseline.trajectories,
+      baseline.lead_one_outputs,
+      v2_selector.selections,
+      v2_selector.estimates,
+      strict=True,
+    )):
+      estimates = model.update(frame.time_s, v2_estimates)
+      estimate_series.append(estimates)
+      all_points = radar_points_at_model_time(frame)
+      front_matches = associator.update(all_points)
+      selected_points = baseline.motion_points[index]
+      point_by_identity = {
+        (point.source, point.track_id): point for point in selected_points
+      }
+      point_by_identity.update({
+        (point.source, point.track_id): point
+        for point in all_points
+        if (point.source, point.track_id) in predictions
+      })
+      base_candidates = {
+        (candidate.source, candidate.continuity_id): candidate
+        for candidate in base_selection.cutin_diagnostics
+      }
+      v3_by_identity = {
+        estimate.evidence.identity: estimate for estimate in estimates
+      }
+      diagnostics = tuple(
+        _v3_candidate(v3_by_identity[identity], candidate)
+        if identity in v3_by_identity else candidate
+        for identity, candidate in base_candidates.items()
+      )
+
+      extra_limits = []
+      extra_decisions = []
+      lead_candidates = []
+      continuity_by_identity = {}
+      for estimate in estimates:
+        if estimate.reason == "baseline" or estimate.stage < V3Stage.PREDECEL:
+          continue
+        occupancy = estimate.evidence.occupancy
+        evidence = occupancy.evidence
+        identity = evidence.source, evidence.track_id
+        prediction = predictions.get(identity)
+        point = point_by_identity.get(identity)
+        candidate = base_candidates.get(evidence.identity)
+        if prediction is None or point is None or candidate is None:
+          continue
+        lead_point = prefer_front_radar_kinematics(
+          point, all_points, front_matches,
+        )
+        lead_d_path = (
+          project_to_model_path(
+            frame.path, lead_point.d_rel, lead_point.y_rel,
+          ).d_path
+          if lead_point is not point else prediction.d_path
+        )
+        lead = lead_from_radar_point(
+          lead_point, lead_d_path, 0.03, estimate.score,
+        )
+        if lead_duplicates_primary(lead, primary) or not cutin_can_compete_with_primary(
+          lead,
+          primary,
+          projected_path_entry=True,
+          entry_horizon_s=occupancy.time_to_overlap_s,
+        ):
+          continue
+        v3_candidate = _v3_candidate(estimate, candidate)
+        extra_limits.append(v3_candidate)
+        continuity_by_identity[identity] = prediction.continuity_id
+        if estimate.stage >= V3Stage.LEAD:
+          extra_decisions.append(v3_candidate)
+          lead_candidates.append(DPathLeadCandidate(
+            lead=lead,
+            source=prediction.source,
+            track_id=prediction.track_id,
+            continuity_id=prediction.continuity_id,
+            retainable=True,
+            confirmed_cutin=True,
+          ))
+
+      lead_selection = lead_two_tracker.update(
+        frame.time_s, primary, lead_candidates, frame.v_ego,
+      )
+      v3_lead_two = _controller_candidate(
+        frame,
+        lead_selection.lead_two,
+        "RadarOccupancy V3 leadTwo",
+        continuity_by_identity,
+      )
+      lead_two = v3_lead_two or base_selection.lead_two
+      base_decision_keys = {
+        (candidate.source, candidate.track_id)
+        for candidate in base_selection.decision_cutin_candidates
+      }
+      decision = base_selection.decision_cutin_candidates + tuple(
+        candidate for candidate in extra_decisions
+        if (candidate.source, candidate.track_id) not in base_decision_keys
+      )
+      selected_ids = {
+        int(lead["radarTrackId"]) for lead in lead_selection.cutins
+      }
+      active = base_selection.active_cutin_candidates + tuple(
+        candidate for candidate in extra_decisions
+        if candidate.track_id in selected_ids
+      )
+      predecel = min(
+        (
+          *extra_limits,
+          *(
+            () if base_selection.cutin_predecel_candidate is None
+            else (base_selection.cutin_predecel_candidate,)
+          ),
+        ),
+        key=lambda candidate: (
+          candidate.d_rel if candidate.d_rel is not None else math.inf
+        ),
+        default=None,
+      )
+      selections.append(Selection(
+        lead_one=base_selection.lead_one,
+        lead_two=lead_two,
+        front_candidates=tuple(
+          candidate for candidate in diagnostics
+          if not candidate.source.startswith("corner")
+        ),
+        corner_candidates=tuple(
+          candidate for candidate in diagnostics
+          if candidate.source.startswith("corner")
+        ),
+        cutin_diagnostics=diagnostics,
+        decision_cutin_candidates=decision,
+        active_cutin_candidates=active,
+        external_candidates=decision,
+        active_external_candidates=active,
+        cutin_predecel_candidate=predecel,
+      ))
+
+    self.motion_sensor = baseline.motion_sensor
+    self.enable_radar_tracks = baseline.enable_radar_tracks
+    self.cut_in_sensitivity = baseline.cut_in_sensitivity
+    self.motion_sensitivity = baseline.motion_sensitivity
+    self.decision_threshold = baseline.decision_threshold
+    self.maximum_lookahead_s = baseline.maximum_lookahead_s
+    self.motion_points = baseline.motion_points
+    self.trajectories = baseline.trajectories
+    self.lead_one_outputs = baseline.lead_one_outputs
+    self.baseline = baseline
+    self.v2_selector = v2_selector
+    self.estimates = tuple(estimate_series)
+    self.selections = tuple(selections)
+
+  def select(
+    self, frame: RadarFrame, frame_index: int | None = None,
+  ) -> Selection:
+    del frame
+    if frame_index is None:
+      raise ValueError("occupancy V3 selector requires a frame index")
+    return self.selections[frame_index]
+
+
+def visual_replay_cache_path(
+  cache_dir: Path,
+  log_path: Path,
+  *,
+  motion_mode: str,
+  cut_in_sensitivity: int,
+  probability_override: float | None,
+  enable_radar_tracks: int,
+) -> Path:
+  """Return the private cache path for one exact visual replay setup."""
+  log_stat = log_path.stat()
+  identity = json.dumps({
+    "version": VISUAL_REPLAY_CACHE_VERSION,
+    "source_fingerprint": radar_replay_source_fingerprint(),
+    "log": str(log_path.resolve()),
+    "log_size": log_stat.st_size,
+    "log_mtime_ns": log_stat.st_mtime_ns,
+    "motion_mode": motion_mode,
+    "cut_in_sensitivity": int(cut_in_sensitivity),
+    "probability_override": probability_override,
+    "enable_radar_tracks": int(enable_radar_tracks),
+  }, sort_keys=True, separators=(",", ":"))
+  digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+  return cache_dir / f"visual-replay-{digest}.pickle"
+
+
+def save_visual_replay_cache(
+  cache_path: Path,
+  frames: list[RadarFrame],
+  selector: RadarOccupancyV2Selector,
+  v3_selector: RadarOccupancyV3Selector,
+  production_selector: ProductionDPathSelector,
+) -> None:
+  """Atomically save a fully built replay for the foreground reviewer."""
+  cache_path.parent.mkdir(parents=True, exist_ok=True)
+  temporary_path = cache_path.with_name(
+    f"{cache_path.name}.{os.getpid()}.tmp",
+  )
+  try:
+    with temporary_path.open("wb") as cache_file:
+      pickle.dump(
+        {
+          "version": VISUAL_REPLAY_CACHE_VERSION,
+          "source_fingerprint": radar_replay_source_fingerprint(),
+          "frames": frames,
+          "selector": selector,
+          "v3_selector": v3_selector,
+          "production_selector": production_selector,
+        },
+        cache_file,
+        protocol=pickle.HIGHEST_PROTOCOL,
+      )
+    temporary_path.replace(cache_path)
+  finally:
+    temporary_path.unlink(missing_ok=True)
+
+
+def load_visual_replay_cache(
+  cache_path: Path,
+) -> tuple[
+  list[RadarFrame],
+  RadarOccupancyV2Selector,
+  RadarOccupancyV3Selector,
+  ProductionDPathSelector,
+] | None:
+  """Load a prepared replay, returning None for stale or damaged data."""
+  if not cache_path.is_file():
+    return None
+  try:
+    with cache_path.open("rb") as cache_file:
+      payload = pickle.load(cache_file)
+    if (
+      not isinstance(payload, dict)
+      or payload.get("version") != VISUAL_REPLAY_CACHE_VERSION
+      or payload.get("source_fingerprint")
+      != radar_replay_source_fingerprint()
+      or not isinstance(payload.get("frames"), list)
+      or not isinstance(payload.get("selector"), RadarOccupancyV2Selector)
+      or not isinstance(payload.get("v3_selector"), RadarOccupancyV3Selector)
+      or not isinstance(
+        payload.get("production_selector"), ProductionDPathSelector,
+      )
+    ):
+      return None
+    return (
+      payload["frames"],
+      payload["selector"],
+      payload["v3_selector"],
+      payload["production_selector"],
+    )
+  except (EOFError, OSError, pickle.PickleError, AttributeError, TypeError):
+    return None
+
+
 def _route_replay_module() -> Any:
   cluster_dir = Path(__file__).resolve().parents[2] / "cluster"
   if str(cluster_dir) not in sys.path:
@@ -1483,12 +2466,16 @@ def _route_replay_module() -> Any:
   return cluster_route_replay
 
 
-def _copy_track_points(points: Iterable[Any]) -> tuple[RadarPoint, ...]:
+def _copy_track_points(
+  points: Iterable[Any],
+  *,
+  allow_legacy_corner_ids: bool = False,
+) -> tuple[RadarPoint, ...]:
   copied: list[RadarPoint] = []
   for point in points:
     track_id = int(point.trackId)
     source = str(point.radarSource)
-    if source == "frontRadar":
+    if allow_legacy_corner_ids and source == "frontRadar":
       if 200 <= track_id < 220:
         source = "corner235"
       elif 240 <= track_id < 250:
@@ -1592,10 +2579,387 @@ def _copy_recorded_lead(lead: Any) -> RecordedLead:
   )
 
 
+def _production_controller_replay(
+  frames: Sequence[RadarFrame],
+  *,
+  motion_sensor: str,
+  enable_radar_tracks: int,
+  cut_in_sensitivity: int,
+) -> tuple[tuple[Any, ...], tuple[tuple[Any, ...], ...]]:
+  """Replay the real dPath controller for option-dependent lead roles."""
+  controller = DPathRadarController(
+    prefer_corner_radar=motion_sensor == "corner",
+    enable_radar_tracks=enable_radar_tracks,
+    cut_in_sensitivity=cut_in_sensitivity,
+  )
+  outputs = []
+  estimates = []
+  for frame in frames:
+    controller.front_radar_measurement_delay_s = max(
+      0.0, float(frame.radar_delay_s),
+    )
+    radar_points = (
+      tuple(
+        point for point in frame.points
+        if not point.source.startswith("corner")
+      )
+      if motion_sensor == "front"
+      else frame.points
+    )
+    outputs.append(controller.update(
+      frame.time_s,
+      frame.v_ego,
+      radar_points,
+      _controller_model(frame),
+      frame.yaw_rate_rad_s,
+      frame.input_age_s - frame.model_age_s,
+    ))
+    estimates.append(controller.trajectory_cutin.last_estimates)
+  return tuple(outputs), tuple(estimates)
+
+
+def _production_controller_outputs(
+  frames: Sequence[RadarFrame],
+  *,
+  motion_sensor: str,
+  enable_radar_tracks: int,
+  cut_in_sensitivity: int,
+) -> tuple[Any, ...]:
+  return _production_controller_replay(
+    frames,
+    motion_sensor=motion_sensor,
+    enable_radar_tracks=enable_radar_tracks,
+    cut_in_sensitivity=cut_in_sensitivity,
+  )[0]
+
+
+class ProductionDPathSelector:
+  """Replay only the production controller without rebuilding shadow models."""
+
+  name = "production-dpath-controller"
+
+  def __init__(
+    self,
+    frames: Sequence[RadarFrame],
+    *,
+    motion_sensor: str | None = None,
+    enable_radar_tracks: int = 2,
+    cut_in_sensitivity: int = VALIDATION_DEFAULT_SENSITIVITY,
+  ) -> None:
+    self.motion_sensor = motion_sensor or preferred_radar_motion_sensor(frames)
+    self.enable_radar_tracks = int(enable_radar_tracks)
+    self.cut_in_sensitivity = max(0, min(5, int(cut_in_sensitivity)))
+    self.motion_sensitivity = radar_motion_sensitivity(
+      self.cut_in_sensitivity,
+      self.motion_sensor,
+    )
+    self.decision_threshold = self.motion_sensitivity.cut_in_threshold
+    outputs, estimate_series = _production_controller_replay(
+      frames,
+      motion_sensor=self.motion_sensor,
+      enable_radar_tracks=self.enable_radar_tracks,
+      cut_in_sensitivity=self.cut_in_sensitivity,
+    )
+    selections = []
+    lane_change_tracker = LaneChangeGapTracker()
+    for frame, output, estimates in zip(
+      frames, outputs, estimate_series, strict=True,
+    ):
+      estimate_aliases: dict[int, tuple[int, ...]] = {}
+      for estimate in estimates:
+        if estimate.cross_sensor_track_id is None:
+          continue
+        point_id = estimate.point.track_id
+        cross_id = estimate.cross_sensor_track_id
+        estimate_aliases[point_id] = tuple({
+          *estimate_aliases.get(point_id, ()), cross_id,
+        })
+        estimate_aliases[cross_id] = tuple({
+          *estimate_aliases.get(cross_id, ()), point_id,
+        })
+      lead_one = _controller_candidate(
+        frame, output.lead_one, "production dPath leadOne",
+      )
+      lead_two = _controller_candidate(
+        frame,
+        output.lead_two,
+        "production dPath leadTwo",
+        track_aliases=estimate_aliases.get(
+          int((output.lead_two or {}).get("radarTrackId", -1)), (),
+        ),
+      )
+      decisions = tuple(
+        candidate
+        for lead in output.leads_cutin
+        if (
+          candidate := _controller_candidate(
+            frame,
+            lead,
+            "trajectory CUT-IN",
+            track_aliases=estimate_aliases.get(
+              int(lead.get("radarTrackId", -1)), (),
+            ),
+          )
+        ) is not None
+      )
+      risk = _controller_candidate(
+        frame,
+        output.lead_cutin_risk,
+        "trajectory CUT-IN pre-deceleration",
+        track_aliases=estimate_aliases.get(
+          int((output.lead_cutin_risk or {}).get("radarTrackId", -1)), (),
+        ),
+      )
+      diagnostics = tuple(
+        Candidate(
+          track_id=estimate.point.track_id,
+          score=estimate.confidence,
+          reason=estimate.reason,
+          d_rel=estimate.point.d_rel,
+          y_rel=estimate.point.y_rel,
+          v_lead=estimate.point.v_lead,
+          current_path_occupancy=estimate.current_path,
+          stage=(
+            "CUT-IN" if estimate.confirmed_cutin
+            else "RAW-CUTIN" if estimate.raw_cutin
+            else "PREDECEL" if estimate.predecel_risk
+            else "WITHDRAWN" if estimate.entry_withdrawn
+            else "REAR-PASS" if estimate.rear_pass
+            else "SIDE-DRIFT" if estimate.parallel_drift
+            else "FILTERED" if not estimate.close_front_supported
+            else "JITTER" if estimate.jittering
+            else "TRACK"
+          ),
+          detail=(
+            f"dRel={estimate.point.d_rel:.2f} "
+            + f"vRel={estimate.point.v_rel:.2f} "
+            + f"yRel={estimate.point.y_rel:.2f} "
+            + f"dPath={estimate.d_path:.2f}->{estimate.future_d_path:.2f} "
+            + "| "
+            + f"h={estimate.history_s:.2f} "
+            + f"p={estimate.inward_progress:.2f} "
+            + f"dir={estimate.direction_consistency:.2f} "
+            + f"yaw={estimate.recent_abs_yaw_max:.3f} "
+            + f"vSp={estimate.recent_v_rel_spread:.2f} "
+            + f"rp={estimate.recent_inward_progress:.2f} "
+            + f"rd={estimate.recent_direction_consistency:.2f} "
+            + "| "
+            + f"J={int(estimate.jittering)} "
+            + f"FJ={int(estimate.unstable_fast_motion)} "
+            + f"rearPass={int(estimate.rear_pass)} "
+            + f"sideDrift={int(estimate.parallel_drift)} "
+            + f"close={int(estimate.close_front_supported)} "
+            + f"hist={int(estimate.front_history_supported)} "
+            + f"vision={int(estimate.vision_supported)} "
+            + f"visionBracket={int(estimate.vision_bracket_supported)} "
+            + f"pairedMotion={int(estimate.paired_inward_motion_supported)} "
+            + f"bodyEntry={int(estimate.paired_body_entry)} "
+            + f"cross={int(estimate.cross_sensor_supported)} "
+            + f"ctrl={int(estimate.control_eligible)} "
+            + f"H={estimate.horizon_s:.2f} "
+            + f"rate={estimate.inward_rate:.2f} "
+            + f"radar={estimate.reported_inward_rate:.2f} "
+            + f"move={estimate.lateral_travel:.2f} "
+            + f"net={estimate.lateral_net_fraction:.2f} "
+            + f"vMin={estimate.recent_v_rel_min:.2f} "
+            + "crossId="
+            + (
+              "--" if estimate.cross_sensor_track_id is None
+              else str(estimate.cross_sensor_track_id)
+            )
+            + " "
+            + f"curve={int(estimate.curve_alias)} "
+            + "eta="
+            + (
+              "--" if estimate.time_to_overlap_s is None
+              else f"{estimate.time_to_overlap_s:.2f}s"
+            )
+          ),
+          source=estimate.point.source,
+          continuity_id=estimate.continuity_id,
+        )
+        for estimate in estimates
+      )
+      direction = frame.lane_change_direction or (lane_change_tracker.direction if frame.lane_change_active else 0)
+      lane_change_gap = lane_change_tracker.update(
+        now=frame.mono_time_s, direction=direction, v_ego=frame.v_ego,
+        yaw_rate=frame.lane_change_device_yaw if frame.lane_change_device_yaw is not None else math.nan,
+        path_t=frame.path_times, path_x=tuple(p[0] for p in frame.lane_change_model_path),
+        path_y=tuple(p[1] for p in frame.lane_change_model_path),
+        primary=SimpleNamespace(**output.lead_one) if output.lead_one else None,
+        secondary=SimpleNamespace(**output.lead_two) if output.lead_two else None,
+        blindspot=frame.lane_change_blindspot or frame.lane_change_direction == 0,
+        valid=frame.input_age_s <= 0.20 and frame.model_age_s <= 0.20 and frame.car_state_age_s <= 0.20,
+      )
+      selections.append(Selection(
+        lead_one=lead_one,
+        lead_two=lead_two,
+        front_candidates=tuple(
+          candidate for candidate in diagnostics
+          if not candidate.source.startswith("corner")
+        ),
+        corner_candidates=tuple(
+          candidate for candidate in diagnostics
+          if candidate.source.startswith("corner")
+        ),
+        cutin_diagnostics=diagnostics,
+        decision_cutin_candidates=decisions,
+        active_cutin_candidates=decisions,
+        external_candidates=decisions,
+        active_external_candidates=decisions,
+        cutin_predecel_candidate=risk,
+        lane_change_gap=lane_change_gap,
+      ))
+    self.motion_points = tuple(
+      motion_points_at_model_time(frame, self.motion_sensor)
+      for frame in frames
+    )
+    # Legacy trajectories use a different predictor and must not be drawn over
+    # production decisions. Production state remains in the track diagnostics.
+    self.trajectories: tuple[dict[Any, Any], ...] = tuple(
+      {} for _ in frames
+    )
+    self.lead_one_outputs = tuple(output.lead_one for output in outputs)
+    self.outputs = outputs
+    self.selections = tuple(selections)
+
+  def select(
+    self,
+    frame: RadarFrame,
+    frame_index: int | None = None,
+  ) -> Selection:
+    del frame
+    if frame_index is None:
+      raise ValueError("production dPath selector requires a frame index")
+    return self.selections[frame_index]
+
+
+def _empty_recorded_lead() -> RecordedLead:
+  return RecordedLead(False, False, -1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
 def aligned_video_time_s(qcamera_start_eof_ns: int, model_eof_ns: int) -> float | None:
   if qcamera_start_eof_ns <= 0 or model_eof_ns < qcamera_start_eof_ns:
     return None
   return (model_eof_ns - qcamera_start_eof_ns) / 1e9
+
+
+def monotonic_log_events(events: Iterable[Any]) -> list[Any]:
+  """Return rlog events in the timestamp order seen by live subscribers."""
+  return sorted(events, key=lambda event: int(event.logMonoTime))
+
+
+def predictor_reference_time_ns(event_ns: int, model_reference_ns: int) -> int:
+  """Use the model exposure timestamp, matching production RadarD."""
+  return model_reference_ns if model_reference_ns > 0 else event_ns
+
+
+def _hyundai_scc_dbc_messages(
+  route_replay: Any,
+  car_fingerprint: str,
+) -> dict[int, tuple[str, dict[str, Any]]]:
+  """Load the route vehicle's SCC signal layout from its powertrain DBC."""
+  # Standalone validation runs only put the openpilot root on sys.path. The
+  # vendored opendbc package lives beside it, so make that import independent
+  # of the caller's PYTHONPATH (the normal review launcher does not set one).
+  opendbc_repo = REPO_ROOT / "opendbc_repo"
+  if opendbc_repo.is_dir() and str(opendbc_repo) not in sys.path:
+    sys.path.insert(0, str(opendbc_repo))
+  try:
+    from opendbc.car.hyundai.values import DBC
+  except ImportError:
+    return {}
+  dbc_by_bus = DBC.get(car_fingerprint)
+  if dbc_by_bus is None:
+    dbc_by_bus = next(
+      (
+        value for fingerprint, value in DBC.items()
+        if str(fingerprint) == car_fingerprint
+      ),
+      None,
+    )
+  if dbc_by_bus is None:
+    return {}
+  dbc_name = next(
+    (
+      value for bus, value in dbc_by_bus.items()
+      if str(getattr(bus, "value", bus)) == "pt"
+    ),
+    None,
+  )
+  if not dbc_name:
+    return {}
+  dbc_path = route_replay.find_opendbc_file(
+    REPO_ROOT,
+    "opendbc",
+    "dbc",
+    f"{dbc_name}.dbc",
+  )
+  if dbc_path is None:
+    return {}
+
+  message_names = {"SCC_CONTROL", "SCC11", "SCC12"}
+  signal_names = {
+    "ACC_ObjDist", "ACC_ObjStatus", "ObjValid", "aReqRaw",
+  }
+  messages: dict[int, tuple[str, dict[str, Any]]] = {}
+  current_address: int | None = None
+  current_name = ""
+  with open(dbc_path, encoding="utf-8") as dbc_file:
+    for line in dbc_file:
+      if line.startswith("BO_ "):
+        parts = line.split()
+        current_address = int(parts[1], 0) if len(parts) > 2 else None
+        current_name = parts[2].rstrip(":") if len(parts) > 2 else ""
+        if current_address is not None and current_name in message_names:
+          messages[current_address] = (current_name, {})
+        continue
+      if current_address not in messages:
+        continue
+      match = route_replay.DBC_SIGNAL_RE.match(line)
+      if match is None:
+        continue
+      name, start, length, endian, sign, factor, offset = match.groups()
+      if name not in signal_names:
+        continue
+      messages[current_address][1][name] = route_replay.DbcSignalSpec(
+        start=int(start),
+        length=int(length),
+        byte_order="le" if endian == "1" else "be",
+        signed=sign == "-",
+        factor=float(factor),
+        offset=float(offset),
+      )
+  return messages
+
+
+def _decode_scc_can_message(
+  route_replay: Any,
+  address: int,
+  data: bytes,
+  messages: dict[int, tuple[str, dict[str, Any]]],
+) -> tuple[float | None, float | None, bool | None]:
+  message = messages.get(address)
+  if message is None:
+    return None, None, None
+  _, signals = message
+  values: dict[str, float] = {}
+  for name, signal in signals.items():
+    raw_value = route_replay.dbc_unsigned(
+      data, signal.start, signal.length, signal.byte_order,
+    )
+    if signal.signed:
+      sign_bit = 1 << (signal.length - 1)
+      raw_value = raw_value - (1 << signal.length) if raw_value & sign_bit else raw_value
+    values[name] = raw_value * signal.factor + signal.offset
+  object_valid = (
+    values["ACC_ObjStatus"] > 0.0
+    if "ACC_ObjStatus" in values
+    else values["ObjValid"] > 0.0
+    if "ObjValid" in values
+    else None
+  )
+  return values.get("ACC_ObjDist"), values.get("aReqRaw"), object_valid
 
 
 def _yaw_metadata(
@@ -1616,26 +2980,55 @@ def _yaw_metadata(
   ):
     value = _finite(getattr(angular_velocity, "z", math.nan), math.nan)
     if math.isfinite(value):
-      return value, False, "livePose"
+      return device_yaw_to_radar(value), False, "livePose"
   ratio = max(abs(_finite(steer_ratio, 14.0)), 1.0)
   base = max(abs(_finite(wheelbase, 2.8)), 1.5)
   road_wheel_angle = math.radians(_finite(steering_angle_deg) / ratio)
-  return -_finite(v_ego) * math.tan(road_wheel_angle) / base, True, "steering"
+  return _finite(v_ego) * math.tan(road_wheel_angle) / base, True, "steering"
 
 
 def load_frames(log_path: Path) -> list[RadarFrame]:
   route_replay = _route_replay_module()
   schema = route_replay.load_openpilot_log_schema()
   data = route_replay.read_log_bytes(log_path)
+  events = monotonic_log_events(schema.Event.read_multiple_bytes(data))
   latest_points: tuple[RadarPoint, ...] | None = None
   latest_points_ns = 0
   latest_v_ego = 0.0
+  latest_left_blinker = latest_right_blinker = False
+  latest_left_blindspot = latest_right_blindspot = False
+  latest_car_state_ns = 0
   latest_steering_angle_deg = 0.0
   latest_steering_rate_deg_s = 0.0
   latest_live_pose: Any | None = None
   latest_live_pose_ns = 0
   latest_steer_ratio = 14.0
   latest_wheelbase = 2.8
+  latest_scc_distance_m: float | None = None
+  latest_scc_distance_ns = 0
+  latest_scc_a_req_raw: float | None = None
+  latest_scc_a_req_raw_ns = 0
+  latest_scc_object_valid: bool | None = None
+  latest_scc_bus: int | None = None
+  latest_scc_bus_ns = 0
+  latest_carrot_a_target: float | None = None
+  latest_carrot_a_target_ns = 0
+  scc_dbc_messages: dict[int, tuple[str, dict[str, Any]]] = {}
+  car_brand = ""
+  # carParams can be emitted well into a segment. Resolve the static vehicle
+  # metadata before consuming events so legacy corner-ID recovery is limited
+  # to Hyundai and SCC_CONTROL is decoded from the first frame.
+  for event in events:
+    try:
+      if event.which() == "carParams":
+        car_brand = str(event.carParams.brand)
+        scc_dbc_messages = _hyundai_scc_dbc_messages(
+          route_replay,
+          str(event.carParams.carFingerprint),
+        )
+        break
+    except Exception:
+      continue
   latest_radar_delay_s = 0.0
   latest_path: tuple[tuple[float, float], ...] = ()
   latest_lanes: tuple[tuple[tuple[float, float], ...], ...] = ()
@@ -1646,11 +3039,14 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
   latest_model_ns = 0
   latest_model_eof_ns = 0
   qcamera_start_eof_ns = 0
-  absolute_frames: list[tuple[int, RadarFrame]] = []
+  absolute_frames: list[tuple[int, int, int, RadarFrame]] = []
+  recorded_leads_by_model_ns: dict[
+    int, tuple[RecordedLead, RecordedLead]
+  ] = {}
   corner_tracker = route_replay.StableCornerObjectTracker()
   group2_front_quality: dict[int, tuple[int, int]] = {}
 
-  for event in schema.Event.read_multiple_bytes(data):
+  for event in events:
     try:
       which = event.which()
     except Exception:
@@ -1666,9 +3062,12 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
         max_measurement_age_s=VALIDATION_CORNER_MAX_MEASUREMENT_AGE_S,
       )
       merged = route_replay.merge_recorded_and_reconstructed_tracks(
-        tuple(event.liveTracks.points), reconstructed, raw_corner_only=True,
+        tuple(event.liveTracks.points), reconstructed,
       )
-      copied_points = _copy_track_points(merged)
+      copied_points = _copy_track_points(
+        merged,
+        allow_legacy_corner_ids=car_brand == "hyundai",
+      )
       latest_points = tuple(
         _with_group2_front_track_state(
           point, event_ns, group2_front_quality,
@@ -1680,6 +3079,39 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
       for can_message in event.can:
         address = int(can_message.address)
         raw = bytes(can_message.dat)
+        scc_distance, scc_a_req_raw, scc_object_valid = (
+          _decode_scc_can_message(
+            route_replay,
+            address,
+            raw,
+            scc_dbc_messages,
+          )
+          if int(can_message.src) < 0x80
+          else (None, None, None)
+        )
+        if any(value is not None for value in (
+          scc_distance, scc_a_req_raw, scc_object_valid,
+        )):
+          latest_scc_bus = int(can_message.src)
+          latest_scc_bus_ns = event_ns
+        if scc_object_valid is not None:
+          latest_scc_object_valid = scc_object_valid
+          if not scc_object_valid:
+            latest_scc_distance_m = None
+            latest_scc_distance_ns = event_ns
+        if scc_distance is not None:
+          latest_scc_distance_m = (
+            float(scc_distance)
+            if (
+              0.0 < scc_distance < 150.0
+              and latest_scc_object_valid is not False
+            )
+            else None
+          )
+          latest_scc_distance_ns = event_ns
+        if scc_a_req_raw is not None:
+          latest_scc_a_req_raw = float(scc_a_req_raw)
+          latest_scc_a_req_raw_ns = event_ns
         if (
           VALIDATION_GROUP2_RADAR_START_ADDR
           <= address
@@ -1701,6 +3133,11 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
           if route_replay.raw_corner_object_is_valid(obj):
             corner_tracker.update(obj)
     elif which == "carParams":
+      car_fingerprint = str(event.carParams.carFingerprint)
+      scc_dbc_messages = _hyundai_scc_dbc_messages(
+        route_replay,
+        car_fingerprint,
+      )
       steer_ratio = _finite(event.carParams.steerRatio)
       wheelbase = _finite(event.carParams.wheelbase)
       latest_steer_ratio = steer_ratio if 5.0 <= steer_ratio <= 30.0 else 14.0
@@ -1709,7 +3146,10 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
         0.0, _finite(event.carParams.radarDelay),
       )
     elif which == "carState":
+      latest_car_state_ns = event_ns
       latest_v_ego = _finite(event.carState.vEgo)
+      latest_left_blinker, latest_right_blinker = bool(event.carState.leftBlinker), bool(event.carState.rightBlinker)
+      latest_left_blindspot, latest_right_blindspot = bool(event.carState.leftBlindspot), bool(event.carState.rightBlindspot)
       latest_steering_angle_deg = _finite(event.carState.steeringAngleDeg)
       latest_steering_rate_deg_s = _finite(event.carState.steeringRateDeg)
     elif which == "livePose":
@@ -1723,6 +3163,14 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
         sensorsOK=bool(event.livePose.sensorsOK),
       )
       latest_live_pose_ns = event_ns
+    elif which == "longitudinalPlan":
+      latest_carrot_a_target = _finite(
+        event.longitudinalPlan.aTarget,
+        math.nan,
+      )
+      if not math.isfinite(latest_carrot_a_target):
+        latest_carrot_a_target = None
+      latest_carrot_a_target_ns = event_ns
     elif which == "modelV2":
       (
         latest_path,
@@ -1734,7 +3182,8 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
       ) = _copy_model(event.modelV2)
       latest_model_ns = event_ns
       latest_model_eof_ns = int(event.modelV2.timestampEof)
-    elif which == "radarState" and latest_points is not None:
+      if latest_points is None:
+        continue
       live_pose_age_s = (
         max(0.0, (event_ns - latest_live_pose_ns) / 1e9)
         if latest_live_pose_ns else math.inf
@@ -1747,15 +3196,18 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
         latest_steer_ratio,
         latest_wheelbase,
       )
-      radar_state = event.radarState
       model_reference_ns = (
         latest_model_eof_ns
         if latest_model_eof_ns > 0
         else latest_model_ns
       )
-      absolute_frames.append((event_ns, RadarFrame(
+      predictor_time_ns = predictor_reference_time_ns(
+        event_ns, model_reference_ns,
+      )
+      absolute_frames.append((
+        event_ns, predictor_time_ns, latest_model_ns, RadarFrame(
         mono_time_s=event_ns / 1e9,
-        time_s=0.0,
+        time_s=predictor_time_ns / 1e9,
         input_age_s=max(0.0, (event_ns - latest_points_ns) / 1e9),
         # modelV2 coordinates belong to the camera exposure time. Its event
         # logMonoTime is publication time after inference and is too recent.
@@ -1766,8 +3218,8 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
         lane_lines=latest_lanes,
         lane_probs=latest_lane_probs,
         model_leads=latest_model_leads,
-        recorded_one=_copy_recorded_lead(radar_state.leadOne),
-        recorded_two=_copy_recorded_lead(radar_state.leadTwo),
+        recorded_one=_empty_recorded_lead(),
+        recorded_two=_empty_recorded_lead(),
         radar_delay_s=latest_radar_delay_s,
         video_time_s=aligned_video_time_s(qcamera_start_eof_ns, latest_model_eof_ns),
         path_y_stds=latest_path_y_stds,
@@ -1777,17 +3229,88 @@ def load_frames(log_path: Path) -> list[RadarFrame]:
         yaw_rate_rad_s=yaw_rate,
         yaw_rate_estimated=yaw_estimated,
         yaw_rate_source=yaw_source,
+        lane_change_direction=(
+          (-1 if latest_left_blinker else 1)
+          if str(event.modelV2.meta.laneChangeState) in ('laneChangeStarting', 'laneChangeFinishing')
+          and latest_left_blinker != latest_right_blinker else 0
+        ),
+        lane_change_active=str(event.modelV2.meta.laneChangeState) in ('laneChangeStarting', 'laneChangeFinishing'),
+        lane_change_blindspot=latest_left_blindspot if latest_left_blinker else latest_right_blindspot,
+        path_times=tuple(float(t) for t in event.modelV2.position.t),
+        car_state_age_s=max(0.0, (event_ns - latest_car_state_ns) / 1e9) if latest_car_state_ns else math.inf,
+        # Preserve the vehicle planner's native right-positive model/pose
+        # inputs independently of the radar reviewer's display coordinates.
+        lane_change_model_path=tuple(zip(event.modelV2.position.x, event.modelV2.position.y, strict=False)),
+        lane_change_device_yaw=(
+          latest_live_pose.angularVelocityDevice.z
+          if latest_live_pose is not None and live_pose_age_s <= 0.15
+          and latest_live_pose.inputsOK and latest_live_pose.sensorsOK and latest_live_pose.angularVelocityDevice.valid
+          and math.isfinite(latest_live_pose.angularVelocityDevice.z) else None
+        ),
         steer_ratio=latest_steer_ratio,
         wheelbase=latest_wheelbase,
+        scc_bus=(
+          latest_scc_bus
+          if (
+            latest_scc_bus_ns > 0
+            and (event_ns - latest_scc_bus_ns) / 1e9
+            <= SCC_SAMPLE_MAX_AGE_S
+          )
+          else None
+        ),
+        scc_distance_m=(
+          latest_scc_distance_m
+          if (
+            latest_scc_distance_ns > 0
+            and (event_ns - latest_scc_distance_ns) / 1e9
+            <= SCC_SAMPLE_MAX_AGE_S
+          )
+          else None
+        ),
+        scc_a_req_raw=(
+          latest_scc_a_req_raw
+          if (
+            latest_scc_a_req_raw_ns > 0
+            and (event_ns - latest_scc_a_req_raw_ns) / 1e9
+            <= SCC_SAMPLE_MAX_AGE_S
+          )
+          else None
+        ),
+        carrot_a_target=(
+          latest_carrot_a_target
+          if (
+            latest_carrot_a_target_ns > 0
+            and (event_ns - latest_carrot_a_target_ns) / 1e9
+            <= LONGITUDINAL_PLAN_MAX_AGE_S
+          )
+          else None
+        ),
       )))
+    elif which == "radarState":
+      radar_state = event.radarState
+      model_ns = int(radar_state.mdMonoTime)
+      if model_ns > 0:
+        recorded_leads_by_model_ns[model_ns] = (
+          _copy_recorded_lead(radar_state.leadOne),
+          _copy_recorded_lead(radar_state.leadTwo),
+        )
 
   if not absolute_frames:
-    raise RuntimeError("no aligned liveTracks/radarState frames were found in this log")
-  origin_ns = absolute_frames[0][0]
-  return [
-    replace(frame, time_s=(event_ns - origin_ns) / 1e9)
-    for event_ns, frame in absolute_frames
-  ]
+    raise RuntimeError("no aligned liveTracks/modelV2 frames were found in this log")
+  origin_ns = absolute_frames[0][1]
+  frames = []
+  for _, predictor_time_ns, model_ns, frame in absolute_frames:
+    recorded = recorded_leads_by_model_ns.get(model_ns)
+    if recorded is not None:
+      frame = replace(
+        frame,
+        recorded_one=recorded[0],
+        recorded_two=recorded[1],
+      )
+    frames.append(replace(
+      frame, time_s=(predictor_time_ns - origin_ns) / 1e9,
+    ))
+  return frames
 
 
 def front_only_frames(frames: list[RadarFrame]) -> tuple[list[RadarFrame], int]:
@@ -1895,6 +3418,7 @@ def _validation_review_from_case(case: dict[str, Any]) -> ValidationReview:
     scene=str(case["scene"]),
     validation_stage=str(case.get("validation_stage", "output")),
     target_track_ids=tuple(int(value) for value in case.get("target_track_ids", ())),
+    forbidden_lead_one_ids=tuple(int(value) for value in case.get("forbidden_lead_one_ids", ())),
     forbidden_lead_two_ids=tuple(int(value) for value in case.get("forbidden_lead_two_ids", ())),
     human_verified=bool(case.get("human_verified", False)),
   )
@@ -2039,6 +3563,9 @@ def validation_review_events(
     }
     added = current - previous
     values = [f"CUT-IN id {track_id}" for track_id in sorted(added)]
+    if review is not None and selection.lead_one is not None:
+      if selection.lead_one.track_id in set(review.forbidden_lead_one_ids):
+        values.append(f"FALSE leadOne id {selection.lead_one.track_id}")
     if review is not None and selection.lead_two is not None:
       if selection.lead_two.track_id in set(review.forbidden_lead_two_ids):
         values.append(f"FALSE leadTwo id {selection.lead_two.track_id}")
@@ -2098,11 +3625,35 @@ def trajectory_model_review_events(
 ) -> dict[int, tuple[str, ...]]:
   requested = {value.lower() for value in sources}
   events: dict[int, tuple[str, ...]] = {}
-  emitted: set[tuple[str, int, int]] = set()
+  emitted: set[tuple[str, str, int, int]] = set()
   trajectories = getattr(selector, "trajectories", ())
   for index, frame in enumerate(frames):
-    candidates = selector.select(frame, index).decision_cutin_candidates
+    selection = selector.select(frame, index)
+    candidates = selection.decision_cutin_candidates
     labels: list[str] = []
+    predecel = selection.cutin_predecel_candidate
+    if predecel is not None:
+      sensor = "corner" if predecel.source.startswith("corner") else "front"
+      prediction = (
+        trajectories[index].get((predecel.source, predecel.track_id))
+        if index < len(trajectories)
+        else None
+      )
+      key = (
+        "predecel",
+        predecel.source,
+        predecel.track_id,
+        prediction.continuity_id if prediction is not None else -1,
+      )
+      if (
+        (sensor in requested or "front+corner" in requested)
+        and key not in emitted
+      ):
+        labels.append(
+          f"예비감속 위험 {sensor} id {predecel.track_id} "
+          + f"위험도 {predecel.score:.2f}"
+        )
+        emitted.add(key)
     for candidate in candidates:
       sensor = "corner" if candidate.source.startswith("corner") else "front"
       if (
@@ -2118,6 +3669,7 @@ def trajectory_model_review_events(
         else None
       )
       key = (
+        "cutin",
         candidate.source,
         candidate.track_id,
         prediction.continuity_id if prediction is not None else -1,
@@ -2130,6 +3682,65 @@ def trajectory_model_review_events(
         emitted.add(key)
     if labels:
       events[index] = tuple(labels)
+  return events
+
+
+def _alert_candidate(candidate: Candidate | None) -> CutinAlertCandidate | None:
+  if (
+    candidate is None
+    or candidate.d_rel is None
+    or candidate.y_rel is None
+    or candidate.v_lead is None
+  ):
+    return None
+  return CutinAlertCandidate(
+    candidate.track_id,
+    candidate.d_rel,
+    candidate.y_rel,
+    candidate.v_lead,
+  )
+
+
+def selected_cutin_candidate(selection: Selection) -> Candidate | None:
+  """Return the confirmed CUT-IN that is the current leadTwo, if any."""
+  lead_two = _alert_candidate(selection.lead_two)
+  if lead_two is None:
+    return None
+  candidates = tuple(
+    (candidate, alert_candidate)
+    for candidate in selection.decision_cutin_candidates
+    if (alert_candidate := _alert_candidate(candidate)) is not None
+  )
+  promoted = promoted_cutin_candidates(
+    tuple(alert_candidate for _, alert_candidate in candidates),
+    lead_two,
+  )
+  if not promoted:
+    return None
+  return next(
+    candidate
+    for candidate, alert_candidate in candidates
+    if alert_candidate == promoted[0]
+  )
+
+
+def cutin_lead_two_promotion_events(
+  frames: Sequence[RadarFrame],
+  selector: LeadSelector,
+) -> dict[int, tuple[str, ...]]:
+  """Build the exact CUT-IN events that would trigger the on-device sound."""
+  tracker = CutinAlertTracker()
+  events: dict[int, tuple[str, ...]] = {}
+  for index, frame in enumerate(frames):
+    selection = selector.select(frame, index)
+    selected = selected_cutin_candidate(selection)
+    alert_candidate = _alert_candidate(selected)
+    if tracker.update(() if alert_candidate is None else (alert_candidate,)):
+      assert selected is not None
+      sensor = "corner" if selected.source.startswith("corner") else "front"
+      events[index] = (
+        f"알림음 L2 승격 {sensor} id {selected.track_id}",
+      )
   return events
 
 
@@ -2181,12 +3792,12 @@ def print_summary(
 
 
 class SimulatorUI:
-  """Replay screen showing only the physical dPath predictor."""
+  """Replay production dPath decisions with cached legacy comparisons."""
 
   def __init__(
     self,
     frames: list[RadarFrame],
-    selector: RadarMotionShadowSelector,
+    selector: RadarMotionShadowSelector | RadarOccupancyV2Selector,
     title: str,
     log_path: Path,
     reviews: tuple[ValidationReview, ...] = (),
@@ -2198,11 +3809,30 @@ class SimulatorUI:
     cut_in_sensitivity: int | None = None,
     sensor_probabilities: dict[str, float] | None = None,
     sensor_lookaheads: dict[str, float] | None = None,
+    v3_selector: RadarOccupancyV3Selector | None = None,
+    production_selector: ProductionDPathSelector | None = None,
   ) -> None:
     import pyray as rl
     self.rl = rl
     self.frames = frames
-    self.selector = selector
+    self.production_selector = production_selector
+    self.selector = production_selector or selector
+    self.occupancy_version = (
+      4
+      if production_selector is not None
+      else 2 if isinstance(selector, RadarOccupancyV2Selector) else 1
+    )
+    self.use_occupancy_v2 = self.occupancy_version == 2
+    self.v1_selector = (
+      selector.baseline
+      if isinstance(selector, RadarOccupancyV2Selector)
+      else selector
+    )
+    self.v2_selector = (
+      selector if isinstance(selector, RadarOccupancyV2Selector) else None
+    )
+    self.v3_selector = v3_selector
+    self.enable_radar_tracks = self.selector.enable_radar_tracks
     self.title = title
     self.log_path = log_path
     self.reviews = reviews
@@ -2212,7 +3842,7 @@ class SimulatorUI:
       raise ValueError(f"unsupported radar motion mode: {motion_mode}")
     self.motion_mode = motion_mode
     self.cut_in_sensitivity = (
-      selector.cut_in_sensitivity
+      self.selector.cut_in_sensitivity
       if cut_in_sensitivity is None
       else max(0, min(5, int(cut_in_sensitivity)))
     )
@@ -2234,27 +3864,29 @@ class SimulatorUI:
       }
     )
     applied_threshold = (
-      selector.decision_threshold
+      self.selector.decision_threshold
       if display_threshold is None
       else float(display_threshold)
     )
-    self.sensor_probabilities[selector.motion_sensor] = applied_threshold
+    self.sensor_probabilities[self.selector.motion_sensor] = applied_threshold
     self.display_threshold = applied_threshold
     self.pending_probability = applied_threshold
     self.probability_dragging = False
     del display_lookahead_s, sensor_lookaheads
-    self.probability_cache = {
+    self.probability_cache: dict[
+      tuple[str, int, float], RadarMotionShadowSelector
+    ] = {
       (
-        selector.motion_sensor,
-        selector.cut_in_sensitivity,
-        round(selector.decision_threshold, 2),
-      ): selector,
+        self.v1_selector.motion_sensor,
+        self.v1_selector.cut_in_sensitivity,
+        round(self.v1_selector.decision_threshold, 2),
+      ): self.v1_selector,
     }
     self.sensor_history_cache = {
-      selector.motion_sensor: (
-        selector.motion_points,
-        selector.trajectories,
-        selector.lead_one_outputs,
+      self.v1_selector.motion_sensor: (
+        self.v1_selector.motion_points,
+        self.v1_selector.trajectories,
+        self.v1_selector.lead_one_outputs,
       ),
     }
     self.index = 0
@@ -2262,16 +3894,19 @@ class SimulatorUI:
     self.speed = 1.0
     self.times = tuple(frame.time_s for frame in frames)
     self.playback_time = 0.0
-    self.events = trajectory_model_review_events(
+    self.marker_events = trajectory_model_review_events(
       frames,
-      selector,
+      self.selector,
       ("front+corner",),
       applied_threshold,
     )
+    self.events = cutin_lead_two_promotion_events(frames, self.selector)
     self._refresh_lead_continuity()
     self.handled_events: set[int] = set()
     self.status = (
-      f"dPath 물리 predictor 전용: {selector.motion_sensor} 레이더"
+      f"dPath predictor 적용: {self.selector.motion_sensor} 레이더 · "
+      + f"EnableRadarTracks {self.enable_radar_tracks} · "
+      + "자동정지=L2 승격 알림음"
     )
     self.font: Any | None = None
     self._owns_font = False
@@ -2305,6 +3940,73 @@ class SimulatorUI:
     else:
       self.video_error = f"camera missing: {self.video_path.name}"
 
+  def _activate_selector_pair(
+    self,
+    value: int,
+    baseline: RadarMotionShadowSelector,
+  ) -> None:
+    self.v1_selector = baseline
+    self.v2_selector = RadarOccupancyV2Selector(
+      self.frames,
+      baseline=baseline,
+      enable_radar_tracks=self.enable_radar_tracks,
+    )
+    if self.v3_selector is not None or self.occupancy_version == 3:
+      self.v3_selector = RadarOccupancyV3Selector(
+        self.frames,
+        baseline=self.v1_selector,
+        v2_selector=self.v2_selector,
+        enable_radar_tracks=self.enable_radar_tracks,
+        cut_in_sensitivity=value,
+      )
+    if self.occupancy_version != 4:
+      targets = {
+        1: self.v1_selector,
+        2: self.v2_selector,
+        3: self.v3_selector,
+      }
+      target = targets[self.occupancy_version]
+      assert target is not None
+      self._activate_sensitivity(value, target)
+
+  def _toggle_occupancy_version(self) -> None:
+    version_cycle = (
+      {4: 1, 1: 2, 2: 3, 3: 4}
+      if self.production_selector is not None
+      else {1: 2, 2: 3, 3: 1}
+    )
+    self.occupancy_version = version_cycle[self.occupancy_version]
+    self.use_occupancy_v2 = self.occupancy_version == 2
+    if self.occupancy_version == 2 and self.v2_selector is None:
+      self.v2_selector = RadarOccupancyV2Selector(
+        self.frames,
+        baseline=self.v1_selector,
+        enable_radar_tracks=self.enable_radar_tracks,
+      )
+    if self.occupancy_version == 3 and self.v3_selector is None:
+      self.v3_selector = RadarOccupancyV3Selector(
+        self.frames,
+        baseline=self.v1_selector,
+        v2_selector=self.v2_selector,
+        enable_radar_tracks=self.enable_radar_tracks,
+        cut_in_sensitivity=self.cut_in_sensitivity,
+      )
+    target = {
+      1: self.v1_selector,
+      2: self.v2_selector,
+      3: self.v3_selector,
+      4: self.production_selector,
+    }[self.occupancy_version]
+    assert target is not None
+    self._activate_sensitivity(self.cut_in_sensitivity, target)
+    version = {
+      1: "이전 V1",
+      2: "이전 V2 확률 점유",
+      3: "이전 V3 단계 융합",
+      4: "현재 Trajectory (production)",
+    }[self.occupancy_version]
+    self.status = f"검증 모델 {version}로 전환"
+
   def _refresh_lead_continuity(self) -> None:
     self.lead_one_segments = lead_continuity_segments(
       self.frames,
@@ -2317,6 +4019,22 @@ class SimulatorUI:
       "lead_two",
     )
     self.vision_lead_segments = vision_lead_continuity_segments(self.frames)
+    self.lead_one_speed_segments = lead_speed_continuity_segments(
+      self.frames,
+      self.selector.selections,
+    )
+    self.scc_distance_segments = frame_value_continuity_segments(
+      self.frames,
+      "scc_distance_m",
+    )
+    self.scc_accel_segments = frame_value_continuity_segments(
+      self.frames,
+      "scc_a_req_raw",
+    )
+    self.carrot_accel_segments = frame_value_continuity_segments(
+      self.frames,
+      "carrot_a_target",
+    )
 
   @staticmethod
   def _clamp_probability(probability: float) -> float:
@@ -2328,7 +4046,12 @@ class SimulatorUI:
   def _activate_sensitivity(
     self,
     value: int,
-    selector: RadarMotionShadowSelector,
+    selector: (
+      RadarMotionShadowSelector
+      | RadarOccupancyV2Selector
+      | RadarOccupancyV3Selector
+      | ProductionDPathSelector
+    ),
   ) -> None:
     self.selector = selector
     self.cut_in_sensitivity = value
@@ -2337,12 +4060,13 @@ class SimulatorUI:
     self.sensor_probabilities[selector.motion_sensor] = (
       selector.decision_threshold
     )
-    self.events = trajectory_model_review_events(
+    self.marker_events = trajectory_model_review_events(
       self.frames,
       selector,
       ("front+corner",),
       selector.decision_threshold,
     )
+    self.events = cutin_lead_two_promotion_events(self.frames, selector)
     self.handled_events.clear()
     self._refresh_lead_continuity()
     lead_two_frames = sum(
@@ -2356,9 +4080,15 @@ class SimulatorUI:
       if value == 0
       else f"확인 {confirmation_s:.2f}초"
     )
+    candidate_events = sum(
+      label.startswith("물리 예측 CUT-IN")
+      for labels in self.marker_events.values()
+      for label in labels
+    )
     self.status = (
       f"CUT-IN 감도 {value} {label} · {policy_text} "
-      + f"적용 완료: 진입 {len(self.events)}회, "
+      + f"적용 완료: 후보 {candidate_events}회, "
+      + f"알림승격 {len(self.events)}회, "
       + f"L2 {lead_two_frames}프레임"
     )
 
@@ -2381,6 +4111,7 @@ class SimulatorUI:
         self.frames,
         cut_in_sensitivity=value,
         motion_sensor=sensor,
+        enable_radar_tracks=self.enable_radar_tracks,
         motion_points=(
           cached_history[0]
           if cached_history is not None
@@ -2409,7 +4140,16 @@ class SimulatorUI:
         - policy.cut_in_threshold
       ) >= 0.005
     ):
-      self._activate_sensitivity(value, cached)
+      self._activate_selector_pair(value, cached)
+      if self.production_selector is not None:
+        self.production_selector = ProductionDPathSelector(
+          self.frames,
+          motion_sensor=sensor,
+          enable_radar_tracks=self.enable_radar_tracks,
+          cut_in_sensitivity=value,
+        )
+        if self.occupancy_version == 4:
+          self._activate_sensitivity(value, self.production_selector)
     else:
       label = VALIDATION_SENSITIVITY_LABELS[value]
       self.status = f"CUT-IN 감도 {value} {label} 이미 적용됨"
@@ -2439,6 +4179,7 @@ class SimulatorUI:
         self.frames,
         cut_in_sensitivity=self.cut_in_sensitivity,
         motion_sensor=target_sensor,
+        enable_radar_tracks=self.enable_radar_tracks,
         maximum_lookahead_s=VALIDATION_DEFAULT_LOOKAHEAD_S,
       )
       self.probability_cache[cache_key] = cached
@@ -2453,10 +4194,22 @@ class SimulatorUI:
       save_validation_motion_mode(mode, self.settings_path)
     except OSError as exc:
       save_error = exc
-    self._activate_sensitivity(self.cut_in_sensitivity, cached)
+    self._activate_selector_pair(self.cut_in_sensitivity, cached)
+    if self.production_selector is not None:
+      self.production_selector = ProductionDPathSelector(
+        self.frames,
+        motion_sensor=target_sensor,
+        enable_radar_tracks=self.enable_radar_tracks,
+        cut_in_sensitivity=self.cut_in_sensitivity,
+      )
+      if self.occupancy_version == 4:
+        self._activate_sensitivity(
+          self.cut_in_sensitivity,
+          self.production_selector,
+        )
     mode_text = "일반(코너 우선)" if mode == "normal" else "프런트 전용"
     self.status = (
-      f"{mode_text} 모드 적용 · {target_sensor} · 미래 5.0초 고정"
+      f"{mode_text} 모드 적용 · {target_sensor} · production 포함 재계산"
     )
     if save_error is not None:
       self.status += f" · 저장 실패: {save_error}"
@@ -2904,6 +4657,12 @@ class SimulatorUI:
       (candidate.source, candidate.track_id)
       for candidate in selection.decision_cutin_candidates
     }
+    predecel_key = (
+      (selection.cutin_predecel_candidate.source,
+       selection.cutin_predecel_candidate.track_id)
+      if selection.cutin_predecel_candidate is not None
+      else None
+    )
     display_points = {
       (point.source, point.track_id): point
       for point in self.selector.motion_points[self.index]
@@ -2936,6 +4695,9 @@ class SimulatorUI:
       if (point.source, point.track_id) in confirmed_cutin_keys:
         color = (246, 142, 55)
         radius = 7.0
+      elif (point.source, point.track_id) == predecel_key:
+        color = (70, 190, 220)
+        radius = 8.0
       elif control_eligible_current_path:
         color = (62, 205, 130)
         radius = 7.0
@@ -2995,8 +4757,13 @@ class SimulatorUI:
       14,
       self._color((145, 158, 170)),
     )
+    trajectory_text = (
+      "현재 production: 우측 진단의 dPath 현재→미래 / rate / direction 확인"
+      if self.occupancy_version == 4
+      else "이전 모델 과거: S,dPath 실선 | 미래: 회색 / 녹색 IN / 주황 CUT-IN"
+    )
     self._draw_text(
-      "과거: S,dPath 실선 | 미래: 회색 부적격 / 녹색 제어가능 IN / 주황 CUT-IN",
+      trajectory_text,
       int(rect.x + 12.0),
       int(rect.y + 46.0),
       14,
@@ -3042,7 +4809,7 @@ class SimulatorUI:
     self._draw_text(
       f"{sensor_text} CUT-IN 감도 {self.pending_sensitivity} "
       + f"{sensitivity_text} · {confirmation_text}"
-      + " · 미래 5.0초 고정"
+      + " · production 재계산"
       + f"  {applied_text}",
       int(slider.x),
       int(slider.y - 27.0),
@@ -3091,7 +4858,9 @@ class SimulatorUI:
     plot_left = time_axis.x
     plot_right = time_axis.x + time_axis.width
     plot_top = rect.y + 28.0
-    plot_bottom = rect.y + rect.height - 18.0
+    plot_bottom = rect.y + rect.height * 0.64
+    accel_top = plot_bottom + 30.0
+    accel_bottom = rect.y + rect.height - 18.0
     plot_width = max(1.0, plot_right - plot_left)
     plot_height = max(1.0, plot_bottom - plot_top)
     for distance in (0.0, 50.0, 100.0, DEFAULT_FORWARD_RANGE_M):
@@ -3110,21 +4879,77 @@ class SimulatorUI:
         10,
         self._color((120, 135, 148)),
       )
+    for speed_kph in (0.0, 70.0, LEAD_SPEED_GRAPH_MAX_KPH):
+      y = plot_bottom - speed_kph / LEAD_SPEED_GRAPH_MAX_KPH * plot_height
+      self._draw_text(
+        f"{speed_kph:.0f}",
+        int(plot_right - 25.0),
+        int(y - 6.0),
+        10,
+        self._color(LEAD_ONE_SPEED_RGB),
+      )
 
     total = max(self.times[-1], 1e-6)
 
-    def position(time_s: float, distance: float) -> Any:
+    def time_x(time_s: float) -> float:
+      return plot_left + min(max(time_s / total, 0.0), 1.0) * plot_width
+
+    def distance_position(time_s: float, distance: float) -> Any:
       return rl.Vector2(
-        plot_left + min(max(time_s / total, 0.0), 1.0) * plot_width,
+        time_x(time_s),
         plot_bottom
         - min(max(distance / DEFAULT_FORWARD_RANGE_M, 0.0), 1.0)
         * plot_height,
       )
 
+    def speed_position(time_s: float, speed_kph: float) -> Any:
+      return rl.Vector2(
+        time_x(time_s),
+        plot_bottom
+        - min(max(speed_kph / LEAD_SPEED_GRAPH_MAX_KPH, 0.0), 1.0)
+        * plot_height,
+      )
+
+    def accel_position(time_s: float, accel: float) -> Any:
+      fraction = (
+        (min(max(accel, ACCEL_GRAPH_MIN_MPS2), ACCEL_GRAPH_MAX_MPS2)
+         - ACCEL_GRAPH_MIN_MPS2)
+        / (ACCEL_GRAPH_MAX_MPS2 - ACCEL_GRAPH_MIN_MPS2)
+      )
+      return rl.Vector2(
+        time_x(time_s),
+        accel_bottom - fraction * max(1.0, accel_bottom - accel_top),
+      )
+
+    def draw_segments(
+      segments: Sequence[Sequence[Sequence[float]]],
+      position: Any,
+      rgb: tuple[int, int, int],
+      width: float = 1.7,
+    ) -> None:
+      color = self._color(rgb)
+      for segment in segments:
+        previous = None
+        for sample in segment:
+          current = position(float(sample[0]), float(sample[1]))
+          if previous is not None:
+            rl.draw_line_ex(previous, current, width, color)
+          previous = current
+        if len(segment) == 1 and previous is not None:
+          rl.draw_circle_v(previous, 2.0, color)
+
+    draw_segments(
+      self.scc_distance_segments,
+      distance_position,
+      SCC_DISTANCE_RGB,
+      1.8,
+    )
+    # Keep Carrot/model results above the stock SCC reference when lines
+    # overlap, since those are the primary series being validated.
     series = (
-      (self.vision_lead_segments, None),
       (self.lead_one_segments, True),
       (self.lead_two_segments, False),
+      (self.vision_lead_segments, None),
     )
     for segments, is_lead_one in series:
       for segment in segments:
@@ -3140,12 +4965,49 @@ class SimulatorUI:
         color = self._color(rgb)
         previous = None
         for time_s, distance, _ in segment:
-          current = position(time_s, distance)
+          current = distance_position(time_s, distance)
           if previous is not None:
             rl.draw_line_ex(previous, current, 1.7, color)
           previous = current
         if len(segment) == 1:
           rl.draw_circle_v(previous, 2.0, color)
+    draw_segments(
+      self.lead_one_speed_segments,
+      speed_position,
+      LEAD_ONE_SPEED_RGB,
+      1.4,
+    )
+
+    for accel in (-4.0, -2.0, 0.0, 2.0):
+      y = accel_position(0.0, accel).y
+      rl.draw_line(
+        int(plot_left),
+        int(y),
+        int(plot_right),
+        int(y),
+        self._color((55, 66, 77) if accel != 0.0 else (95, 108, 120)),
+      )
+      self._draw_text(
+        f"{accel:+.0f}",
+        int(rect.x + 8.0),
+        int(y - 6.0),
+        10,
+        self._color((120, 135, 148)),
+      )
+    draw_segments(
+      self.scc_accel_segments,
+      accel_position,
+      SCC_ACCEL_RGB,
+      1.8,
+    )
+    # Carrot is the primary series under review, so keep it visible when both
+    # acceleration targets overlap.
+    draw_segments(
+      self.carrot_accel_segments,
+      accel_position,
+      CARROT_ACCEL_RGB,
+      2.2,
+    )
 
     current_selection = self.selector.select(
       self.frames[self.index],
@@ -3182,17 +5044,63 @@ class SimulatorUI:
         12,
         self._color(rgb),
       )
-      legend_x += 150
+      legend_x += 145
       if (
         candidate is not None
         and candidate.d_rel is not None
         and 0.0 <= candidate.d_rel <= DEFAULT_FORWARD_RANGE_M
       ):
         rl.draw_circle_v(
-          position(self.playback_time, candidate.d_rel),
+          distance_position(self.playback_time, candidate.d_rel),
           3.5,
           self._color(rgb),
         )
+      if (
+        label == "L1"
+        and candidate is not None
+        and candidate.v_lead is not None
+      ):
+        rl.draw_circle_v(
+          speed_position(self.playback_time, candidate.v_lead * 3.6),
+          3.0,
+          self._color(LEAD_ONE_SPEED_RGB),
+        )
+      if label == "L1":
+        speed_value = (
+          f"{candidate.v_lead * 3.6:.1f}km/h"
+          if candidate is not None and candidate.v_lead is not None
+          else "--"
+        )
+        self._draw_text(
+          f"L1 vLead {speed_value}",
+          legend_x,
+          int(rect.y + 7.0),
+          12,
+          self._color(LEAD_ONE_SPEED_RGB),
+        )
+        legend_x += 165
+    scc_bus_text = (
+      f"[B{frame.scc_bus}]" if frame.scc_bus is not None else ""
+    )
+    scc_value = (
+      f"{frame.scc_distance_m:.1f}m"
+      if frame.scc_distance_m is not None
+      else "--"
+    )
+    self._draw_text(
+      f"SCC{scc_bus_text} ObjDist {scc_value}",
+      legend_x,
+      int(rect.y + 7.0),
+      12,
+      self._color(SCC_DISTANCE_RGB),
+    )
+    if frame.scc_distance_m is not None:
+      rl.draw_circle_v(
+        distance_position(self.playback_time, frame.scc_distance_m),
+        3.5,
+        self._color(SCC_DISTANCE_RGB),
+      )
+    legend_x += 200
     self._draw_text(
       f"V {vision_value}",
       legend_x,
@@ -3202,16 +5110,54 @@ class SimulatorUI:
     )
     if vision_distance is not None:
       rl.draw_circle_v(
-        position(self.playback_time, vision_distance),
+        distance_position(self.playback_time, vision_distance),
         3.5,
         self._color(vision_rgb),
       )
-    cursor_x = plot_left + self.playback_time / total * plot_width
+
+    scc_accel_text = (
+      f"{frame.scc_a_req_raw:+.2f}"
+      if frame.scc_a_req_raw is not None
+      else "--"
+    )
+    carrot_accel_text = (
+      f"{frame.carrot_a_target:+.2f}"
+      if frame.carrot_a_target is not None
+      else "--"
+    )
+    self._draw_text(
+      f"SCC{scc_bus_text} aReqRaw {scc_accel_text}",
+      int(plot_left),
+      int(accel_top - 21.0),
+      12,
+      self._color(SCC_ACCEL_RGB),
+    )
+    self._draw_text(
+      f"Carrot aTarget {carrot_accel_text} m/s²",
+      int(plot_left + 190.0),
+      int(accel_top - 21.0),
+      12,
+      self._color(CARROT_ACCEL_RGB),
+    )
+    if frame.scc_a_req_raw is not None:
+      rl.draw_circle_v(
+        accel_position(self.playback_time, frame.scc_a_req_raw),
+        3.0,
+        self._color(SCC_ACCEL_RGB),
+      )
+    if frame.carrot_a_target is not None:
+      rl.draw_circle_v(
+        accel_position(self.playback_time, frame.carrot_a_target),
+        3.0,
+        self._color(CARROT_ACCEL_RGB),
+      )
+
+    cursor_x = time_x(self.playback_time)
     rl.draw_line(
       int(cursor_x),
       int(plot_top),
       int(cursor_x),
-      int(plot_bottom),
+      int(accel_bottom),
       self._color((225, 231, 237, 150)),
     )
 
@@ -3236,8 +5182,16 @@ class SimulatorUI:
       if self.motion_mode == "normal"
       else "프런트 전용"
     )
+    version_text = {
+      1: "이전 V1",
+      2: "이전 V2 확률 점유",
+      3: "이전 V3 단계 융합",
+      4: "현재 Trajectory (production)",
+    }[self.occupancy_version]
     self._draw_text(
-      f"dPath predictor: {mode_text} · {sensor_text} 레이더 사용",
+      f"dPath predictor: {version_text} · {mode_text} · "
+      + f"{sensor_text} 레이더 사용 · "
+      + f"EnableRadarTracks {self.enable_radar_tracks}",
       x,
       int(rect.y + 82.0),
       18,
@@ -3253,9 +5207,21 @@ class SimulatorUI:
       if selection.lead_two is not None
       else "--"
     )
+    predecel_id = (
+      str(selection.cutin_predecel_candidate.track_id)
+      if selection.cutin_predecel_candidate is not None
+      else "--"
+    )
+    alert_id = (
+      lead_two_id
+      if self.index in self.events
+      and selected_cutin_candidate(selection) is not None
+      else "--"
+    )
     self._draw_text(
-      f"L1 {lead_one_id}  L2 {lead_two_id}  | 새 CUT-IN "
-      + str([value.track_id for value in selection.decision_cutin_candidates]),
+      f"L1 {lead_one_id}  L2 {lead_two_id} | 예비감속 {predecel_id} | 후보 "
+      + str([value.track_id for value in selection.decision_cutin_candidates])
+      + f" | 알림 {alert_id}",
       x,
       int(rect.y + 110.0),
       16,
@@ -3263,9 +5229,34 @@ class SimulatorUI:
     )
     self._draw_probability_slider(rect)
     y = rect.y + 194.0
-    max_rows = max(3, int((rect.height - 348.0) // 45.0))
+    max_rows = max(3, int((rect.height - 348.0) // 79.0))
+    predecel = selection.cutin_predecel_candidate
+    if predecel is not None:
+      self._draw_text(
+        f"{predecel.source[:9]:9} id{predecel.track_id:4d} "
+        + f"위험도{predecel.score:.2f} 예비감속 활성 (CUT-IN 미확정)",
+        x,
+        int(y),
+        15,
+        self._color((70, 190, 220)),
+      )
+      detail_lines = predecel.detail.split(" | ", 2)
+      self._draw_text(detail_lines[0][:59], x + 18, int(y + 20.0), 14, muted)
+      if len(detail_lines) > 1:
+        self._draw_text(detail_lines[1][:59], x + 18, int(y + 38.0), 14, muted)
+      if len(detail_lines) > 2:
+        self._draw_text(detail_lines[2][:59], x + 18, int(y + 56.0), 14, muted)
+      y += 79.0
+      max_rows -= 1
     for candidate in selection.cutin_diagnostics[:max_rows]:
       stage_text = {
+        "CLEAR": "관찰 해제",
+        "WATCH": "진입 관찰",
+        "CAUTION": "진입 주의",
+        "PREDECEL": "가속 금지/예비감속",
+        "LIMIT": "가속 제한/예비감속",
+        "LEAD": "L2 승격",
+        "OCCUPIED": "현재 경로 점유",
         "IN": "현재 경로",
         "PENDING": "CUT-IN 확인 중",
         "CUT-IN": "CUT-IN 확정",
@@ -3276,6 +5267,21 @@ class SimulatorUI:
         "L1-FUTURE": "진입 예상 시점에 L1보다 앞이 아님",
         "BELOW": "기준 미달",
       }.get(candidate.stage, candidate.stage)
+      selected_cutin = selected_cutin_candidate(selection)
+      if candidate.stage == "CUT-IN":
+        if (
+          self.index in self.events
+          and selected_cutin is not None
+          and candidate.track_id == selected_cutin.track_id
+        ):
+          stage_text = "L2 승격·알림음"
+        elif (
+          selected_cutin is not None
+          and candidate.track_id == selected_cutin.track_id
+        ):
+          stage_text = "L2 선택 유지"
+        else:
+          stage_text = "후보 확정(L2 미선택)"
       self._draw_text(
         f"{candidate.source[:9]:9} id{candidate.track_id:4d} "
         + f"진입{candidate.score:.2f} 이탈{candidate.path_exit_score:.2f} {stage_text}",
@@ -3284,8 +5290,13 @@ class SimulatorUI:
         15,
         white,
       )
-      self._draw_text(candidate.detail[:59], x + 18, int(y + 20.0), 14, muted)
-      y += 45.0
+      detail_lines = candidate.detail.split(" | ", 2)
+      self._draw_text(detail_lines[0][:59], x + 18, int(y + 20.0), 14, muted)
+      if len(detail_lines) > 1:
+        self._draw_text(detail_lines[1][:59], x + 18, int(y + 38.0), 14, muted)
+      if len(detail_lines) > 2:
+        self._draw_text(detail_lines[2][:59], x + 18, int(y + 56.0), 14, muted)
+      y += 79.0
     if self.reviews:
       active_reviews = [
         review for review in self.reviews
@@ -3303,7 +5314,7 @@ class SimulatorUI:
       )
     self._draw_text(self.status[:65], x, int(rect.y + rect.height - 83.0), 15, white)
     self._draw_text(
-      "Space 재생  클릭 탐색  R 처음  T 처리모드  F 표시  H 궤적  A raw  M 마커",
+      "Space 재생  클릭 탐색  R 처음  V 현재/이전 비교  T 처리모드  F 표시  H 궤적  A raw  M 마커",
       x,
       int(rect.y + rect.height - 51.0),
       13,
@@ -3354,8 +5365,8 @@ class SimulatorUI:
     timeline = self._timeline_rect(width, height)
     continuity_bottom = timeline.y - 47.0
     continuity_height = min(
-      290.0,
-      max(200.0, float(height) * 0.27),
+      360.0,
+      max(300.0, float(height) * 0.33),
     )
     continuity_rect = self.rl.Rectangle(
       12.0,
@@ -3408,13 +5419,22 @@ class SimulatorUI:
         self._color(color),
       )
     if self.show_shadow_markers:
-      for frame_index in self.events:
+      for frame_index in set(self.marker_events) | set(self.events):
         marker_x = rect.x + rect.width * self.times[frame_index] / total
+        predecel_event = any(
+          label.startswith("예비감속 위험")
+          for label in self.marker_events.get(frame_index, ())
+        )
+        alert_event = frame_index in self.events
         rl.draw_line_ex(
           rl.Vector2(marker_x, rect.y - 15.0),
           rl.Vector2(marker_x, rect.y + rect.height + 7.0),
-          3.0,
-          self._color((246, 142, 55)),
+          4.0 if alert_event else 3.0,
+          self._color(
+            (98, 225, 125)
+            if alert_event
+            else (70, 190, 220) if predecel_event else (246, 142, 55)
+          ),
         )
     progress = min(max(self.playback_time / total, 0.0), 1.0)
     rl.draw_rectangle(
@@ -3438,9 +5458,9 @@ class SimulatorUI:
       self._color((225, 231, 237)),
     )
     shadow_text = (
-      "주황: predictor CUT-IN 일시정지(M: 숨김)"
+      "하늘: 예비감속 · 주황: 후보 확정 · 연두: L2 승격 알림음(M: 숨김)"
       if self.show_shadow_markers
-      else "CUT-IN 마커 숨김(M: 표시)"
+      else "예비감속/후보/알림음 마커 숨김(M: 표시)"
     )
     self._draw_text(
       f"{shadow_text}   위쪽 막대: 검증 구간",
@@ -3499,7 +5519,7 @@ class SimulatorUI:
     self.paused = True
     self.status = (
       f"{source} 탐색 @{self.playback_time:.2f}초; "
-      + "이후 CUT-IN 자동정지 재설정됨"
+      + "이후 L2 승격 알림음 자동정지 재설정됨"
     )
 
   def _rearm_events_from_current(self) -> None:
@@ -3539,7 +5559,7 @@ class SimulatorUI:
       self.status = (
         "수동 일시정지"
         if self.paused
-        else "재생 중: predictor CUT-IN 자동정지 대기"
+        else "재생 중: L2 승격 알림음 자동정지 대기"
       )
     shift = rl.is_key_down(rl.KEY_LEFT_SHIFT) or rl.is_key_down(rl.KEY_RIGHT_SHIFT)
     if rl.is_key_pressed(rl.KEY_RIGHT):
@@ -3568,12 +5588,12 @@ class SimulatorUI:
       self.handled_events.clear()
       self.seek(0.0)
       self.paused = False
-      self.status = "처음부터 재생: 모든 predictor CUT-IN 자동정지 대기"
+      self.status = "처음부터 재생: 모든 L2 승격 알림음 자동정지 대기"
       self._pause_for_event(-1, self.index)
     if rl.is_key_pressed(rl.KEY_M):
       self.show_shadow_markers = not self.show_shadow_markers
       state = "표시" if self.show_shadow_markers else "숨김"
-      self.status = f"dPath predictor 타임라인 마커 {state}"
+      self.status = f"예비감속/CUT-IN 후보/L2 알림음 타임라인 마커 {state}"
     if rl.is_key_pressed(rl.KEY_H):
       self.show_trajectory_history = not self.show_trajectory_history
       state = "표시" if self.show_trajectory_history else "숨김"
@@ -3590,6 +5610,8 @@ class SimulatorUI:
       mode = "front" if self.motion_mode == "normal" else "normal"
       self.status = "처리 센서 모드 변경 계산 중..."
       self._request_motion_mode(mode)
+    if rl.is_key_pressed(rl.KEY_V):
+      self._toggle_occupancy_version()
     if rl.is_key_pressed(rl.KEY_I):
       self._label("detect")
     if rl.is_key_pressed(rl.KEY_C):
@@ -3777,8 +5799,8 @@ def parse_args() -> argparse.Namespace:
     type=float,
     default=None,
     help=(
-      "advanced one-run probability threshold override; the UI no longer "
-      + "changes this sensor-specific safety threshold"
+      "legacy V1/V2/V3 comparison threshold override; production behavior "
+      + "is controlled only by CUT-IN sensitivity"
     ),
   )
   parser.add_argument(
@@ -3790,8 +5812,26 @@ def parse_args() -> argparse.Namespace:
       + "UI's saved level (default 3)"
     ),
   )
+  parser.add_argument(
+    "--enable-radar-tracks",
+    type=int,
+    choices=range(-2, 4),
+    default=2,
+    help=(
+      "EnableRadarTracks value used by the real dPath controller replay "
+      + "(default: 2)"
+    ),
+  )
+  parser.add_argument(
+    "--legacy-v1",
+    action="store_true",
+    help="start legacy-only visual review with V1 (V cycles old V1/V2/V3)",
+  )
   parser.add_argument("--validation-case", action="append", default=[])
-  parser.add_argument("--validation-root", type=Path, default=Path(r"W:\routes"))
+  parser.add_argument(
+    "--validation-root", type=Path,
+    default=Path(r"\\DS1821P\openpilot\routes"),
+  )
   parser.add_argument("--validation-cases", type=Path, default=DEFAULT_VALIDATION_CASES)
   parser.add_argument("--screenshot", type=Path)
   parser.add_argument(
@@ -3803,6 +5843,21 @@ def parse_args() -> argparse.Namespace:
     "--review-position",
     default="",
     help="queue position shown in the window title, for example 1/40",
+  )
+  parser.add_argument(
+    "--cache-dir",
+    type=Path,
+    help="private replay cache directory used by the validation queue",
+  )
+  parser.add_argument(
+    "--preload-only",
+    action="store_true",
+    help="build the replay cache and exit without opening a window",
+  )
+  parser.add_argument(
+    "--consume-cache",
+    action="store_true",
+    help="remove a prepared replay cache after loading it",
   )
   return parser.parse_args()
 
@@ -3828,31 +5883,97 @@ def main() -> int:
     raise SystemExit("--sensitivity must be between 0 and 5")
   if args.front_only and args.motion_mode not in (None, "front"):
     raise SystemExit("--front-only conflicts with --motion-mode normal")
-  print(f"Loading {args.rlog} ...", flush=True)
-  frames = load_frames(args.rlog)
+  if args.preload_only and args.cache_dir is None:
+    raise SystemExit("--preload-only requires --cache-dir")
   motion_mode = (
     "front"
     if args.front_only
     else args.motion_mode or load_validation_motion_mode()
-  )
-  motion_sensor = (
-    "front"
-    if motion_mode == "front"
-    else preferred_radar_motion_sensor(frames)
   )
   cut_in_sensitivity = (
     load_validation_sensitivity()
     if args.sensitivity is None
     else int(args.sensitivity)
   )
+  cache_path = (
+    visual_replay_cache_path(
+      args.cache_dir,
+      args.rlog,
+      motion_mode=motion_mode,
+      cut_in_sensitivity=cut_in_sensitivity,
+      probability_override=args.prob,
+      enable_radar_tracks=args.enable_radar_tracks,
+    )
+    if args.cache_dir is not None
+    else None
+  )
+  cached = (
+    load_visual_replay_cache(cache_path)
+    if cache_path is not None
+    else None
+  )
+  if cached is not None:
+    frames, v2_selector, v3_selector, production_selector = cached
+    v1_selector = v2_selector.baseline
+    motion_sensor = v1_selector.motion_sensor
+    probability = v1_selector.decision_threshold
+    print(f"Using prepared replay cache for {args.rlog}", flush=True)
+    if args.consume_cache and cache_path is not None:
+      cache_path.unlink(missing_ok=True)
+  else:
+    print(f"Loading {args.rlog} ...", flush=True)
+    frames = load_frames(args.rlog)
+    motion_sensor = (
+      "front"
+      if motion_mode == "front"
+      else preferred_radar_motion_sensor(frames)
+    )
+    motion_policy = radar_motion_sensitivity(
+      cut_in_sensitivity,
+      motion_sensor,
+    )
+    probability = (
+      motion_policy.cut_in_threshold
+      if args.prob is None
+      else float(args.prob)
+    )
+    print("Building physical dPath predictor history ...", flush=True)
+    v1_selector = RadarMotionShadowSelector(
+      frames,
+      probability if args.prob is not None else None,
+      cut_in_sensitivity=cut_in_sensitivity,
+      motion_sensor=motion_sensor,
+      enable_radar_tracks=args.enable_radar_tracks,
+    )
+    v2_selector = RadarOccupancyV2Selector(
+      frames,
+      baseline=v1_selector,
+      enable_radar_tracks=args.enable_radar_tracks,
+    )
+    v3_selector = RadarOccupancyV3Selector(
+      frames,
+      baseline=v1_selector,
+      v2_selector=v2_selector,
+      enable_radar_tracks=args.enable_radar_tracks,
+      cut_in_sensitivity=cut_in_sensitivity,
+    )
+    production_selector = ProductionDPathSelector(
+      frames,
+      motion_sensor=motion_sensor,
+      enable_radar_tracks=args.enable_radar_tracks,
+      cut_in_sensitivity=cut_in_sensitivity,
+    )
+    if args.preload_only and cache_path is not None:
+      save_visual_replay_cache(
+        cache_path,
+        frames,
+        v2_selector,
+        v3_selector,
+        production_selector,
+      )
   motion_policy = radar_motion_sensitivity(
     cut_in_sensitivity,
     motion_sensor,
-  )
-  probability = (
-    motion_policy.cut_in_threshold
-    if args.prob is None
-    else float(args.prob)
   )
   if motion_mode == "front":
     ignored = sum(
@@ -3864,43 +5985,49 @@ def main() -> int:
       f"Front-only replay: ignoring {ignored} measured corner-radar points.",
       flush=True,
     )
-  print("Building physical dPath predictor history ...", flush=True)
-  print(
-    f"Validation {motion_sensor} CUT-IN: sensitivity "
-    + f"{cut_in_sensitivity} "
-    + f"({VALIDATION_SENSITIVITY_LABELS[cut_in_sensitivity]}), "
-    + f"probability {probability:.2f}, confirmation "
-    + f"{motion_policy.confirmation_s:.2f}s, future lookahead 5.0s, "
-    + "continuous overlap "
-    + f">={VALIDATION_MIN_CONTINUOUS_OVERLAP_S:.1f}s",
-    flush=True,
-  )
-  selector = RadarMotionShadowSelector(
-    frames,
-    (
-      probability
-      if args.prob is not None
-      else None
-    ),
-    cut_in_sensitivity=cut_in_sensitivity,
-    motion_sensor=motion_sensor,
-  )
+  if args.legacy_v1:
+    print(
+      f"Legacy validation {motion_sensor} CUT-IN: sensitivity "
+      + f"{cut_in_sensitivity} "
+      + f"({VALIDATION_SENSITIVITY_LABELS[cut_in_sensitivity]}), "
+      + f"probability {probability:.2f}, confirmation "
+      + f"{motion_policy.confirmation_s:.2f}s, future lookahead 5.0s, "
+      + "continuous overlap "
+      + f">={VALIDATION_MIN_CONTINUOUS_OVERLAP_S:.1f}s",
+      flush=True,
+    )
+  else:
+    print(
+      f"Production Trajectory CUT-IN: sensitivity {cut_in_sensitivity} "
+      + f"({VALIDATION_SENSITIVITY_LABELS[cut_in_sensitivity]}), "
+      + f"{motion_sensor} preferred, full dPath controller replay",
+      flush=True,
+    )
+  if args.preload_only:
+    print(f"Prepared replay cache for {args.rlog}", flush=True)
+    return 0
+  selector = v1_selector if args.legacy_v1 else production_selector
   print_summary(args.rlog, frames, selector)
   if args.summary:
     return 0
   position = f"[{args.review_position}] " if args.review_position else ""
   display_name = f"{position}{args.rlog.parent.name}/{args.rlog.name}"
-  SimulatorUI(
+  ui = SimulatorUI(
     frames,
-    selector,
+    v1_selector if args.legacy_v1 else v2_selector,
     display_name,
     args.rlog,
     reviews=reviews,
     validation_cases_path=args.validation_cases if reviews else None,
-    display_threshold=probability,
+    display_threshold=selector.decision_threshold,
     motion_mode=motion_mode,
     cut_in_sensitivity=cut_in_sensitivity,
-  ).run(args.start, args.paused, args.screenshot, args.exit_at_end)
+    v3_selector=v3_selector,
+    production_selector=None if args.legacy_v1 else production_selector,
+  )
+  if args.legacy_v1:
+    ui.v2_selector = v2_selector
+  ui.run(args.start, args.paused, args.screenshot, args.exit_at_end)
   return 0
 
 
@@ -3910,8 +6037,11 @@ __all__ = (
   "CurrentRadardTeacher",
   "LeadSelector",
   "ModelLead",
+  "ProductionDPathSelector",
   "RadarFrame",
   "RadarMotionShadowSelector",
+  "RadarOccupancyV2Selector",
+  "RadarOccupancyV3Selector",
   "RadarPoint",
   "RecordedLead",
   "Selection",
@@ -3931,23 +6061,30 @@ __all__ = (
   "candidate_track_ids",
   "comparison_summary",
   "confirmed_cutin_overlap_at",
+  "cutin_lead_two_promotion_events",
   "corner_radar_display_points",
   "current_cutin_track_ids",
   "front_only_frames",
   "front_radar_display_points",
+  "frame_value_continuity_segments",
   "is_position_only_reference",
   "lead_continuity_segments",
+  "lead_speed_continuity_segments",
   "lead_one_rgb",
   "load_validation_motion_mode",
   "load_validation_lookahead",
   "load_validation_probability",
   "load_validation_sensitivity",
   "load_frames",
+  "load_visual_replay_cache",
   "main",
   "model_line_y",
   "motion_points_at_model_time",
+  "monotonic_log_events",
   "preferred_radar_points",
+  "radar_replay_source_fingerprint",
   "preferred_radar_motion_sensor",
+  "predictor_reference_time_ns",
   "qcamera_path_for_log",
   "radar_points_at_model_time",
   "radar_trajectory_series",
@@ -3958,6 +6095,8 @@ __all__ = (
   "save_validation_lookahead",
   "save_validation_probability",
   "save_validation_sensitivity",
+  "save_visual_replay_cache",
+  "selected_cutin_candidate",
   "prediction_with_validation_lookahead",
   "trajectory_history_display_y",
   "trajectory_history_display_position",
@@ -3967,6 +6106,7 @@ __all__ = (
   "update_validation_case_label",
   "validation_review_events",
   "validation_settings_path",
+  "visual_replay_cache_path",
   "vision_lead_continuity_segments",
   "vision_lead_display_value",
   "vision_lead_rgb",

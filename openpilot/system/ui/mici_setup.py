@@ -18,8 +18,9 @@ from openpilot.common.realtime import config_realtime_process, set_core_affinity
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.time_helpers import system_time_valid
 from openpilot.common.utils import run_cmd
-from openpilot.system.ui.lib.application import gui_app, FontWeight
+from openpilot.system.ui.lib.application import gui_app, FontWeight, TextAlignment, TextAlignmentVertical
 from openpilot.system.ui.lib.wifi_manager import WifiManager, ConnectStatus
+from openpilot.system.ui.setup_download import format_download_detail, format_http_error
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.nav_widget import NavWidget
 from openpilot.system.ui.widgets.label import UnifiedLabel
@@ -40,11 +41,13 @@ INSTALLER_URL_PATH = "/tmp/installer_url"
 
 
 class NetworkConnectivityMonitor:
-  def __init__(self, should_check: Callable[[], bool] | None = None):
+  def __init__(self, should_check: Callable[[], bool] | None = None,
+               probe_urls: tuple[str, ...] | None = None):
     self.network_connected = threading.Event()
     self.wifi_connected = threading.Event()
     self.recheck_event = threading.Event()
     self._should_check = should_check or (lambda: True)
+    self._probe_urls = probe_urls or (OPENPILOT_URL,)
     self._stop_event = threading.Event()
     self._last_timesyncd_restart = 0.0
     self._thread: threading.Thread | None = None
@@ -73,8 +76,10 @@ class NetworkConnectivityMonitor:
     while not self._stop_event.is_set():
       if self._should_check():
         try:
-          request = urllib.request.Request(OPENPILOT_URL, method="HEAD")
-          urllib.request.urlopen(request, timeout=2.0)
+          for url in self._probe_urls:
+            request = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(request, timeout=2.0):
+              pass
 
           # Discard stale result if invalidated during request
           if self.recheck_event.is_set():
@@ -105,8 +110,8 @@ class StartPage(Widget):
     super().__init__()
 
     self._title = UnifiedLabel("start", 64, text_color=rl.Color(255, 255, 255, int(255 * 0.9)),
-                               font_weight=FontWeight.DISPLAY, alignment=rl.GuiTextAlignment.TEXT_ALIGN_CENTER,
-                               alignment_vertical=rl.GuiTextAlignmentVertical.TEXT_ALIGN_MIDDLE)
+                               font_weight=FontWeight.DISPLAY, alignment=TextAlignment.CENTER,
+                               alignment_vertical=TextAlignmentVertical.MIDDLE)
 
     self._start_bg_txt = gui_app.texture("icons_mici/setup/start_button.png", 500, 224, keep_aspect_ratio=False)
     self._start_bg_pressed_txt = gui_app.texture("icons_mici/setup/start_button_pressed.png", 500, 224, keep_aspect_ratio=False)
@@ -197,7 +202,7 @@ class DownloadingPage(NavWidget):
     self._title_label = UnifiedLabel("downloading...", 64, text_color=rl.Color(255, 255, 255, int(255 * 0.9)),
                                      font_weight=FontWeight.DISPLAY)
     self._progress_label = UnifiedLabel("", 132, text_color=rl.Color(255, 255, 255, int(255 * 0.9 * 0.65)),
-                                        font_weight=FontWeight.ROMAN, alignment_vertical=rl.GuiTextAlignmentVertical.TEXT_ALIGN_BOTTOM)
+                                        font_weight=FontWeight.ROMAN, alignment_vertical=TextAlignmentVertical.BOTTOM)
     self._progress = 0
 
   def _back_enabled(self) -> bool:
@@ -211,6 +216,10 @@ class DownloadingPage(NavWidget):
   def set_progress(self, progress: int):
     self._progress = progress
     self._progress_label.set_text(f"{progress}%")
+
+  def set_status(self, status: str):
+    self._title_label.set_text(status)
+    self._progress_label.set_visible(status == "downloading...")
 
   def _render(self, rect: rl.Rectangle):
     rl.draw_rectangle_rec(rect, rl.BLACK)
@@ -261,8 +270,8 @@ class BigPillButton(BigButton):
     super().__init__(*args, **kwargs)
 
     self._label.set_font_size(48)
-    self._label.set_alignment(rl.GuiTextAlignment.TEXT_ALIGN_CENTER)
-    self._label.set_alignment_vertical(rl.GuiTextAlignmentVertical.TEXT_ALIGN_MIDDLE)
+    self._label.set_alignment(TextAlignment.CENTER)
+    self._label.set_alignment_vertical(TextAlignmentVertical.MIDDLE)
 
   def _load_images(self):
     if self._green:
@@ -434,6 +443,8 @@ class Setup(Widget):
     super().__init__()
     self.download_url = ""
     self.download_progress = 0
+    self.download_status = "connecting..."
+    self.download_started_at = 0.0
     self.download_thread = None
     self._download_failed_reason: str | None = None
 
@@ -461,6 +472,10 @@ class Setup(Widget):
 
   def _nav_stack_tick(self):
     self._downloading_page.set_progress(self.download_progress)
+    status = self.download_status
+    if status == "connecting...":
+      status = f"connecting... {int(time.monotonic() - self.download_started_at)}s"
+    self._downloading_page.set_status(status)
 
     if self._download_failed_reason is not None:
       reason = self._download_failed_reason
@@ -503,6 +518,8 @@ class Setup(Widget):
     parsed = urlparse(url, scheme='https')
     self.download_url = (urlparse(f"https://{url}") if not parsed.netloc else parsed).geturl()
     self.download_progress = 0
+    self.download_status = "connecting..."
+    self.download_started_at = time.monotonic()
 
     def start_download():
       self.download_thread = threading.Thread(target=self._download_thread, daemon=True)
@@ -512,6 +529,8 @@ class Setup(Widget):
     gui_app.push_widget(self._downloading_page)
 
   def _download_thread(self):
+    fd = None
+    tmpfile = None
     try:
       import tempfile
 
@@ -522,22 +541,27 @@ class Setup(Widget):
                  "X-openpilot-device-type": HARDWARE.get_device_type()}
       req = urllib.request.Request(self.download_url, headers=headers)
 
-      with open(tmpfile, 'wb') as f, urllib.request.urlopen(req, timeout=30) as response:
+      with urllib.request.urlopen(req, timeout=30) as response:
         total_size = int(response.headers.get('content-length', 0))
         downloaded = 0
         block_size = 8192
+        output = os.fdopen(fd, 'wb')
+        fd = None
+        self.download_status = "downloading..."
+        self.download_progress, _ = format_download_detail(downloaded, total_size)
 
-        while True:
-          buffer = response.read(block_size)
-          if not buffer:
-            break
+        with output as f:
+          while True:
+            buffer = response.read(block_size)
+            if not buffer:
+              break
 
-          downloaded += len(buffer)
-          f.write(buffer)
+            downloaded += len(buffer)
+            f.write(buffer)
 
-          if total_size:
-            self.download_progress = int(downloaded * 100 / total_size)
+            self.download_progress, _ = format_download_detail(downloaded, total_size)
 
+      self.download_status = "verifying..."
       is_elf = False
       with open(tmpfile, 'rb') as f:
         header = f.read(4)
@@ -551,20 +575,27 @@ class Setup(Widget):
       with open(INSTALLER_URL_PATH, "w") as f:
         f.write(self.download_url)
 
-      # AGNOS might try to execute the installer before this process exits.
-      # Therefore, important to close the fd before renaming the installer.
-      os.close(fd)
       os.rename(tmpfile, INSTALLER_DESTINATION_PATH)
+      tmpfile = None
 
       # give time for installer UI to take over
+      self.download_status = "starting installer..."
       time.sleep(0.1)
       gui_app.request_close()
 
     except urllib.error.HTTPError as e:
-      if e.code == 409:
-        self._download_failed_reason = "Incompatible openpilot version."
-    except Exception:
-      self._download_failed_reason = "Invalid URL: " + self.download_url.replace("https://", "", 1)
+      details = e.read().decode("utf-8", errors="replace") if e.code == 409 else ""
+      self._download_failed_reason = format_http_error(e.code, str(e.reason), details)
+    except Exception as e:
+      self._download_failed_reason = f"Download error: {e}"
+    finally:
+      if fd is not None:
+        os.close(fd)
+      if tmpfile is not None:
+        try:
+          os.unlink(tmpfile)
+        except FileNotFoundError:
+          pass
 
 
 def main():

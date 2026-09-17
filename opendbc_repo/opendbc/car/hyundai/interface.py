@@ -62,7 +62,9 @@ class CarInterface(CarInterfaceBase):
       if has_ev_mode_status:
         ret.extFlags |= HyundaiExtFlags.EV_MODE_STATUS_230.value
 
-      if 203 in fingerprint[CAN.CAM]: # LFA_ALT
+      # Tucson can broadcast LFA_ALT while using LFA torque steering.
+      # Keep its torque controller instead of inferring angle support from 0xCB alone.
+      if candidate != CAR.HYUNDAI_TUCSON_4TH_GEN and 0xCB in fingerprint[CAN.CAM]:  # LFA_ALT
         print("##### Anglecontrol detected (LFA_ALT)")
         ret.flags |= HyundaiFlags.ANGLE_CONTROL.value
 
@@ -80,9 +82,9 @@ class CarInterface(CarInterfaceBase):
       if all(fingerprint[CAN.ACAN].get(addr) == 32 for addr in range(0x180, 0x185)):
         ret.extFlags |= HyundaiExtFlags.CORNER_RADAR_OBJECTS_180.value
         print("##### Corner radar objects 0x180 group detected")
-      if all(fingerprint[CAN.ACAN].get(addr) == 32 for addr in tuple(range(0x430, 0x438)) + tuple(range(0x440, 0x448))):
-        ret.extFlags |= HyundaiExtFlags.CORNER_RADAR_OBJECTS_430.value
-        print("##### Corner radar objects 0x430/0x440 group detected")
+      # The 0x430/0x440 layout is not validated as object data. Keep these
+      # frames available in raw logs for offline analysis, but do not advertise
+      # them as live corner-radar tracks.
 
       # detect HDA2 with ADAS Driving ECU
       if hda2:
