@@ -41,6 +41,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ExperimentalMode", {PERSISTENT, BOOL}},
     {"ExperimentalModeConfirmed", {PERSISTENT, BOOL}},
     {"EonClusterHud", {PERSISTENT, BOOL}},
+    {"EonClusterHudBtMac", {PERSISTENT, STRING}},
     {"EonClusterHudBrightness", {PERSISTENT, STRING}},
     {"EonClusterHudConnected", {PERSISTENT, BOOL}},
     {"EonClusterHudDayBrightness", {PERSISTENT, STRING}},

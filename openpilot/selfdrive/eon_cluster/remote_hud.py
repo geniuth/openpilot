@@ -18,6 +18,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.params import Params
 from openpilot.selfdrive.eon_cluster.nav_selection import NavSelectionSync
 from openpilot.selfdrive.eon_cluster.hud_remote import RemoteCommandSync
+from openpilot.selfdrive.eon_cluster.bt_link import BluetoothLink, available as bt_available
 
 
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -51,6 +52,8 @@ PARAM_CONNECTED = "EonClusterHudConnected"
 PARAM_HEARTBEAT = "EonClusterHudHeartbeat"
 PARAM_FPS = "EonClusterHudFps"
 PARAM_MAP_FPS = "EonClusterHudMapFps"
+# 비우면 본딩된 기기를 순회하며 우리 서비스를 찾는다.
+PARAM_BT_MAC = "EonClusterHudBtMac"
 HEARTBEAT_PERIOD_S = 2.0
 PARAM_NOO_ENABLED = "NavigationOnOpenpilot"
 _NAVI_CACHE = {"signature": None, "state": {}, "scene_sig": None, "scene": None, "parsed_at": 0.0}
@@ -287,6 +290,18 @@ def _param_int(params, key, default=0, minimum=0, maximum=999):
   except (TypeError, ValueError):
     value = default
   return max(minimum, min(maximum, value))
+
+
+def _param_str(params, key, default=""):
+  try:
+    raw = params.get(key)
+  except (TypeError, ValueError):
+    return default
+  if raw is None:
+    return default
+  if isinstance(raw, bytes):
+    raw = raw.decode("utf-8", "replace")
+  return str(raw).strip()
 
 
 def _alert(controls_state):
@@ -1231,6 +1246,10 @@ def main():
   sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
   sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
   sock.setblocking(False)
+  # 블루투스 HUD(Navdy). 커널에 BT 가 없는 기기에서는 만들지 않는다.
+  bt_link = None
+  if bt_available():
+    bt_link = BluetoothLink(_param_str(params, PARAM_BT_MAC))
   last_ack = 0.0
   connected = False
   published = [None, 0.0]
@@ -1263,8 +1282,12 @@ def main():
       packet = _packet(sm, noo_enabled, path_offset)
       packet.update(nav_selection.telemetry())
       packet.update(remote_commands.telemetry())
-      sock.sendto(json.dumps(packet, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
-                  ("255.255.255.255", PORT))
+      blob = json.dumps(packet, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+      sock.sendto(blob, ("255.255.255.255", PORT))
+      # Navdy 는 WiFi 유저스페이스가 없어 UDP 로 닿지 않는다. 같은 패킷을
+      # RFCOMM 으로도 흘려보낸다. 링크가 없으면 내부에서 알아서 재접속한다.
+      if bt_link is not None:
+        bt_link.send(blob)
       try:
         for _ in range(64):
           reply, address = sock.recvfrom(256)
@@ -1286,6 +1309,8 @@ def main():
     time.sleep(max(0.0, 1.0 / telemetry_fps - (time.monotonic() - started)))
   _publish_connected(params, published, False)
   map_server.close()
+  if bt_link is not None:
+    bt_link.close()
   sock.close()
 
 
