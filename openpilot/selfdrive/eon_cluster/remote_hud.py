@@ -1287,7 +1287,7 @@ def main():
       # Navdy 는 WiFi 유저스페이스가 없어 UDP 로 닿지 않는다. 같은 패킷을
       # RFCOMM 으로도 흘려보낸다. 링크가 없으면 내부에서 알아서 재접속한다.
       if bt_link is not None:
-        bt_link.send(blob)
+        bt_link.send_packet(packet)
       try:
         for _ in range(64):
           reply, address = sock.recvfrom(256)

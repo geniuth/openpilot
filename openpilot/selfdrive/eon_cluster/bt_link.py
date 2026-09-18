@@ -14,6 +14,7 @@ UDP 로는 닿을 수 없다. 대신 기기가 안드로이드이고 루팅돼 �
 10Hz 송신 루프가 블루투스 지연에 막히면 안 되므로 실제 전송은 별도 스레드에서
 하고, 큐에는 최신 패킷 하나만 남긴다(오래된 주행 상태를 뒤늦게 그려봐야 쓸모없다).
 """
+import json
 import os
 import queue
 import socket
@@ -79,6 +80,40 @@ def _service_channel(mac):
   return None
 
 
+# HUD 렌더러가 실제로 읽는 항목만. 원본에는 계기판용 필드(문·타이어공기압·
+# 주차센서·날씨 등)가 많은데 이 화면에는 안 그린다.
+KEEP_KEYS = (
+  "speed", "limit", "set", "gap", "drive", "gear", "active", "alert",
+  "lanes", "edges", "path", "lead", "lead2",
+  "leftBsd", "rightBsd", "leftBlinker", "rightBlinker",
+  "camera", "cameraDist", "cameraSection", "bumpDist",
+  "turnType", "turnDist", "remainDist", "remainTime",
+)
+# 폴리라인 점 개수. 640x480 에서는 33점이나 13점이나 같은 그림이 나온다.
+LINE_POINTS = 13
+
+
+def _thin(points, count=LINE_POINTS):
+  """앞쪽을 촘촘히 남긴다. 가까운 구간이 화면에서 크게 보이기 때문이다."""
+  if not points or len(points) <= count:
+    return points
+  last = len(points) - 1
+  idx = sorted({int(round(last * (i / float(count - 1)) ** 1.6)) for i in range(count)})
+  return [points[i] for i in idx]
+
+
+def slim_packet(packet: dict) -> dict:
+  out = {k: packet[k] for k in KEEP_KEYS if k in packet}
+  for key in ("lanes", "edges"):
+    lines = out.get(key)
+    if isinstance(lines, list):
+      out[key] = [{**ln, "p": _thin(ln.get("p"))} if isinstance(ln, dict) else ln
+                  for ln in lines]
+  if isinstance(out.get("path"), list):
+    out["path"] = _thin(out["path"])
+  return out
+
+
 class BluetoothLink:
   """최신 패킷 하나만 유지하며 RFCOMM 으로 밀어 넣는다. 끊기면 스스로 다시 붙는다."""
 
@@ -98,6 +133,16 @@ class BluetoothLink:
   @property
   def last_error(self):
     return self._last_error
+
+  def send_packet(self, packet: dict) -> None:
+    """블루투스로 보낼 만큼만 추려서 보낸다.
+
+    UDP(WiFi) 경로는 원본을 그대로 쓰지만 RFCOMM 은 대역폭이 빠듯하다.
+    실측 원본이 5,765B 라 10Hz 면 461kbps 로 RFCOMM 실효대역폭에 걸린다.
+    HUD 가 실제로 그리는 것만 남기고 폴리라인을 솎으면 그 절반 이하가 된다.
+    """
+    self.send(json.dumps(slim_packet(packet), separators=(",", ":"),
+                         ensure_ascii=False).encode("utf-8"))
 
   def send(self, payload: bytes) -> None:
     """가장 최근 것만 남긴다. 큐가 차 있으면 이전 것을 버린다."""
