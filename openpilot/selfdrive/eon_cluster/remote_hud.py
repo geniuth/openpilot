@@ -274,7 +274,9 @@ def _param_bool(params, key, default=False):
   """Read a boolean Params key without coupling telemetry to a UI renderer."""
   try:
     raw = params.get(key)
-  except (TypeError, ValueError):
+  except Exception:
+    # 새 키가 아직 params_pyx 에 컴파일되지 않았으면 UnknownKeyName 이 난다.
+    # 설정 하나 때문에 전체 텔레메트리가 죽으면 안 된다.
     return default
   if raw is None:
     return default
@@ -287,7 +289,7 @@ def _param_int(params, key, default=0, minimum=0, maximum=999):
   try:
     raw = params.get(key)
     value = int(raw) if raw is not None else default
-  except (TypeError, ValueError):
+  except Exception:
     value = default
   return max(minimum, min(maximum, value))
 
@@ -295,7 +297,7 @@ def _param_int(params, key, default=0, minimum=0, maximum=999):
 def _param_str(params, key, default=""):
   try:
     raw = params.get(key)
-  except (TypeError, ValueError):
+  except Exception:
     return default
   if raw is None:
     return default
@@ -1247,9 +1249,13 @@ def main():
   sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
   sock.setblocking(False)
   # 블루투스 HUD(Navdy). 커널에 BT 가 없는 기기에서는 만들지 않는다.
+  # 블루투스가 안 되더라도 UDP 경로와 나머지 텔레메트리는 그대로 돌아야 한다.
   bt_link = None
   if bt_available():
-    bt_link = BluetoothLink(_param_str(params, PARAM_BT_MAC))
+    try:
+      bt_link = BluetoothLink(_param_str(params, PARAM_BT_MAC))
+    except Exception as exc:
+      print("bluetooth HUD link unavailable: %s" % exc, flush=True)
   last_ack = 0.0
   connected = False
   published = [None, 0.0]
