@@ -91,15 +91,29 @@ KEEP_KEYS = (
 )
 # 폴리라인 점 개수. 640x480 에서는 33점이나 13점이나 같은 그림이 나온다.
 LINE_POINTS = 13
+# 이보다 가까운 점은 HUD 투영에서 화면 밖으로 나가 그릴 수 없다.
+# 앱의 Projection.MIN_X 와 맞춰 둔다.
+MIN_DRAW_X = 2.0
+# 이보다 멀면 소실점에 뭉쳐 한 점이 된다.
+MAX_DRAW_X = 90.0
 
 
 def _thin(points, count=LINE_POINTS):
-  """앞쪽을 촘촘히 남긴다. 가까운 구간이 화면에서 크게 보이기 때문이다."""
-  if not points or len(points) <= count:
+  """보이는 구간만 남기고 솎는다. 가까운 쪽을 촘촘히 둔다.
+
+  modelV2 의 x 간격은 앞쪽이 아주 촘촘하고(0, 0.19, 0.75, 1.69) 뒤로 갈수록
+  벌어진다. 인덱스 기준으로 솎으면 그 촘촘한 앞부분만 챙기다가 정작 화면에
+  보이는 3~7m 구간을 통째로 건너뛴다(실측: 1.69 다음이 6.75 로 점프해서
+  화면 아래 절반이 비었다). 그래서 안 보일 점을 먼저 버리고 솎는다.
+  """
+  if not points:
     return points
-  last = len(points) - 1
+  usable = [p for p in points if MIN_DRAW_X <= p[0] <= MAX_DRAW_X]
+  if len(usable) <= count:
+    return usable
+  last = len(usable) - 1
   idx = sorted({int(round(last * (i / float(count - 1)) ** 1.6)) for i in range(count)})
-  return [points[i] for i in idx]
+  return [usable[i] for i in idx]
 
 
 def slim_packet(packet: dict) -> dict:
