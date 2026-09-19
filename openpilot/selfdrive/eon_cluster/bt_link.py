@@ -84,7 +84,7 @@ def _service_channel(mac):
 # 주차센서·날씨 등)가 많은데 이 화면에는 안 그린다.
 KEEP_KEYS = (
   "speed", "limit", "set", "gap", "drive", "gear", "active", "alert",
-  "lanes", "edges", "path", "lead", "lead2",
+  "lanes", "edges", "path", "lead", "lead2", "laneL", "laneR",
   "leftBsd", "rightBsd", "leftBlinker", "rightBlinker",
   "camera", "cameraDist", "cameraSection", "bumpDist",
   "turnType", "turnDist", "remainDist", "remainTime",

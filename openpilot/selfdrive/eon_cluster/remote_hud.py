@@ -1229,6 +1229,12 @@ def _packet(sm, noo_enabled, path_offset=0.0):
     "path": hud_path,
     "lanes": hud_lanes,
     "edges": hud_edges,
+    # 자차선 종류. 카메라가 읽은 실제 노면 표시라 모델 차선(laneLines)과 달리
+    # 점선/실선과 색을 구분할 수 있다. 규약은 색*10 + 종류:
+    #   종류 0 점선 / 1 실선 / 2 미상,  색 +10 흰 / +20 노랑 / +30 파랑
+    # 예) 21 = 실선 노란색. 지원하지 않는 차는 -1 이 온다.
+    "laneL": int(_finite(_field(car, "leftLaneLine", -1), -1)),
+    "laneR": int(_finite(_field(car, "rightLaneLine", -1), -1)),
     "lead": _lead(sm["radarState"], "leadOne"),
     "lead2": _lead(sm["radarState"], "leadTwo"),
     # UI only: controls continue to consume radarState exactly as before.
