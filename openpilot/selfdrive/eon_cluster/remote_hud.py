@@ -523,6 +523,42 @@ def _lead(radar_state, name):
   }
 
 
+def _others(radar_state, limit=4):
+  """자차선 앞차를 뺀 나머지 검출 차량.
+
+  leadOne/leadTwo 는 자차선만 보므로 HUD 가 옆 차선 차를 그릴 수 없다.
+  radarState 의 leadLeft/leadRight/leadsCenter 를 같이 실어 보낸다.
+  중복이 있을 수 있어 거리와 횡위치가 비슷하면 하나로 본다.
+  """
+  taken = []
+  for name in ("leadOne", "leadTwo"):
+    lead = _lead(radar_state, name)
+    if lead:
+      taken.append((lead["d"], lead["y"]))
+
+  out = []
+  candidates = []
+  for name in ("leadLeft", "leadRight"):
+    candidates.append(_field(radar_state, name, None))
+  candidates.extend(list(_field(radar_state, "leadsCenter", []) or []))
+
+  for lead in candidates:
+    if len(out) >= limit or not bool(_field(lead, "status", False)):
+      continue
+    d = round(max(0.0, _finite(_field(lead, "dRel", 0.0))), 1)
+    y = round(_finite(_field(lead, "yRel", 0.0)), 2)
+    if any(abs(d - td) < 2.0 and abs(y - ty) < 1.0 for td, ty in taken):
+      continue
+    taken.append((d, y))
+    out.append({
+      "d": d,
+      "y": y,
+      "v": round(_finite(_field(lead, "vRel", 0.0)) * 3.6, 1),
+      "a": round(_finite(_field(lead, "aLeadK", 0.0)), 2),
+    })
+  return out
+
+
 def _gear_step(car_state):
   step = int(_finite(_field(car_state, "gearStep", 0)))
   return step if 1 <= step <= 8 else 0
@@ -1237,6 +1273,10 @@ def _packet(sm, noo_enabled, path_offset=0.0):
     "laneR": int(_finite(_field(car, "rightLaneLine", -1), -1)),
     "lead": _lead(sm["radarState"], "leadOne"),
     "lead2": _lead(sm["radarState"], "leadTwo"),
+    # 옆 차선 차량. leadOne/leadTwo 는 자차선 앞차만이라 HUD 에 한두 대밖에
+    # 안 그려진다. radarState 는 좌우 차선의 앞차도 따로 내보내므로 그대로 쓴다.
+    # 이미 구독 중인 서비스라 추가 비용이 없다.
+    "others": _others(sm["radarState"]),
     # UI only: controls continue to consume radarState exactly as before.
   }
 
