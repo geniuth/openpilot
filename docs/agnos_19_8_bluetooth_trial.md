@@ -1,5 +1,10 @@
 # AGNOS 19.8 native Bluetooth / Cinque v3 experiment
 
+As of 2026-09-19, the user requested integration of this entire experiment into
+`carrot-wip`. References below to v3-only scope and the old wip model/OS describe
+the original trial. See [the integration review](cinque_v3_integration_20260919.md)
+for the current scope; the hardware validation limits below still apply.
+
 ## Scope
 
 The user requested this combined experiment on 2026-09-17, on the existing
@@ -229,8 +234,9 @@ mouse wheels, gamepad axes and arbitrary vendor protocols are not implemented.
 The learn/test session lasts 120 seconds and suppresses commands for that device.
 Closing the dialog does not end the session early. Save a profile before learning,
 then save again to persist newly learned keys/actions. Unmapped events are swallowed
-while the mapping is enabled. Key repeats are ignored; actions fire on release or
-completion of a short touch gesture. Stale (>400 ms), startup and replayed commands
+while the mapping is enabled. Kernel key repeats are ignored; short actions fire
+on release or completion of a short touch gesture. Assigned long actions use the
+hold timer described below. Stale (>400 ms), startup and replayed commands
 are discarded. Physical cruise-button events/held buttons have priority, and valid
 CAN, cruise availability and Drive are required for cruise actions. Lane requests
 retain lateral-active, speed, trailer, geometry, blind-spot and torque checks.
@@ -252,16 +258,125 @@ key 114 remains unassigned. No further physical testing was requested after the
 user ended the session. Evidence: `/data/carrot-bluetooth-mapping-events.json`.
 
 The requested Yiser profile and default mapping are saved on the trial device.
-Test mode has ended; persistent vehicle-command activation remains off pending
-explicit activation approval. Road behavior and other accessories are not yet
+Test mode ended with persistent vehicle-command activation initially off. The
+user subsequently explicitly approved activation; the saved Yiser mapping is
+now enabled, with its connected HID node exclusively captured. Road behavior and other accessories are not yet
 verified. Korean/English usage and scope explanations live in the web dialog;
 no global Params setting or generated settings Wiki page is added.
+
+### Multiple remotes, click gestures and CarrotCruise
+
+The same Cinque v3 experiment now supports per-button short, double and long
+actions in the localized web editor. Existing single mappings and enabled state
+are preserved. New double/long actions default to unassigned. Double clicks use
+a 350 ms release-to-release window; only an assigned double action delays its
+single action. Learning recognizes all gestures and therefore waits on singles.
+Long actions originally fired on release; the hold-timer follow-up below replaces
+that behavior. Kernel key repeats do not directly fire commands. Holds stop after
+10 seconds, and dropped input and overdue deferred singles are discarded.
+A remote emitting synthetic short pulses cannot expose its true
+physical hold duration; Yiser long-press support is not yet verified on hardware.
+
+Device-specific decoders prevent two remotes from combining into one double
+click. One daemon writes bounded, ordered cruise/lane event journals, preserving
+simultaneous device commands rather than overwriting one slot. Readers consume
+each event once and reject startup leftovers, cancelled and >400 ms old events.
+There are at most 64 entries per channel; overload can discard old commands.
+Disconnects, mapping changes and test transitions cancel pending device input.
+HTTP cancellation writes device timestamps instead of racing journal writes.
+Only the selected device is suppressed during learning; other enabled devices
+continue operating. The web editor merges one device's save server-side, displays
+each mapping/capture state and retains test events arriving between polls.
+Configuration allows 16 devices, not a guarantee of 16 simultaneous radio links.
+
+`carrotCruise` enters the existing `carrot_cruise_active` mode, matching LFA mode 2
+and paddle mode 3. Repeated requests leave it enabled, and existing RES/+ handling
+exits it without increasing set speed on that first press. It does not change
+`CarrotCruiseDecel`, `CarrotCruiseAtcDecel`, steering, engage conditions or vehicle
+controller algorithms. Actual acceleration limiting remains subject to existing
+vehicle support (the Hyundai controller), its speed/override/stop conditions and
+those parameters. This action is available in every gesture selector but is not
+automatically assigned to the user's remote.
+
+Validation: 94 C4 Python tests pass with warnings as errors, including actual
+daemon-loop tests with two local input pipes, delayed singles, learning isolation,
+recorded Yiser replay, queue expiry/cancellation, API device-save isolation and
+cruise/desire regressions. These tests use temporary command files, never vehicle
+input or CAN. Thirteen web tests pass and the production assets build. Multiple
+physical accessories and actual long/double operation are not yet verified.
+
+### Native button-long actions and engagement follow-up
+
+The initial HID speed actions changed set speed but did not produce an engagement
+request. RES/+ and SET/- now request engagement when disabled, including their
+native long variants. The request uses the existing `activateCruise`/car-event
+path; it never sets selfdrive state directly. Manual button intent is independent
+of the automatic-engagement preference. CAN validity, Drive, cruise availability,
+physical-button priority, brake/gas checks, hold/steering interlocks and normal
+selfdrived no-entry events remain. A negative request already produced that frame
+is not replaced, and SET during soft hold keeps its existing cancel behavior.
+
+The action selectors now include every button with a distinct native long handler:
+
+| Native action | Result |
+| --- | --- |
+| `accelCruiseLong` / `decelCruiseLong` | One existing 10-unit speed step; can request engagement while disabled |
+| `gapAdjustCruiseLong` | Existing driving-mode cycle |
+| `lfaButtonLong` | Existing lane-line mode toggle |
+| `cancelLong` | Cruise cancellation and lateral disable |
+
+Short `lfaButton` and `cancel` are also selectable. These action names are separate
+from the remote's physical gesture: a short remote press may execute a native
+long action without waiting 700 ms. No synthetic held state or repeat is left
+behind. Fixed actions such as lane requests, paddle deceleration and CarrotCruise
+have no separate native long handler; they can still be assigned to any gesture.
+Existing user mappings are preserved, and long actions are not auto-assigned.
+
+Explicit Bluetooth cancellation uses `activateCruise=-3`, leaving the existing
+automatic -1/-2 meanings unchanged. PCM vehicles also receive the normal cancel
+event for this request. The Hyundai stock-cruise button path now accepts only
+positive activation requests, so negative cancellation cannot accidentally send
+RES. This is compatibility for the experiment's new cancel actions; no panda
+safety limits or schema changes are involved.
+
+Validation: 140 C4 Python tests and 14 web tests pass. Coverage includes disabled
+cruise with automatic engagement off, all five native long handlers, physical
+priority/interlocks, actual selfdrived state-machine no-entry checks and PCM/non-PCM
+cancel transitions. Tests generate no vehicle commands. Actual road engagement
+has not been exercised by the agent.
 
 For rollback while stationary, stop comma, restore the matching previous
 openpilot OS manifest/version (the pre-trial commit is in `before.json`), select
 the preserved B slot with `sudo abctl --set_active 1`, and reboot. Restoring the
 matching code avoids immediately requesting the new OS again. Do not flash the
 preserved slot as part of rollback.
+
+### Held actions (carrot-wip, 2026-09-20)
+
+An assigned `@long` gesture now fires while held, first at 700 ms. The speed
+actions `accelCruise`, `decelCruise`, `accelCruiseLong` and `decelCruiseLong`
+repeat every 500 ms while assigned to that gesture. Other actions execute once
+per hold, avoiding repeated mode toggles, gap cycles and lane requests. Native
+long actions mapped to a short or double gesture still execute only once.
+Existing mappings are preserved; repeat requires assigning the Long press slot.
+
+Release, input loss, a changed touch direction, mapping/test transitions and a
+10-second hold timeout stop repetition and remove unconsumed held commands.
+Pedals, physical vehicle buttons, leaving Drive, invalid vehicle state and
+cruise disengagement cancel the hold until release and a new press. Repeated
+ticks cannot request engagement when cruise is disabled; the first action keeps
+the existing manual engagement path and checks. Missed intervals are never
+replayed as a burst. Kernel auto-repeat events do not set the repeat cadence.
+
+The localized web dialog describes timing and the required Long press mapping.
+Hardware must report a continuous press and release; a synthetic short pulse
+does not expose the user's physical hold duration. Physical Yiser hold behavior
+and road operation remain unverified.
+
+Validation: 160 C4 Python tests pass with warnings as errors, including the
+real daemon loop with simulated HID pipes, hold interruptions and disabled-cruise
+repeat rejection. Fourteen web tests pass and the production tools bundle builds.
+Tests use temporary journals and do not send vehicle commands.
 
 Docs-Not-Needed: Developer-only OS/model compatibility experiment with no
 user-facing setting addition or changed setting behavior.

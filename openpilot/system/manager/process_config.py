@@ -206,7 +206,8 @@ procs = [
 
   PythonProcess("carrot_server", "openpilot.selfdrive.carrot.carrot_server", always_run, enabled=not CARROT_WEB_EXTERNAL),
   PythonProcess("carrot_bluetooth", "openpilot.selfdrive.carrot.bluetooth.daemon", always_run, enabled=TICI, restart_if_crash=True),
-  # 외부 HUD(폰 렌더) 텔레메트리. EonClusterHud 토글로 켠다.
+  # 외부 HUD(폰/Navdy 렌더) 텔레메트리. EonClusterHud 토글로 켠다.
+  # carrot_bluetooth 와 같은 어댑터를 쓰지만 서비스 UUID 가 달라 서로 간섭하지 않는다.
   PythonProcess("remote_hud", "openpilot.selfdrive.eon_cluster.remote_hud_s9", always_run, enabled=TICI, restart_if_crash=True),
   PythonProcess("cweb_push", "openpilot.selfdrive.carrot.cweb_push", always_run, enabled=not PC),
   PythonProcess("carrot_cluster", "openpilot.selfdrive.carrot.cluster_autorun", enable_cluster_hud, restart_if_crash=True),
