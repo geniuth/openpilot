@@ -44,10 +44,12 @@ pkg_names = ['acados', 'bzip2', 'capnproto', 'eigen', 'ffmpeg', 'json11', 'libjp
 if GetOption('extras'):
   pkg_names.append('catch2')
 if arch == "larch64":
-  # AGNOS 19 no longer ships comma's legacy bzip2/libyuv Python wrappers.
+  # AGNOS 19 no longer ships comma's legacy bzip2/libyuv/libjpeg Python wrappers.
   # Neither dependency is used by an on-device target: bzip2 is replay-only,
   # and the libyuv-backed FFmpeg encoder is excluded below on larch64.
-  pkg_names = [name for name in pkg_names if name not in ('bzip2', 'libyuv')]
+  # libjpeg is only imported for its presence; AGNOS provides jpeglib.h and
+  # libjpeg.so system-wide, and loggerd links it as a plain -ljpeg.
+  pkg_names = [name for name in pkg_names if name not in ('bzip2', 'libyuv', 'libjpeg')]
 
 pkgs = [importlib.import_module(name) for name in pkg_names]
 acados = pkgs[pkg_names.index('acados')]
