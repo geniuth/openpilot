@@ -523,6 +523,12 @@ def _lead(radar_state, name):
   }
 
 
+def _limit_or_zero(value, no_limit):
+  """감속 제한값. no_limit 이상이면 제한이 없다는 뜻이라 0 으로 접는다."""
+  v = int(_finite(value, 0))
+  return v if 0 < v < no_limit else 0
+
+
 def _others(radar_state, limit=4):
   """자차선 앞차를 뺀 나머지 검출 차량.
 
@@ -1149,10 +1155,13 @@ def _packet(sm, noo_enabled, path_offset=0.0):
     #               4 우차선변경 5 로터리 6 톨게이트 7 도착/유턴. -1 이면 없음.
     #   turnDist    그 지점까지 남은 거리(m).
     #   desiredSpeed / desiredSource  최종 목표속도와 그 이유.
-    "vTurnSpeed": max(0, int(_finite(_field(road, "vTurnSpeed", 0)))),
+    # carrot 은 "제한 없음"을 250(vTurnSpeed) 과 크루즈 최대치(desiredSpeed)로
+    # 표현한다. 그대로 보내면 HUD 에 "VT 250 / 200" 이 늘 떠 있는다. 규약을
+    # 아는 이쪽에서 0 으로 접어 보내고, 앱은 0 이면 안 그린다.
+    "vTurnSpeed": _limit_or_zero(_field(road, "vTurnSpeed", 0), 250),
     "turnInfo": int(_finite(_field(road, "xTurnInfo", -1), -1)),
     "turnDist": max(0, int(_finite(_field(road, "xDistToTurn", 0)))),
-    "desiredSpeed": max(0, int(_finite(_field(road, "desiredSpeed", 0)))),
+    "desiredSpeed": _limit_or_zero(_field(road, "desiredSpeed", 0), 200),
     "desiredSource": str(_field(road, "desiredSource", "") or ""),
     "camera": max(0, cam_speed),
     "cameraDist": max(0, cam_dist),
