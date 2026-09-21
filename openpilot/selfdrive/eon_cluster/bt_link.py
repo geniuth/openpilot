@@ -82,12 +82,16 @@ def _service_channel(mac):
 
 # HUD 렌더러가 실제로 읽는 항목만. 원본에는 계기판용 필드(문·타이어공기압·
 # 주차센서·날씨 등)가 많은데 이 화면에는 안 그린다.
+# "drive"/"active"/"turnType"/"remainDist"/"remainTime" 는 최상위에 없는 키였다.
+# navi 안에 중첩돼 있어서 아무것도 안 나갔다. 최상위에 실제로 있는 이름으로 바꾼다.
 KEEP_KEYS = (
-  "speed", "limit", "set", "gap", "drive", "gear", "active", "alert",
+  "speed", "limit", "set", "gap", "gear", "alert",
+  # 인게이지 여부. 경로 띠 색이 여기서 갈린다.
+  "enabled",
   "lanes", "edges", "path", "lead", "lead2", "others", "laneL", "laneR",
   "leftBsd", "rightBsd", "leftBlinker", "rightBlinker",
   "camera", "cameraDist", "cameraSection", "bumpDist",
-  "turnType", "turnDist", "remainDist", "remainTime",
+  "vTurnSpeed", "turnInfo", "turnDist", "desiredSpeed",
 )
 # 폴리라인 점 개수. 640x480 에서는 33점이나 13점이나 같은 그림이 나온다.
 LINE_POINTS = 13

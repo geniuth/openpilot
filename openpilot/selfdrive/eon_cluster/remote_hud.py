@@ -1143,6 +1143,17 @@ def _packet(sm, noo_enabled, path_offset=0.0):
     "gap": gap if 1 <= gap <= 4 else 0,
     "drivingMode": mode,
     "limit": max(0, int(_finite(_field(road, "nRoadLimitSpeed", 0)))),
+    # 커브/내비 감속. carrotMan 이 이미 계산해 둔 값을 그대로 내보낸다.
+    #   vTurnSpeed  시야 커브에서 낼 수 있는 속도(km/h). 0 이면 커브 없음.
+    #   turnInfo    다음 경로 안내. 1 좌회전 2 우회전 3 좌차선변경
+    #               4 우차선변경 5 로터리 6 톨게이트 7 도착/유턴. -1 이면 없음.
+    #   turnDist    그 지점까지 남은 거리(m).
+    #   desiredSpeed / desiredSource  최종 목표속도와 그 이유.
+    "vTurnSpeed": max(0, int(_finite(_field(road, "vTurnSpeed", 0)))),
+    "turnInfo": int(_finite(_field(road, "xTurnInfo", -1), -1)),
+    "turnDist": max(0, int(_finite(_field(road, "xDistToTurn", 0)))),
+    "desiredSpeed": max(0, int(_finite(_field(road, "desiredSpeed", 0)))),
+    "desiredSource": str(_field(road, "desiredSource", "") or ""),
     "camera": max(0, cam_speed),
     "cameraDist": max(0, cam_dist),
     "cameraSection": bool(camera_section),
