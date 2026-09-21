@@ -307,7 +307,11 @@ def _param_str(params, key, default=""):
 
 
 def _alert(controls_state):
-  """controlsState에서 Android HUD에 필요한 openpilot 이벤트 알림을 추출한다."""
+  """openpilot 이벤트 알림을 뽑는다.
+
+  alertText1/alertSize 도 controlsState 최상위에서 사라져 selfdriveState 로
+  옮겨졌다. 호출부에서 selfdriveState 를 넘긴다.
+  """
   text1 = str(_field(controls_state, "alertText1", "") or "")
   text2 = str(_field(controls_state, "alertText2", "") or "")
   if not (text1 or text2):
@@ -597,11 +601,17 @@ def _apply_speed(car_control):
   return max(0, int(round(apply_max))), source[:8]
 
 
-def _set_speed(controls_state, car_control):
+def _set_speed(car_state, car_control):
+  """크루즈 설정속도(km/h).
+
+  예전에는 controlsState.vCruise 를 읽었는데, 그 필드는 deprecated 그룹으로
+  들어가 최상위에서 사라졌다. _field 가 조용히 기본값을 돌려주는 바람에 늘 0 이
+  나가서 HUD 에 설정속도가 한 번도 뜨지 않았다. 지금은 carState 에 있다.
+  """
   smoother = _field(car_control, "sccSmoother", None)
   value = _field(smoother, "cruiseMaxSpeed", None)
   if value is None:
-    value = _field(controls_state, "vCruiseCluster", _field(controls_state, "vCruise", 0.0))
+    value = _field(car_state, "vCruiseCluster", _field(car_state, "vCruise", 0.0))
   return max(0, int(round(_finite(value))))
 
 
@@ -1140,10 +1150,13 @@ def _packet(sm, noo_enabled, path_offset=0.0):
     "gpsInfo": gps_info,
     "layout": REMOTE_LAYOUT,
     "speed": int(round(_finite(_field(car, "vEgoCluster", _field(car, "vEgo", 0.0))) * 3.6)),
-    "set": _set_speed(controls, sm["carControl"]),
+    "set": _set_speed(car, sm["carControl"]),
     "applySpeed": apply_speed,
     "applySource": apply_source,
-    "enabled": bool(_field(controls, "enabled", False)),
+    # controlsState.enabled 는 deprecated 그룹으로 옮겨져 최상위에 없다.
+    # _field 가 조용히 기본값 False 를 돌려주는 바람에 인게이지 중에도 계속
+    # False 가 나갔다(HUD 경로 띠가 늘 해제 색). 이미 구독 중인 carControl 을 쓴다.
+    "enabled": bool(_field(sm["carControl"], "enabled", False)),
     "gear": _gear(car),
     "gearStep": _gear_step(car),
     "gap": gap if 1 <= gap <= 4 else 0,
@@ -1277,7 +1290,7 @@ def _packet(sm, noo_enabled, path_offset=0.0):
     # 카메라 roadEdges/laneLines 로 추정한 도로 내 자차 위치. 화면 배치에만
     # 사용하며 조향 제어에는 절대 되먹이지 않는다.
     "lanePosition": lane_position,
-    "alert": _alert(controls),
+    "alert": _alert(sm["selfdriveState"]),
     "navi": navi,
     # 날씨 조회 전용 저정밀 좌표(소수점 2자리). navi.scene.pos 는 위에서 제거되고
     # TMAP 안내가 꺼져 있으면 navi 자체가 비므로, 별도 최상위 키로 내보낸다.
@@ -1310,7 +1323,8 @@ def main():
   signal.signal(signal.SIGTERM, lambda *_: running.__setitem__(0, False))
   sm = messaging.SubMaster(["carState", "carControl", "controlsState", "deviceState",
                             "modelV2", "radarState", "longitudinalPlan", "carrotMan",
-                            "liveCalibration", "lateralPlan", "gpsLocationExternal"])
+                            "liveCalibration", "lateralPlan", "gpsLocationExternal",
+                            "selfdriveState"])
   sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
   sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
   sock.setblocking(False)
