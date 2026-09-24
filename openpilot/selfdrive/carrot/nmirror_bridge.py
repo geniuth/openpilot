@@ -11,6 +11,9 @@ npilot 의 selfdrive/controls/neokii/navi_controller.py 와 같은 방식으로 
 
 소켓 스레드는 받은 값을 보관만 하고, CarrotServ 반영은 carrot_man 의 메인 루프가
 pop() 으로 가져가서 한다. CarrotServ 상태를 한 스레드에서만 바꾸기 위해서다.
+
+받은 원본은 값이 바뀔 때만 cloudlog 로 남긴다. logMessage 로 rlog 에 들어가고
+(주행 중), 주차 중에도 swaglog 파일에 남는다. 앱은 같은 값을 1Hz 로 되풀이한다.
 """
 import ipaddress
 import json
@@ -20,6 +23,8 @@ import threading
 import time
 
 import psutil
+
+from openpilot.common.swaglog import cloudlog
 
 SDP_MESSAGE = b"EON:ROAD_LIMIT_SERVICE:v1"
 BROADCAST_PORT = 2899  # 기기 -> 앱: SDP, echo, GPS
@@ -91,6 +96,8 @@ class NMirrorBridge:
     self._road_limit = None
     self._traffic_signal = None
     self._ignored_cmd_logged = False
+    self._logged_road_limit = None
+    self._logged_traffic_signal = None
 
   @property
   def connected(self):
@@ -115,6 +122,7 @@ class NMirrorBridge:
 
     if self.remote_addr is None or self.remote_addr[0] != addr[0]:
       print(f"[nmirror] connected: {addr[0]}")
+      cloudlog.event("nmirror_connected", remote=addr[0])
     self.remote_addr = addr
     self.last_recv = now
 
@@ -130,6 +138,12 @@ class NMirrorBridge:
 
     road_limit = obj.get("road_limit")
     traffic_signal = obj.get("traffic_signal")
+    if isinstance(road_limit, dict) and road_limit != self._logged_road_limit:
+      self._logged_road_limit = road_limit
+      cloudlog.event("nmirror_road_limit", active=obj.get("active"), road_limit=road_limit)
+    if isinstance(traffic_signal, dict) and traffic_signal != self._logged_traffic_signal:
+      self._logged_traffic_signal = traffic_signal
+      cloudlog.event("nmirror_traffic_signal", traffic_signal=traffic_signal)
     with self.lock:
       if isinstance(road_limit, dict):
         self._road_limit = road_limit
@@ -141,7 +155,9 @@ class NMirrorBridge:
   def tick(self, sock, now):
     if self.remote_addr is not None and now - self.last_recv > CONNECTION_TIMEOUT:
       print(f"[nmirror] disconnected: {self.remote_addr[0]}")
+      cloudlog.event("nmirror_disconnected", remote=self.remote_addr[0])
       self.remote_addr = self.gps_addr = None
+      self._logged_road_limit = self._logged_traffic_signal = None  # 재연결 첫 값은 다시 남긴다
 
     if self.remote_addr is None:
       if now - self.last_discovery >= DISCOVERY_INTERVAL:

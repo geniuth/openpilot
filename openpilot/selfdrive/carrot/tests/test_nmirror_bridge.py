@@ -34,6 +34,28 @@ def test_road_limit_is_queued_and_answered_with_sdp():
   assert bridge.pop() is None
 
 
+def test_raw_payload_is_logged_only_on_change(monkeypatch):
+  events = []
+  monkeypatch.setattr(nmirror_bridge.cloudlog, "event", lambda name, **kwargs: events.append((name, kwargs)))
+  bridge, sock = NMirrorBridge(), _Sock()
+  idle = _packet(active=0, road_limit={})
+  guiding = _packet(active=1, road_limit={"road_limit_speed": 80, "cam_type": 1})
+  for data in (idle, idle, guiding, guiding, idle):
+    bridge.handle_packet(data, APP, sock, 10.)
+
+  assert events == [
+    ("nmirror_connected", {"remote": APP[0]}),
+    ("nmirror_road_limit", {"active": 0, "road_limit": {}}),
+    ("nmirror_road_limit", {"active": 1, "road_limit": {"road_limit_speed": 80, "cam_type": 1}}),
+    ("nmirror_road_limit", {"active": 0, "road_limit": {}}),
+  ]
+
+  events.clear()
+  bridge.tick(sock, 10. + CONNECTION_TIMEOUT + 1.)
+  bridge.handle_packet(idle, APP, sock, 20.)
+  assert [name for name, _ in events] == ["nmirror_disconnected", "nmirror_connected", "nmirror_road_limit"]
+
+
 def test_keepalive_without_data_does_not_queue():
   bridge = NMirrorBridge()
   bridge.handle_packet(_packet(active=1), APP, _Sock(), 10.)
