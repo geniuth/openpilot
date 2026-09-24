@@ -81,6 +81,7 @@ import collections
 
 COUNTDOWN_NEW_TARGET_MIN_JUMP_M = 20.0
 SCHOOL_ZONE_GAS_OVERRIDE_TIMEOUT_S = 3.0
+NMIRROR_ACTIVE_TICKS = 120  # update_navi 20Hz 기준 6초
 
 
 class CarrotServ:
@@ -1319,6 +1320,70 @@ class CarrotServ:
         self.xSpdLimit = self.nRoadLimitSpeed * self.autoNaviSpeedSafetyFactor if self.nRoadLimitSpeed > 0 else 0
         self.xSpdDist = distance
         self.xSpdType = xSpdType
+
+  def update_nmirror(self, road_limit):
+    # nmirror2(neokii ROAD_LIMIT_SERVICE) 의 road_limit 을 SDI 상태로 옮긴다. TBT 는 오지 않는다.
+    if self.carrot_navi_active and self.carrot_navi_has_control:
+      return False  # CarrotNavi 가 붙어 있으면 그쪽이 우선
+
+    def _i(key, default=0):
+      try:
+        value = road_limit.get(key)
+        return default if value is None else int(float(value))
+      except (TypeError, ValueError):
+        return default
+
+    # update_navi 가 20Hz 로 깎는다. npilot 과 같이 6초 동안 소식이 없으면 끊긴 것으로 본다.
+    self.active_count = max(self.active_count, NMIRROR_ACTIVE_TICKS)
+    self.active_sdi_count = self.active_sdi_count_max
+
+    # 0 은 "제한속도 모름". 30 미만이면 road 소스가 적용되지 않는다.
+    self.nRoadLimitSpeed = max(_i("road_limit_speed"), 0)
+    is_highway = road_limit.get("is_highway")
+    if is_highway is not None:
+      self.roadcate = 0 if is_highway else 8  # roadcate 0,1: 고속도로 (과속방지턱 제어 제외)
+    road_name = road_limit.get("current_road_name")
+    if isinstance(road_name, str):
+      self.szPosRoadName = road_name
+
+    # cam_type 은 TMAP SDI 코드 (22: 과속방지턱, 2: 구간단속 시작 ...)
+    cam_type = _i("cam_type", -1)
+    cam_speed = _i("cam_limit_speed")
+    cam_dist = _i("cam_limit_speed_left_dist")
+    cam_present = cam_type >= 0 and cam_dist > 0
+    section_speed = _i("section_limit_speed")
+    section_dist = _i("section_left_dist")
+    section_present = section_speed > 0 and section_dist > 0
+
+    self.nSdiPlusType = self.nSdiPlusBlockType = -1
+    self.nSdiPlusSpeedLimit = self.nSdiPlusDist = 0
+    self.nSdiPlusBlockSpeed = self.nSdiPlusBlockDist = 0
+    if section_present:
+      # _apply_carrot_navi_speed 의 구간단속 표현과 같게 맞춘다.
+      self.nSdiType = 4
+      self.nSdiSpeedLimit = section_speed
+      self.nSdiDist = section_dist
+      self.nSdiSection = 1
+      self.nSdiBlockType = 2
+      self.nSdiBlockSpeed = section_speed
+      self.nSdiBlockDist = section_dist
+      if cam_present:
+        self.nSdiPlusType = cam_type
+        self.nSdiPlusSpeedLimit = cam_speed
+        self.nSdiPlusDist = cam_dist
+    elif cam_present:
+      self.nSdiType = cam_type
+      self.nSdiSpeedLimit = cam_speed
+      self.nSdiDist = cam_dist
+      self.nSdiSection = -1
+      self.nSdiBlockType = -1
+      self.nSdiBlockSpeed = self.nSdiBlockDist = 0
+    else:
+      self.nSdiType = self.nSdiBlockType = self.nSdiSection = -1
+      self.nSdiSpeedLimit = self.nSdiDist = 0
+      self.nSdiBlockSpeed = self.nSdiBlockDist = 0
+    self._update_sdi()
+    return True
 
   def update_navi(self, remote_ip, sm, pm, vturn_speed, coords, distances, route_speed, gps_service):
 

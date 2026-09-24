@@ -35,6 +35,7 @@ from openpilot.common.constants import CV
 from openpilot.selfdrive.carrot.carrot_serv import CarrotServ
 from openpilot.selfdrive.carrot.curve_speed import VisionCurveSpeed, curve_speed
 from openpilot.selfdrive.carrot.carrot_navi_control import CarrotNaviControl, parse_carrot_navi_control
+from openpilot.selfdrive.carrot.nmirror_bridge import NMirrorBridge, to_carrot_traffic_light
 from openpilot.selfdrive.carrot.server.services.web_settings import read_web_settings
 from openpilot.selfdrive.carrot.web_upload import (
   carrot_logs_web_target,
@@ -315,6 +316,7 @@ class CarrotMan:
     self.pm = messaging.PubMaster(['carrotMan', "navRoute", "navInstructionCarrot"])
 
     self.carrot_serv = CarrotServ()
+    self.nmirror = NMirrorBridge(get_location=self._nmirror_location)
 
     self.broadcast_ip = self.get_broadcast_address()
     self.broadcast_port = 7705
@@ -415,6 +417,7 @@ class CarrotMan:
         remote_ip = remote_addr[0] if remote_addr is not None else ""
         vturn_speed = self.carrot_curve_speed(self.sm)
         coords, distances, route_speed = self.carrot_navi_route()
+        self._apply_nmirror()
 
         #print("coords=", coords)
         #print("curvatures=", curvatures)
@@ -751,6 +754,22 @@ class CarrotMan:
         self.remote_addr = None
         print(f"Network error, retrying...: {e}")
         time.sleep(2)
+
+  def _nmirror_location(self):
+    # nmirror 소켓 스레드에서 불린다. 읽기만 한다.
+    if not self.sm.alive[self.gps_location_service]:
+      return None
+    return self.sm[self.gps_location_service]
+
+  def _apply_nmirror(self):
+    packet = self.nmirror.pop()
+    if packet is None:
+      return
+    road_limit, traffic_signal = packet
+    if road_limit is not None:
+      self.carrot_serv.update_nmirror(road_limit)
+    if traffic_signal is not None and not self.carrot_serv.carrot_navi_active:
+      self.handle_traffic_light(to_carrot_traffic_light(traffic_signal))
 
   def parse_kisa_data(self, data: bytes):
     result = {}
@@ -2316,6 +2335,7 @@ def main():
 
   print(f"CarrotMan {carrot_man}")
   threading.Thread(target=carrot_man.kisa_app_thread, daemon=True).start()
+  threading.Thread(target=carrot_man.nmirror.run, daemon=True).start()
   threading.Thread(target=carrot_man.carrot_navi_thread, daemon=True).start()
   threading.Thread(target=carrot_man.carrot_navi_http_thread, daemon=True).start()
 
