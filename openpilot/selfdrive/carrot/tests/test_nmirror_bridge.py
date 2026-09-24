@@ -166,6 +166,16 @@ def nmirror_bridge_ticks():
   return NMIRROR_ACTIVE_TICKS
 
 
+def test_idle_app_does_not_take_over(navigation_update):  # noqa: F811
+  # 실측: 안내가 없을 때 앱은 {"active":0,"road_limit":{}} 를 1Hz 로 보낸다.
+  serv, CS, update = navigation_update
+  CS.speedLimit = 60
+  assert not serv.update_nmirror({})
+  result = update()
+  assert result.activeCarrot == 0
+  assert result.nRoadLimitSpeed == 60
+
+
 def test_carrot_navi_has_priority(navigation_update):  # noqa: F811
   serv, _CS, _update = navigation_update
   serv.carrot_navi_active = serv.carrot_navi_has_control = True

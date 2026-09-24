@@ -1325,6 +1325,10 @@ class CarrotServ:
     # nmirror2(neokii ROAD_LIMIT_SERVICE) 의 road_limit 을 SDI 상태로 옮긴다. TBT 는 오지 않는다.
     if self.carrot_navi_active and self.carrot_navi_has_control:
       return False  # CarrotNavi 가 붙어 있으면 그쪽이 우선
+    if not road_limit:
+      # 앱은 안내가 없을 때도 {"active":0,"road_limit":{}} 를 1Hz 로 보낸다.
+      # 이걸 연결로 치면 차량/navd 제한속도가 가려진다.
+      return False
 
     def _i(key, default=0):
       try:
