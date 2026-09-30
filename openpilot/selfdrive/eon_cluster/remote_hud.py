@@ -1175,6 +1175,9 @@ def _packet(sm, noo_enabled, path_offset=0.0):
     "turnInfo": int(_finite(_field(road, "xTurnInfo", -1), -1)),
     "turnDist": max(0, int(_finite(_field(road, "xDistToTurn", 0)))),
     "desiredSpeed": _limit_or_zero(_field(road, "desiredSpeed", 0), 200),
+    # 목적지까지 남은 시간(초). 경로가 없으면 0 이다.
+    # HUD 는 이 하나로 도착 예정시각과 남은 시간을 모두 만든다.
+    "goTime": max(0, int(_finite(_field(road, "nGoPosTime", 0)))),
     "desiredSource": str(_field(road, "desiredSource", "") or ""),
     "camera": max(0, cam_speed),
     "cameraDist": max(0, cam_dist),

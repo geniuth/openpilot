@@ -91,7 +91,8 @@ KEEP_KEYS = (
   "lanes", "edges", "path", "lead", "lead2", "others", "laneL", "laneR",
   "leftBsd", "rightBsd", "leftBlinker", "rightBlinker",
   "camera", "cameraDist", "cameraSection", "bumpDist",
-  "vTurnSpeed", "turnInfo", "turnDist", "desiredSpeed",
+  # turnInfo/turnDist(경로 안내 화살표)는 HUD 에서 뺐다. 안 그리는 것은 안 보낸다.
+  "vTurnSpeed", "desiredSpeed", "goTime",
 )
 # 폴리라인 점 개수. 640x480 에서는 33점이나 13점이나 같은 그림이 나온다.
 LINE_POINTS = 13
