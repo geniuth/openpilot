@@ -308,9 +308,10 @@ class BluetoothLink:
         if dialed is None:
           self._connected.clear()
           failed_dials += 1
-          # 같은 이유로 계속 실패하는 동안은 한 번만 남긴다.
+          # 같은 이유로 계속 실패하는 동안은 한 번만 남긴다. 키 이름을 error 로 하면
+          # cloudlog 가 ERROR 레벨로 올린다. Navdy 가 아직 안 켜진 건 정상 상황이다.
           if self._last_error != logged_error:
-            cloudlog.event("hud_bt_dial_failed", error=self._last_error, attempts=failed_dials)
+            cloudlog.event("hud_bt_dial_failed", reason=self._last_error, attempts=failed_dials)
             logged_error = self._last_error
           self._stop.wait(backoff)
           backoff = min(RECONNECT_MAX_S, backoff * 2)
