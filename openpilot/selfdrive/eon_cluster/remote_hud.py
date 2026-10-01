@@ -1356,6 +1356,8 @@ def main():
       last_ack = 0.0
       _publish_connected(params, published, False)
       map_server.set_inactive()
+      if bt_link is not None:
+        bt_link.set_active(False)
       time.sleep(0.25)
       continue
     _publish_heartbeat(params, published)
@@ -1367,6 +1369,9 @@ def main():
       map_server.set_poll_fps(_param_int(params, PARAM_MAP_FPS, 3, 2, 5))
       next_param_read = started + 1.0
     sm.update(0)
+    if bt_link is not None:
+      # 시동이 꺼져 있으면 Navdy 도 꺼져 있다. 찾느라 무선을 계속 두드리지 않는다.
+      bt_link.set_active(bool(sm.seen["deviceState"] and sm["deviceState"].started))
     try:
       packet = _packet(sm, noo_enabled, path_offset)
       packet.update(nav_selection.telemetry())
