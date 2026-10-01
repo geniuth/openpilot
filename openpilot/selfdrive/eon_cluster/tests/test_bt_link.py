@@ -57,6 +57,13 @@ class PairLink(bt_link.BluetoothLink):
     return ours, 5, self.dials == 1
 
 
+def stop(link):
+  # 스레드가 끝나기 전에 다음 테스트로 넘어가면 그 스레드의 기록이 다음 테스트의
+  # Recorder 로 들어간다(cloudlog 를 모듈 단위로 바꿔 끼우기 때문).
+  link.close()
+  link._thread.join(timeout=5.0)
+
+
 def wait_for(cond, timeout=3.0):
   end = time.monotonic() + timeout
   while time.monotonic() < end:
@@ -108,7 +115,7 @@ def test_sends_telemetry_and_periodic_ping_while_telemetry_flows():
       connected = rec.last("hud_bt_connected")
       assert connected["channel"] == 5 and connected["sdp"] is True
     finally:
-      link.close()
+      stop(link)
 
 
 def test_drops_frames_while_blocked_then_reports_stall():
@@ -118,17 +125,22 @@ def test_drops_frames_while_blocked_then_reports_stall():
     try:
       assert wait_for(lambda: link.connected)
       # 상대가 읽지 않으니 버퍼가 찬다. 곧바로 끊지 말고 프레임만 버려야 한다.
+      # 막힘은 보낼 것이 있을 때 판정하므로 실제처럼 계속 흘려 넣는다.
       blob = b"x" * 2000
-      for _ in range(20):
+      started = time.monotonic()
+      while time.monotonic() - started < 0.5:
         link.send(blob)
         time.sleep(0.02)
       assert link.connected, "버퍼가 막혔다고 바로 끊으면 안 된다"
-      assert wait_for(lambda: "hud_bt_disconnected" in rec.names(), timeout=4.0)
+      while "hud_bt_disconnected" not in rec.names() and time.monotonic() - started < 5.0:
+        link.send(blob)
+        time.sleep(0.05)
+      assert "hud_bt_disconnected" in rec.names()
       gone = rec.last("hud_bt_disconnected")
       assert gone["reason"].startswith("stalled")
       assert gone["dropped"] > 0
     finally:
-      link.close()
+      stop(link)
 
 
 def test_inactive_drops_link_and_stops_dialing_after_grace():
@@ -149,7 +161,7 @@ def test_inactive_drops_link_and_stops_dialing_after_grace():
       assert wait_for(lambda: link.connected)
       assert link.dials == dials + 1
     finally:
-      link.close()
+      stop(link)
 
 
 class FakeRfcomm:
