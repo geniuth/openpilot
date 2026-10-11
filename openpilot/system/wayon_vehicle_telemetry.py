@@ -6,7 +6,8 @@
 
 배터리는 CAN(Motor_16)에서 직접 디코딩한다. carState는 card 프로세스가 온로드에서만
 돌아 주차 중엔 비어 있어, 충전 중 감시가 되려면 CAN 직접 샘플링이어야 한다.
-충전 전력은 배터리량 증가 기울기로 추정한다(전용 신호 MEB_HVEM_01 수신 여부 미검증).
+HV 전압·배터리 전류·BMS 모드는 0x0CF(DBC에 없음, 원시 바이트 해석)에서 실측한다.
+0x0CF가 없을 때만 충전 전력을 배터리량 증가 기울기로 추정한다.
 
 - 주행 중: TELEMETRY_ONROAD_S 간격
 - 주차 중: TELEMETRY_OFFROAD_S 간격 + 배터리 변화 감지 시 즉시
@@ -45,6 +46,17 @@ CHARGE_SLOW_MAX_W = 11000.0
 CHARGE_PRICE_SLOW = 280.0
 CHARGE_PRICE_FAST = 320.0
 
+# 0x0CF(207): BMS 실시간 전류/전압/모드, 100Hz. vw_meb.dbc 에 없어 원시 바이트로 해석한다.
+#   모드 = b[2] & 0x07                                   (0,1 비충전 / 4 AC 충전 / 6 DC 충전)
+#   전류 = ((((b[4] & 0x7F) << 8) | b[3]) - 16300) * 0.1 [A] (+ 충전/회생, - 방전)
+#   전압 = ((b[7] << 4) | (b[6] >> 4)) * 0.25            [V]
+# 실측 검증(2026-10): 주행 rlog 에서 V-I 상관 0.99, V×I 적산이 Motor_16 감소와 일치.
+# AC 완속 충전 중 모드 4, +14.6A, 394.5V, +5.76kW. DC(6)는 미검증.
+# MEB_HVEM_01.Battery_Voltage 는 주행 중에도 480.9V 고정이라 실제 팩 전압이 아니다(사용 중단).
+BMS_0CF_ADDR = 0x0CF
+BMS_CHARGE_MODES = {4: "ac", 6: "dc"}
+BMS_IDLE_MODES = (0, 1)
+
 # can 구독 소켓 (재사용)
 _CAN_SOCK = None
 
@@ -78,7 +90,7 @@ def utc_now() -> str:
 
 
 def build_vehicle_block(battery_wh: float | None, charge_power_w: float | None,
-                        capacity_wh: float | None = None) -> dict:
+                        capacity_wh: float | None = None, bms_mode: int | None = None) -> dict:
   vehicle: dict = {}
   # 분모는 항상 고정값(계기판 일치). capacity_wh(BMS 실측)는 SOH 전용.
   usable = USABLE_BATTERY_WH
@@ -86,11 +98,20 @@ def build_vehicle_block(battery_wh: float | None, charge_power_w: float | None,
     vehicle["battery_wh"] = round(battery_wh, 1)
     vehicle["capacity_wh"] = round(usable, 0)
     vehicle["soc_percent"] = round(min(100.0, battery_wh / usable * 100.0), 1)
-  if charge_power_w is not None and charge_power_w >= CHARGING_MIN_W:
-    vehicle["charging"] = True
-    vehicle["charge_power_w"] = round(charge_power_w, 0)
+  # 충전 여부는 BMS 모드가 있으면 그것을 따른다. 주행 중 회생도 전류가 + 라서
+  # 전력만 보면 충전으로 오판하기 때문이다. 모드를 모를 때만 전력 기준으로 판정한다.
+  if bms_mode in BMS_CHARGE_MODES:
+    charging = True
+    vehicle["charge_kind"] = BMS_CHARGE_MODES[bms_mode]
+  elif bms_mode in BMS_IDLE_MODES:
+    charging = False
   else:
-    vehicle["charging"] = False
+    charging = charge_power_w is not None and charge_power_w >= CHARGING_MIN_W
+  vehicle["charging"] = charging
+  if charging and charge_power_w is not None and charge_power_w > 0:
+    vehicle["charge_power_w"] = round(charge_power_w, 0)
+  if bms_mode is not None:
+    vehicle["bms_mode"] = bms_mode
   return vehicle
 
 
@@ -114,11 +135,12 @@ def save_charge_ledger(ledger: dict) -> None:
   os.replace(tmp, CHARGE_LEDGER_PATH)
 
 
-def add_charge_energy(ledger: dict, delta_wh: float, hours: float) -> None:
-  """늘어난 에너지를 구간 평균 전력으로 완속/급속을 나눠 이번 달에 더한다.
+def add_charge_energy(ledger: dict, delta_wh: float, hours: float, kind_hint: str | None = None) -> None:
+  """늘어난 에너지를 완속/급속으로 나눠 이번 달에 더한다.
 
-  전력은 '지금 값'이 아니라 (증가분 / 경과시간)으로 구한다. 기기가 자다 깨면
-  몇 시간치가 한 번에 들어오는데, 그때 순간 전력을 쓰면 판정이 엉뚱해진다.
+  BMS 모드(0x0CF)로 AC/DC 를 알면 그것을 쓴다(kind_hint: 'ac'->완속, 'dc'->급속).
+  모를 때만 구간 평균 전력(증가분 / 경과시간)으로 나눈다. 순간 전력을 쓰지 않는 건,
+  기기가 자다 깨면 몇 시간치가 한 번에 들어와 판정이 엉뚱해지기 때문이다.
   """
   if delta_wh <= 0 or hours <= 0:
     return
@@ -132,7 +154,12 @@ def add_charge_energy(ledger: dict, delta_wh: float, hours: float) -> None:
   now = datetime.now(timezone.utc).timestamp() + 9 * 3600
   month = datetime.utcfromtimestamp(now).strftime("%Y-%m")
 
-  kind = "slow" if avg_power_w <= CHARGE_SLOW_MAX_W else "fast"
+  if kind_hint == "ac":
+    kind = "slow"
+  elif kind_hint == "dc":
+    kind = "fast"
+  else:
+    kind = "slow" if avg_power_w <= CHARGE_SLOW_MAX_W else "fast"
   price = CHARGE_PRICE_SLOW if kind == "slow" else CHARGE_PRICE_FAST
   kwh = delta_wh / 1000.0
 
@@ -174,14 +201,14 @@ def sample_vehicle_can(timeout_s: float = 6.0) -> dict:
   양쪽 버스를 다 파싱한다.
   - Motor_16.MO_Energieinhalt_BMS      : HV 배터리 에너지량[Wh]  <- 잔량/충전 판정의 핵심
   - HVEM_02.HVEM_Nutzbare_Energie      : 가용 에너지[Wh] (Motor_16과 동일값으로 교차검증됨)
-  - MEB_HVEM_01.Battery_Voltage        : HV 전압[V]  (실측 369.2V)
+  - 0x0CF (원시 해석, BMS_0CF_ADDR 주석) : HV 전압[V]·배터리 전류[A]·BMS 모드
   - BMS_04.BMS_Kapazitaet_02           : 배터리 용량[Ah] -> 실제 용량/SOH
   - Diagnose_01.KBI_Kilometerstand     : 계기판 총 주행거리[km]
   - Klima_Sensor_02.BCM1_Aussen_Temp_ungef : 외기온도[degC] (주행 중에만 수신)
   """
   result: dict = {}
   # 같은 메시지가 주행 중엔 bus0, 주차/충전 중엔 bus1로 온다(실측). 양쪽 다 파싱한다.
-  MSGS = [("Motor_16", 2), ("HVEM_02", 10), ("MEB_HVEM_01", 100),
+  MSGS = [("Motor_16", 2), ("HVEM_02", 10),
           ("BMS_04", 2), ("Diagnose_01", 1), ("Klima_Sensor_02", 1),
           ("Klima_11", 5), ("Klima_12", 5)]
   try:
@@ -200,13 +227,26 @@ def sample_vehicle_can(timeout_s: float = 6.0) -> dict:
     messaging.drain_sock(_CAN_SOCK)
   sock = _CAN_SOCK
   deadline = time.monotonic() + max(0.5, timeout_s)
-  hv_voltage = None
   capacity_ah = None
+  bms_volts: list[float] = []
+  bms_amps: list[float] = []
+  bms_modes: list[int] = []
   while time.monotonic() < deadline:
     msgs = messaging.drain_sock(sock)
     if not msgs:
       continue
     frames = [(m.logMonoTime, [(f.address, f.dat, f.src) for f in m.can]) for m in msgs]
+
+    # 0x0CF: DBC 에 없어 원시 바이트로 해석 (식은 BMS_0CF_ADDR 주석)
+    for _, cans in frames:
+      for addr, dat, src in cans:
+        if addr != BMS_0CF_ADDR or src not in (0, 1) or len(dat) < 8:
+          continue
+        d = bytes(dat)
+        bms_modes.append(d[2] & 0x07)
+        bms_amps.append(((((d[4] & 0x7F) << 8) | d[3]) - 16300) * 0.1)
+        bms_volts.append(((d[7] << 4) | (d[6] >> 4)) * 0.25)
+
     for cp in parsers:
       try:
         cp.update(frames)
@@ -226,10 +266,6 @@ def sample_vehicle_can(timeout_s: float = 6.0) -> dict:
           result["odometer_km"] = float(odo)
       if cp.vl_all["Klima_Sensor_02"].get("BCM1_Aussen_Temp_ungef"):
         result["outside_temp_c"] = float(cp.vl["Klima_Sensor_02"]["BCM1_Aussen_Temp_ungef"])
-      if cp.vl_all["MEB_HVEM_01"].get("Battery_Voltage"):
-        v = cp.vl["MEB_HVEM_01"]["Battery_Voltage"]
-        if v > 0:
-          hv_voltage = float(v)
       if cp.vl_all["BMS_04"].get("BMS_Kapazitaet_02"):
         ah = cp.vl["BMS_04"]["BMS_Kapazitaet_02"]
         if ah > 0:
@@ -252,6 +288,19 @@ def sample_vehicle_can(timeout_s: float = 6.0) -> dict:
 
     if "battery_wh" in result and "odometer_km" in result:
       break
+
+  # 0x0CF 집계: 샘플 구간 평균. 모드는 가장 많이 나온 값.
+  hv_voltage = None
+  if bms_volts:
+    hv_voltage = sum(bms_volts) / len(bms_volts)
+    if not 200.0 <= hv_voltage <= 500.0:  # 상식 밖이면 해석이 틀린 것 -> 이번 값 전부 버림
+      hv_voltage = None
+  if hv_voltage is not None:
+    amps = sum(bms_amps) / len(bms_amps)
+    power_w = sum(v * a for v, a in zip(bms_volts, bms_amps)) / len(bms_volts)
+    result["battery_current_a"] = round(amps, 1)
+    result["battery_power_w"] = round(power_w, 0)
+    result["bms_mode"] = max(set(bms_modes), key=bms_modes.count)
 
   # 측정 용량: BMS 용량[Ah] x HV 전압[V]
   # 주의: SOH(열화율)가 아니다. BMS가 온도/충전상태에 따라 그때그때 다시 추정하는 값이라
@@ -497,6 +546,12 @@ def main() -> None:
       if last_battery_at is None or abs(battery_wh - (last_battery_wh or 0)) >= BATTERY_DELTA_TRIGGER_WH:
         last_battery_wh, last_battery_at = battery_wh, now
 
+    # 0x0CF 실측(배터리 측 V×I)이 있으면 위의 기울기 추정 대신 그 값을 쓴다.
+    bms_mode = sampled.get("bms_mode")
+    if sampled.get("battery_power_w") is not None:
+      measured_w = float(sampled["battery_power_w"])
+      charge_power_w = measured_w if measured_w > 0 else None
+
     # 오도미터 급변 방어: 계기판이 깨어나는 중이면 엉뚱한 값이 한 번씩 섞인다.
     # 이전에 알던 값과 1000km 이상 벌어지면 이번 값은 버리고 기존 값을 유지한다.
     sampled_odo = sampled.get("odometer_km")
@@ -517,14 +572,16 @@ def main() -> None:
       prev_at = charge_ledger.get("last_at")
       if not onroad and prev_wh is not None and prev_at is not None and battery_wh > prev_wh:
         hours = max(0.0, time.time() - float(prev_at)) / 3600.0
-        add_charge_energy(charge_ledger, battery_wh - float(prev_wh), hours)
+        add_charge_energy(charge_ledger, battery_wh - float(prev_wh), hours,
+                          kind_hint=BMS_CHARGE_MODES.get(bms_mode))
       charge_ledger["last_wh"] = battery_wh
       charge_ledger["last_at"] = time.time()
       save_charge_ledger(charge_ledger)
 
-    vehicle = build_vehicle_block(battery_wh, charge_power_w, sampled.get("capacity_wh"))
+    vehicle = build_vehicle_block(battery_wh, charge_power_w, sampled.get("capacity_wh"), bms_mode)
     vehicle["charge_months"] = charge_ledger.get("months", {})
     for key in ("odometer_km", "outside_temp_c", "hv_voltage", "measured_capacity_wh",
+                "battery_current_a", "battery_power_w",
                 "ac_on", "blower_volt", "blower_level", "seat_heat_left", "seat_heat_right", "recirc"):
       if sampled.get(key) is not None:
         vehicle[key] = sampled[key]
@@ -578,6 +635,8 @@ def main() -> None:
       save_last_state(last)   # 마지막 측정값 유지 (주차 후에도 표시하기 위함)
       print(f"Wayon telemetry: uploaded soc={vehicle.get('soc_percent')}% "
             f"odo={vehicle.get('odometer_km')} charging={vehicle.get('charging')} "
+            f"kind={vehicle.get('charge_kind')} power={vehicle.get('charge_power_w')} "
+            f"bms_mode={vehicle.get('bms_mode')} hv={vehicle.get('hv_voltage')} "
             f"stale={vehicle.get('stale', False)}", flush=True)
 
 
