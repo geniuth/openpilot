@@ -57,6 +57,22 @@ BMS_0CF_ADDR = 0x0CF
 BMS_CHARGE_MODES = {4: "ac", 6: "dc"}
 BMS_IDLE_MODES = (0, 1)
 
+# 도어 잠금/열림 (읽기 전용). 실측(2026-10): 주행 rlog 에서 시속 17km 자동 잠금 때
+# ZV_02.ZV_verriegelt_intern_ist 와 문별 *_verriegelt 가 동시에 0->1. bus0/1/2 수신.
+#   ZV_02 (0x583) byte2: bit0 안에서 잠김(intern_ist), bit1 밖에서 잠김(extern_ist), bit4 SAFE(gesafet_extern_ist)
+#   Gateway_72 (0x3DB): 문 열림 비트 (DBC 시작비트 -> byte, bit)
+ZV_02_ADDR = 1411
+GATEWAY_72_ADDR = 987
+DOOR_OPEN_BITS = {
+  "driver": (3, 2),       # ZV_FT_offen   26
+  "passenger": (3, 0),    # ZV_BT_offen   24
+  "rear_left": (2, 4),    # ZV_HFS_offen  20
+  "rear_right": (2, 5),   # ZV_HBFS_offen 21
+  "tailgate": (3, 6),     # ZV_HD_offen   30
+}
+# 잠금 상태가 바뀌어 즉시 업로드할 때도 최소 이 간격은 둔다(신호가 잠깐 흔들려도 폭주하지 않게)
+DOOR_UPLOAD_MIN_GAP_S = 10.0
+
 # can 구독 소켓 (재사용)
 _CAN_SOCK = None
 
@@ -191,6 +207,44 @@ def merge_last_known(vehicle: dict, last_known: dict) -> dict:
   return merged
 
 
+def get_can_sock():
+  """can 구독 소켓. 매번 새로 열면 첫 호출(프로세스 기동 직후)에 연결 워밍업 때문에
+  아무것도 못 받으므로 한 번 만들어 재사용한다."""
+  global _CAN_SOCK
+  if _CAN_SOCK is None:
+    _CAN_SOCK = messaging.sub_sock("can", timeout=200)
+    time.sleep(0.5)          # 구독 성립 대기
+    messaging.drain_sock(_CAN_SOCK)
+  return _CAN_SOCK
+
+
+def read_door_state(sock) -> dict | None:
+  """쌓인 CAN 에서 도어 잠금/열림만 가볍게 읽는다(수신 전용). 버스가 조용하면 None.
+
+  메인 루프가 매초 부른다. 주차 중 업로드는 10분마다라, 잠그는 순간을 놓치지 않으려면
+  잠금 신호만큼은 계속 지켜보다가 바뀌면 바로 올려야 한다(차는 잠근 뒤 곧 잠들어 조용해짐).
+  """
+  zv = gw = None
+  for m in messaging.drain_sock(sock):
+    for f in m.can:
+      if f.src > 2 or len(f.dat) < 4:
+        continue
+      if f.address == ZV_02_ADDR:
+        zv = bytes(f.dat)
+      elif f.address == GATEWAY_72_ADDR:
+        gw = bytes(f.dat)
+  if zv is None and gw is None:
+    return None
+  state: dict = {}
+  if zv is not None:
+    state["door_locked_inside"] = bool(zv[2] & 0x01)
+    state["door_locked_outside"] = bool(zv[2] & 0x02)
+    state["door_safe"] = bool(zv[2] & 0x10)
+  if gw is not None:
+    state["doors_open"] = [name for name, (byte, bit) in DOOR_OPEN_BITS.items() if (gw[byte] >> bit) & 1]
+  return state
+
+
 def sample_vehicle_can(timeout_s: float = 6.0) -> dict:
   """차량 값들을 CAN에서 짧게 샘플링한다.
 
@@ -218,14 +272,7 @@ def sample_vehicle_can(timeout_s: float = 6.0) -> dict:
     print(f"Wayon telemetry: CAN parser unavailable: {exc}", flush=True)
     return result
 
-  # 소켓을 매번 새로 열면 첫 호출(프로세스 기동 직후)에 연결 워밍업 때문에 아무것도 못 받는다.
-  # 한 번 만들어 재사용한다.
-  global _CAN_SOCK
-  if _CAN_SOCK is None:
-    _CAN_SOCK = messaging.sub_sock("can", timeout=200)
-    time.sleep(0.5)          # 구독 성립 대기
-    messaging.drain_sock(_CAN_SOCK)
-  sock = _CAN_SOCK
+  sock = get_can_sock()
   deadline = time.monotonic() + max(0.5, timeout_s)
   capacity_ah = None
   bms_volts: list[float] = []
@@ -465,6 +512,11 @@ def main() -> None:
   charge_power_w = None
   trip = TripRecorder()
   onroad_prev = None
+  # 도어 상태는 마지막으로 알던 값에서 시작한다(재시작했다고 '바뀜'으로 오인하지 않게)
+  door_keys = ("door_locked_inside", "door_locked_outside", "door_safe", "doors_open",
+               "door_changed_at", "door_seen_at")
+  door_state = {k: last.get(k) for k in door_keys}
+  door_pending = False
 
   print("Wayon telemetry: started", flush=True)
 
@@ -520,6 +572,17 @@ def main() -> None:
         last_battery_wh = battery_wh
         last_battery_at = now
 
+    # 도어 잠금/열림: 매초 확인하고, 바뀌면 다음 주기를 기다리지 않고 올린다.
+    door = read_door_state(get_can_sock())
+    if door:
+      stamp = utc_now()
+      door_state["door_seen_at"] = stamp
+      if any(door_state.get(k) != v for k, v in door.items()):
+        door_state.update(door)
+        door_state["door_changed_at"] = stamp
+        door_pending = True
+    door_due = door_pending and (last_upload_at is None or now - last_upload_at >= DOOR_UPLOAD_MIN_GAP_S)
+
     interval = TELEMETRY_ONROAD_S if onroad else TELEMETRY_OFFROAD_S
     battery_moved = (
       battery_wh is not None and last.get("battery_wh") is not None
@@ -527,7 +590,7 @@ def main() -> None:
     )
     # 부팅 직후엔 monotonic이 작아 'now - 0 < interval'이 참이 되어 첫 업로드가
     # 최대 10분 지연되던 문제가 있었다. 첫 회는 무조건 올린다.
-    if last_upload_at is not None and now - last_upload_at < interval and not battery_moved:
+    if last_upload_at is not None and now - last_upload_at < interval and not battery_moved and not door_due:
       continue
 
     # 배터리/오도미터/외기온·용량은 CAN에서 직접 샘플링 (업로드 직전에만).
@@ -603,6 +666,15 @@ def main() -> None:
         last["measured_at"] = utc_now()
     vehicle = merge_last_known(vehicle, last)
 
+    # 도어 상태: 마지막으로 본 값을 그대로 싣는다. 차가 잠들어 버스가 조용해도
+    # 잠금/해제는 차를 깨우므로, 콤마가 켜져 있는 동안엔 바뀌면 바로 보인다.
+    for key, value in door_state.items():
+      if value is not None:
+        vehicle[key] = value
+        last[key] = value
+    if door_state.get("door_locked_inside") is not None or door_state.get("door_locked_outside") is not None:
+      vehicle["door_locked"] = bool(door_state.get("door_locked_inside") or door_state.get("door_locked_outside"))
+
     # Worker(/api/telemetry)는 camelCase + 중첩 gps 를 기대하며, 페이로드 전체를 raw_json 에 저장한다.
     # 앱은 raw_json.vehicle 을 읽어 배터리/충전 정보를 표시한다.
     dongle = params.get("DongleId")
@@ -631,12 +703,14 @@ def main() -> None:
 
     if post_state(config, payload):
       last_upload_at = now
+      door_pending = False
       last["updated_at"] = payload["updatedAt"]
       save_last_state(last)   # 마지막 측정값 유지 (주차 후에도 표시하기 위함)
       print(f"Wayon telemetry: uploaded soc={vehicle.get('soc_percent')}% "
             f"odo={vehicle.get('odometer_km')} charging={vehicle.get('charging')} "
             f"kind={vehicle.get('charge_kind')} power={vehicle.get('charge_power_w')} "
             f"bms_mode={vehicle.get('bms_mode')} hv={vehicle.get('hv_voltage')} "
+            f"locked={vehicle.get('door_locked')} open={vehicle.get('doors_open')} "
             f"stale={vehicle.get('stale', False)}", flush=True)
 
 
