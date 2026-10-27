@@ -207,6 +207,76 @@ def test_dial_reuses_cached_channel_and_forgets_it_after_failure():
     assert len(calls) == 2, "접속에 실패한 채널은 잊고 SDP 를 다시 한다"
 
 
+# ── 전송량 축소(slim_packet) ──
+# 모델 차선의 x 격자. 앞쪽이 촘촘하다.
+X_IDXS = [192.0 * (i / 32) ** 2 for i in range(33)]
+
+
+def _lane(y0):
+  return [[round(x, 2), round(y0, 2)] for x in X_IDXS]
+
+
+def test_slim_drops_keys_the_hud_does_not_read():
+  packet = {"speed": 90, "gap": 3, "gear": "D", "alert": None, "edges": [{"p": _lane(7.2), "c": 0.4}],
+            "lanes": [], "doors": {"fl": False}}
+  out = bt_link.slim_packet(packet)
+  assert "speed" in out
+  for key in ("gap", "gear", "alert", "edges", "doors"):
+    assert key not in out, key
+
+
+def test_slim_lane_covers_screen_bottom_to_far_edge():
+  out = bt_link.slim_packet({"lanes": [{"p": _lane(-1.8), "c": 0.973}]})
+  pts = out["lanes"][0]["p"]
+  xs = [p[0] for p in pts]
+  assert len(pts) <= bt_link.LINE_POINTS
+  assert len(set(xs)) == len(xs), "솎은 점이 겹치면 안 된다"
+  # 범위 바로 바깥 점이 하나씩 있어야 앱이 2m 와 50m 끝까지 선을 긋는다.
+  assert xs[0] < bt_link.MIN_DRAW_X <= xs[1]
+  assert xs[-2] <= bt_link.LANE_MAX_X < xs[-1]
+  assert all(len(p) == 2 for p in pts)
+  assert out["lanes"][0]["c"] == 0.97
+
+
+def test_slim_keeps_lane_slots_in_order_even_when_empty():
+  lanes = [{"p": [], "c": 0.0}, {"p": _lane(-1.8), "c": 0.9},
+           {"p": _lane(1.8), "c": 0.9}, {"p": [], "c": 0.0}]
+  out = bt_link.slim_packet({"lanes": lanes})["lanes"]
+  assert len(out) == 4, "슬롯 번호가 곧 차선 위치다"
+  assert out[0]["p"] == [] and out[3]["p"] == []
+  assert out[1]["p"][1][1] == -1.8 and out[2]["p"][1][1] == 1.8
+
+
+def test_slim_path_drops_height_and_far_points():
+  path = [[round(x, 2), 0.1, 0.5] for x in X_IDXS]
+  out = bt_link.slim_packet({"path": path})["path"]
+  assert len(out) <= bt_link.PATH_POINTS
+  assert all(len(p) == 2 for p in out), "높이(z)는 앱이 쓰지 않는다"
+  assert all(bt_link.MIN_DRAW_X <= p[0] <= bt_link.PATH_MAX_X for p in out)
+
+
+def test_slim_vehicle_keeps_only_fields_the_hud_reads():
+  car = {"d": 35.24, "y": -0.123, "v": -3.42, "a": -0.61, "src": "R", "p": 0.98}
+  out = bt_link.slim_packet({"lead": car, "lead2": None, "others": [car]})
+  assert out["lead"] == {"d": 35.2, "y": -0.1, "v": -3, "a": -0.6}
+  assert out["lead2"] is None
+  assert out["others"] == [out["lead"]]
+
+
+def test_slim_frame_is_much_smaller():
+  car = {"d": 35.2, "y": -0.12, "v": -3.4, "a": -0.15, "src": "R", "p": 0.98}
+  packet = {
+    "speed": 90, "limit": 100, "set": 100, "gap": 3, "gear": "D", "alert": None, "enabled": True,
+    "lanes": [{"p": _lane(y), "c": 0.9} for y in (-5.4, -1.8, 1.8, 5.4)],
+    "edges": [{"p": _lane(y), "c": 0.4} for y in (-7.2, 7.2)],
+    "path": [[round(25 * t, 2), 0.0, 0.0] for t in (10.0 * (i / 32) ** 2 for i in range(33))],
+    "lead": car, "lead2": car, "others": [car] * 4,
+  }
+  size = len(bt_link.json.dumps(bt_link.slim_packet(packet), separators=(",", ":")))
+  # 10/27 실측 평균 프레임이 1.6KB 였고 그 크기에서 9.5% 를 버렸다.
+  assert size < 1200, size
+
+
 if __name__ == "__main__":
   for name, fn in list(globals().items()):
     if name.startswith("test_") and callable(fn):

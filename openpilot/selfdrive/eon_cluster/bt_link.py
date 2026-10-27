@@ -93,54 +93,99 @@ def _service_channel(mac):
 
 # HUD 렌더러가 실제로 읽는 항목만. 원본에는 계기판용 필드(문·타이어공기압·
 # 주차센서·날씨 등)가 많은데 이 화면에는 안 그린다.
-# "drive"/"active"/"turnType"/"remainDist"/"remainTime" 는 최상위에 없는 키였다.
-# navi 안에 중첩돼 있어서 아무것도 안 나갔다. 최상위에 실제로 있는 이름으로 바꾼다.
+# HUD 렌더러가 실제로 읽는 항목만(나브디 앱 HudView 에서 opt* 로 읽는 키와 맞춘다).
+# gap/gear/alert 는 앱이 읽지 않고, edges(도로 경계선)는 앱에서 그리기가 꺼져 있다
+# (HudView.SHOW_EDGES=false). 실측(10/27, 74분)에서 프레임당 평균 1.6KB 를 보내다
+# 9.5% 를 버렸다 - 블루투스가 다 못 밀어냈다. 안 쓰는 것부터 뺀다.
 KEEP_KEYS = (
-  "speed", "limit", "set", "gap", "gear", "alert",
+  "speed", "limit", "set",
   # 인게이지 여부. 경로 띠 색이 여기서 갈린다.
   "enabled",
-  "lanes", "edges", "path", "lead", "lead2", "others", "laneL", "laneR",
+  "lanes", "path", "lead", "lead2", "others", "laneL", "laneR",
   "leftBsd", "rightBsd", "leftBlinker", "rightBlinker",
   "camera", "cameraDist", "cameraSection", "bumpDist",
   # turnInfo/turnDist(경로 안내 화살표)는 HUD 에서 뺐다. 안 그리는 것은 안 보낸다.
   "vTurnSpeed", "desiredSpeed", "goTime",
 )
-# 폴리라인 점 개수. 640x480 에서는 33점이나 13점이나 같은 그림이 나온다.
-LINE_POINTS = 13
-# 이보다 가까운 점은 HUD 투영에서 화면 밖으로 나가 그릴 수 없다.
-# 앱의 Projection.MIN_X 와 맞춰 둔다.
+# 검출 차량에서 앱이 쓰는 필드와 소수 자릿수. src/p 는 앱이 읽지 않는다.
+VEHICLE_FIELDS = (("d", 1), ("y", 1), ("v", 0), ("a", 1))
+
+# 폴리라인 점 개수. 앱은 점 사이를 0.75m 간격으로 다시 쪼개 그리므로 원래 점이
+# 많을 필요가 없다. 그리는 구간(아래)만 남기면 이 정도로 충분하다.
+LINE_POINTS = 10
+PATH_POINTS = 8
+# 앱이 실제로 그리는 범위. 앱 상수와 맞춰 둔다.
+#   MIN_DRAW_X  = Projection.MIN_X   (이보다 가까우면 화면 밖)
+#   LANE_MAX_X  = Projection.MAX_X   (차선)
+#   PATH_MAX_X  = HudView.PATH_MAX_X (경로 띠)
 MIN_DRAW_X = 2.0
-# 이보다 멀면 소실점에 뭉쳐 한 점이 된다.
-MAX_DRAW_X = 90.0
+LANE_MAX_X = 50.0
+PATH_MAX_X = 35.0
 
 
-def _thin(points, count=LINE_POINTS):
-  """보이는 구간만 남기고 솎는다. 가까운 쪽을 촘촘히 둔다.
+def _num(value, digits):
+  """반올림하고, 정수가 되면 int 로 둔다(JSON 에서 12.0 대신 12)."""
+  r = round(float(value), digits)
+  return int(r) if r == int(r) else r
+
+
+def _pt(point):
+  """x 는 0.1m, y 는 0.01m. 높이(z) 등 나머지 성분은 앱이 쓰지 않아 버린다."""
+  return [_num(point[0], 1), _num(point[1], 2)]
+
+
+def _thin(points, count=LINE_POINTS, max_x=LANE_MAX_X, margin=True):
+  """그리는 구간만 남기고 솎는다. 가까운 쪽을 촘촘히 둔다.
 
   modelV2 의 x 간격은 앞쪽이 아주 촘촘하고(0, 0.19, 0.75, 1.69) 뒤로 갈수록
   벌어진다. 인덱스 기준으로 솎으면 그 촘촘한 앞부분만 챙기다가 정작 화면에
   보이는 3~7m 구간을 통째로 건너뛴다(실측: 1.69 다음이 6.75 로 점프해서
   화면 아래 절반이 비었다). 그래서 안 보일 점을 먼저 버리고 솎는다.
+
+  margin 이면 범위 바로 바깥 점을 양쪽에 하나씩 남긴다. 앱은 점 사이 선분을
+  쪼개 범위 안쪽만 그리므로, 그래야 선이 화면 아래 끝(2m)과 먼 끝까지 닿는다.
+  범위 안 점만 남기면 차선이 3m 에서야 시작해 화면 아래가 비었다.
   """
   if not points:
     return points
-  usable = [p for p in points if MIN_DRAW_X <= p[0] <= MAX_DRAW_X]
-  if len(usable) <= count:
-    return usable
-  last = len(usable) - 1
-  idx = sorted({int(round(last * (i / float(count - 1)) ** 1.6)) for i in range(count)})
-  return [usable[i] for i in idx]
+  inside = [i for i, p in enumerate(points) if MIN_DRAW_X <= p[0] <= max_x]
+  if not inside:
+    return []
+  lo, hi = inside[0], inside[-1]
+  if margin:
+    lo = max(0, lo - 1)
+    hi = min(len(points) - 1, hi + 1)
+  usable = points[lo:hi + 1]
+  if len(usable) > count:
+    # 모델 격자 자체가 앞쪽이 촘촘하다(x = 192*(i/32)^2). 보이는 구간만 남긴
+    # 뒤에는 인덱스를 고르게 뽑아도 가까운 쪽이 촘촘하게 남는다. 예전처럼 다시
+    # 앞쪽으로 몰아 뽑으면 앞쪽 인덱스가 겹쳐 점이 줄고 중간 구간이 빈다.
+    last = len(usable) - 1
+    idx = sorted({int(round(last * i / float(count - 1))) for i in range(count)})
+    usable = [usable[i] for i in idx]
+  return [_pt(p) for p in usable]
+
+
+def _vehicle(v):
+  if not isinstance(v, dict):
+    return v
+  return {k: _num(v[k], nd) for k, nd in VEHICLE_FIELDS if k in v}
 
 
 def slim_packet(packet: dict) -> dict:
   out = {k: packet[k] for k in KEEP_KEYS if k in packet}
-  for key in ("lanes", "edges"):
-    lines = out.get(key)
-    if isinstance(lines, list):
-      out[key] = [{**ln, "p": _thin(ln.get("p"))} if isinstance(ln, dict) else ln
-                  for ln in lines]
+  lines = out.get("lanes")
+  if isinstance(lines, list):
+    # 슬롯 번호가 곧 차선 위치(0 바깥왼쪽 .. 3 바깥오른쪽)라 빈 슬롯도 순서대로 둔다.
+    out["lanes"] = [{"p": _thin(ln.get("p")), "c": _num(ln.get("c", 0.0), 2)}
+                    if isinstance(ln, dict) else ln for ln in lines]
   if isinstance(out.get("path"), list):
-    out["path"] = _thin(out["path"])
+    out["path"] = _thin(out["path"], PATH_POINTS, PATH_MAX_X, margin=False)
+  for key in ("lead", "lead2"):
+    if key in out:
+      out[key] = _vehicle(out[key])
+  if isinstance(out.get("others"), list):
+    out["others"] = [_vehicle(v) for v in out["others"]]
   return out
 
 
