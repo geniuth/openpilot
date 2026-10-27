@@ -33,6 +33,16 @@ BATTERY_DELTA_TRIGGER_WH = 300.0
 # 잔량% 계산 분모. 차량 계기판 표시와 맞추기 위해 64kWh로 고정한다.
 # (BMS가 주는 실측 용량은 값이 계속 변해 계기판과 어긋난다)
 USABLE_BATTERY_WH = 64000.0
+# carstate 는 fuelGauge = Motor_16[Wh] / 77000 으로 넣는다(opendbc volkswagen/carstate.py).
+# 주행 중 carState 에서 Wh 를 되살릴 때는 이 값으로 곱해야 CAN 직접 샘플과 맞는다.
+# (예전엔 64000 을 곱해 주행 중 값이 17% 낮게 나왔고, 업로드 때 CAN 값과 늘 300Wh 넘게
+#  어긋나 '배터리 급변'으로 판정돼 30초 주기 대신 매번 업로드했다)
+CARSTATE_GAUGE_FULL_WH = 77000.0
+# Motor_16 / HVEM_02 에너지량 무효값[Wh]. 차가 깨어나는 중이거나 BMS 가 다시 초기화될 때
+# 이런 고정값이 섞여 들어온다(carrot-ha MEB_INVALID_ENERGY_WH). 잔량이 100% 넘게 튀고
+# 충전 원장에 수십 kWh 가 한 번에 더해지므로 버린다. 실제 용량(~77kWh)을 넘는 값도 버린다.
+MEB_INVALID_ENERGY_WH = {102250, 102300, 102350, 102375}
+MAX_VALID_ENERGY_WH = 90000.0
 # 충전으로 판정할 최소 증가율[W]
 CHARGING_MIN_W = 300.0
 # 오도미터(KBI_Kilometerstand)는 DBC상 20비트 [0|1048573] 이다. 1048574(2^20-2)는
@@ -73,8 +83,46 @@ DOOR_OPEN_BITS = {
 # 잠금 상태가 바뀌어 즉시 업로드할 때도 최소 이 간격은 둔다(신호가 잠깐 흔들려도 폭주하지 않게)
 DOOR_UPLOAD_MIN_GAP_S = 10.0
 
+# 전비/주행가능거리. 트립마다 출발·도착 배터리[Wh]와 GPS 거리로 km/kWh 를 기록한다.
+# Motor_16 분해능이 25~50Wh 라 짧은 트립은 오차가 커서 거리·에너지가 작으면 버린다.
+EFFICIENCY_PATH = Path(os.getenv("WAYON_EFFICIENCY", "/data/wayon_cloud/efficiency.json"))
+EFFICIENCY_MIN_KM = 2.0
+EFFICIENCY_MIN_KWH = 0.5
+EFFICIENCY_KEEP_TRIPS = 30
+# 주행가능거리는 최근 트립 전비의 하위 25%(보수적)로 잡는다. 트립이 적으면 평균, 없으면 기본값.
+RANGE_QUARTILE_MIN_TRIPS = 4
+DEFAULT_EFFICIENCY_KPL = 5.0
+EFFICIENCY_VALID_KPL = (2.0, 12.0)   # 이 밖은 GPS 튐·배터리 값 오류로 본다
+
+# 충전 완료 예상. 배터리 측 실측 전력(0x0CF)으로 목표 잔량까지 남은 시간을 낸다.
+# DC 는 전력이 잔량에 따라 떨어지므로 ID.4 실측 급속 충전 곡선(carrot-ha, kW, 잔량 0~100%)을 쓴다.
+ID4_DC_CURVE_KW = [
+  181.3, 181.3, 183.4, 183.3, 185.0, 187.1, 187.2, 187.2, 188.3, 189.1, 189.2,
+  190.2, 190.3, 190.2, 191.3, 191.3, 191.3, 191.3, 191.3, 192.3, 192.4,
+  189.2, 187.1, 184.4, 181.2, 179.2, 176.2, 170.2, 165.0, 160.2, 155.0,
+  150.2, 146.0, 144.0, 141.2, 138.2, 136.0, 132.9, 131.2, 129.1, 127.0,
+  124.0, 122.9, 120.1, 119.1, 117.0, 114.0, 112.9, 110.1, 109.1, 107.0,
+  107.0, 104.9, 103.8, 101.8, 101.9, 100.7, 100.1, 99.1, 98.0, 96.9,
+  96.0, 95.0, 93.9, 92.8, 91.8, 91.8, 91.8, 91.8, 91.8, 91.8,
+  91.8, 91.8, 91.9, 91.8, 92.9, 92.8, 92.8, 92.8, 91.8, 90.8,
+  90.0, 88.9, 85.9, 81.8, 79.1, 76.0, 72.8, 69.7, 66.9, 62.8,
+  59.7, 57.0, 52.7, 49.7, 46.8, 43.7, 40.6, 37.6, 34.8, 31.7,
+]
+CHARGE_ETA_TARGETS = (80, 100)
+
 # can 구독 소켓 (재사용)
 _CAN_SOCK = None
+
+
+def valid_battery_wh(value) -> float | None:
+  """Motor_16/HVEM_02 에너지량이 믿을 만하면 Wh, 아니면 None."""
+  try:
+    wh = float(value)
+  except (TypeError, ValueError):
+    return None
+  if not 0 < wh <= MAX_VALID_ENERGY_WH or round(wh) in MEB_INVALID_ENERGY_WH:
+    return None
+  return wh
 
 
 def read_config() -> dict:
@@ -304,9 +352,9 @@ def sample_vehicle_can(timeout_s: float = 6.0) -> dict:
       wh = cp.vl_all["Motor_16"].get("MO_Energieinhalt_BMS") or \
            cp.vl_all["HVEM_02"].get("HVEM_Nutzbare_Energie")
       if wh:
-        v_wh = wh[-1] if isinstance(wh, (list, tuple)) else wh
-        if v_wh > 0:
-          result["battery_wh"] = float(v_wh)
+        v_wh = valid_battery_wh(wh[-1] if isinstance(wh, (list, tuple)) else wh)
+        if v_wh is not None:
+          result["battery_wh"] = v_wh
       if cp.vl_all["Diagnose_01"].get("KBI_Kilometerstand"):
         odo = cp.vl["Diagnose_01"]["KBI_Kilometerstand"]
         if 0 < odo <= ODO_MAX_VALID_KM:
@@ -363,6 +411,84 @@ def sample_vehicle_can(timeout_s: float = 6.0) -> dict:
   return result
 
 
+def load_efficiency() -> dict:
+  try:
+    data = json.loads(EFFICIENCY_PATH.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and isinstance(data.get("trips"), list):
+      return data
+  except (OSError, ValueError):
+    pass
+  return {"trips": []}
+
+
+def record_trip_efficiency(distance_km: float, energy_kwh: float) -> bool:
+  """트립 하나의 거리·소비 에너지를 전비 기록에 더한다. 기록했으면 True."""
+  if distance_km < EFFICIENCY_MIN_KM or energy_kwh < EFFICIENCY_MIN_KWH:
+    return False
+  kpl = distance_km / energy_kwh
+  lo, hi = EFFICIENCY_VALID_KPL
+  if not lo <= kpl <= hi:
+    print(f"Wayon telemetry: efficiency {kpl:.2f} km/kWh rejected "
+          f"({distance_km:.1f}km / {energy_kwh:.2f}kWh)", flush=True)
+    return False
+  data = load_efficiency()
+  data["trips"].append({"at": utc_now(), "km": round(distance_km, 2), "kwh": round(energy_kwh, 3)})
+  data["trips"] = data["trips"][-EFFICIENCY_KEEP_TRIPS:]
+  EFFICIENCY_PATH.parent.mkdir(parents=True, exist_ok=True)
+  tmp = EFFICIENCY_PATH.with_suffix(".tmp")
+  tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+  os.replace(tmp, EFFICIENCY_PATH)
+  return True
+
+
+def efficiency_summary(data: dict) -> dict:
+  """최근 트립 전비. efficiency_kpl = 거리 가중 평균(앱 표시용),
+  range_kpl = 트립별 전비의 하위 25%(주행가능거리용, 추위·고속주행에 덜 낙관적)."""
+  trips = [t for t in data.get("trips", []) if t.get("km", 0) > 0 and t.get("kwh", 0) > 0]
+  if not trips:
+    return {"range_kpl": DEFAULT_EFFICIENCY_KPL, "efficiency_trips": 0}
+  total_km = sum(t["km"] for t in trips)
+  avg = total_km / sum(t["kwh"] for t in trips)
+  per_trip = sorted(t["km"] / t["kwh"] for t in trips)
+  range_kpl = per_trip[len(per_trip) // 4] if len(per_trip) >= RANGE_QUARTILE_MIN_TRIPS else avg
+  return {
+    "efficiency_kpl": round(avg, 2),
+    "range_kpl": round(min(avg, range_kpl), 2),
+    "efficiency_trips": len(trips),
+    "efficiency_km": round(total_km, 1),
+  }
+
+
+def estimate_charge_minutes(battery_wh: float, power_w: float, kind: str | None, target_pct: int) -> float | None:
+  """지금 배터리 측 전력으로 target_pct(잔량%, USABLE_BATTERY_WH 기준)까지 남은 분.
+
+  AC 는 끝까지 거의 일정한 전력이라 남은 에너지 / 전력. DC 는 1% 씩 걸으며 ID.4 충전 곡선을
+  따라 전력을 깎는다. 충전기가 곡선보다 낮게 주고 있으면(충전기 한계) 곡선이 그 아래로
+  떨어질 때까지 지금 전력을 유지하고, 곡선만큼 받고 있으면 곡선 비율대로 줄인다.
+  """
+  if power_w < CHARGING_MIN_W:
+    return None
+  soc = battery_wh / USABLE_BATTERY_WH * 100.0
+  if soc >= target_pct:
+    return 0.0
+  wh_per_pct = USABLE_BATTERY_WH / 100.0
+  if kind != "dc":
+    return (target_pct - soc) * wh_per_pct / power_w * 60.0
+
+  power_kw = power_w / 1000.0
+  curve_now = ID4_DC_CURVE_KW[min(100, int(soc))]
+  limited = power_kw < curve_now * 0.9
+  minutes = 0.0
+  step = soc
+  while step < target_pct:
+    end = min(float(target_pct), float(int(step) + 1))
+    curve = ID4_DC_CURVE_KW[min(100, int(end))]
+    kw = min(power_kw, curve) if limited else curve * power_kw / curve_now
+    minutes += (end - step) * wh_per_pct / 1000.0 / max(kw, 1.0) * 60.0
+    step = end
+  return minutes
+
+
 def haversine_m(a: tuple, b: tuple) -> float:
   """두 위경도 사이 거리[m]."""
   import math
@@ -395,6 +521,8 @@ class TripRecorder:
     self.last_point = None
     self.last_sample_at = 0.0
     self.trip_id = None
+    self.start_wh = None
+    self.end_wh = None
 
   def start(self):
     import uuid
@@ -408,6 +536,8 @@ class TripRecorder:
     self.distance_m = 0.0
     self.last_point = None
     self.last_sample_at = 0.0
+    self.start_wh = None
+    self.end_wh = None
     self.trip_id = str(uuid.uuid4())
     print("Wayon telemetry: trip started", flush=True)
 
@@ -426,6 +556,14 @@ class TripRecorder:
         point["speedMps"] = round(speed_mps, 2)
       self.route.append(point)
 
+  def note_battery(self, wh: float | None):
+    """주행 중 배터리[Wh]. 처음 본 값이 출발, 마지막 값이 도착 -> 트립 소비 에너지."""
+    if not self.active or wh is None:
+      return
+    if self.start_wh is None:
+      self.start_wh = wh
+    self.end_wh = wh
+
   def finish(self, config: dict, device_id: str) -> bool:
     """주행 종료 -> 업로드. 성공/실패와 무관하게 상태는 초기화한다."""
     if not self.active:
@@ -434,6 +572,12 @@ class TripRecorder:
     if self.distance_m < self.MIN_TRIP_M or len(self.route) < 2:
       print(f"Wayon telemetry: trip discarded ({self.distance_m:.0f}m)", flush=True)
       return False
+
+    if self.start_wh is not None and self.end_wh is not None:
+      km = self.distance_m / 1000.0
+      kwh = (self.start_wh - self.end_wh) / 1000.0
+      if record_trip_efficiency(km, kwh):
+        print(f"Wayon telemetry: trip efficiency {km / kwh:.2f} km/kWh ({km:.1f}km, {kwh:.2f}kWh)", flush=True)
 
     from datetime import datetime, timedelta, timezone
     now = datetime.now(timezone.utc)
@@ -557,8 +701,10 @@ def main() -> None:
     battery_wh = None
     if sm.updated["carState"] and sm.valid["carState"]:
       gauge = sm["carState"].fuelGauge
-      if gauge > 0:
-        battery_wh = gauge * USABLE_BATTERY_WH
+      # carstate 가 1.0 에서 잘라 넣으므로 1.0 은 무효값(102kWh 등)이 잘린 것일 수 있다 -> 버림
+      if 0 < gauge < 1.0:
+        battery_wh = valid_battery_wh(gauge * CARSTATE_GAUGE_FULL_WH)
+    trip.note_battery(battery_wh)
 
     # 주차 중 배터리 증가 기울기로 충전 전력 추정
     if battery_wh is not None:
@@ -600,6 +746,7 @@ def main() -> None:
     # 주차 중엔 carState가 없으므로 CAN 샘플값이 배터리의 유일한 소스가 된다.
     if sampled.get("battery_wh"):
       battery_wh = sampled["battery_wh"]
+      trip.note_battery(battery_wh)
       # 충전 판정도 이 값으로 다시 계산 (증가 기울기)
       if last_battery_at is not None and last_battery_wh is not None:
         dt_h = (now - last_battery_at) / 3600.0
@@ -666,6 +813,21 @@ def main() -> None:
         last["measured_at"] = utc_now()
     vehicle = merge_last_known(vehicle, last)
 
+    # 전비·주행가능거리: 콤마가 기록한 최근 트립 전비 x 현재(또는 마지막) 배터리
+    eff = efficiency_summary(load_efficiency())
+    vehicle.update(eff)
+    if vehicle.get("battery_wh"):
+      vehicle["range_km"] = round(vehicle["battery_wh"] / 1000.0 * eff["range_kpl"])
+
+    # 충전 완료 예상[분]. 기준 시각을 같이 실어 앱이 '몇 시 몇 분'으로 바꾼다.
+    if vehicle.get("charging") and vehicle.get("charge_power_w") and battery_wh:
+      for target in CHARGE_ETA_TARGETS:
+        minutes = estimate_charge_minutes(battery_wh, vehicle["charge_power_w"],
+                                          vehicle.get("charge_kind"), target)
+        if minutes is not None:
+          vehicle[f"charge_eta_{target}_min"] = round(minutes)
+      vehicle["charge_eta_base"] = utc_now()
+
     # 도어 상태: 마지막으로 본 값을 그대로 싣는다. 차가 잠들어 버스가 조용해도
     # 잠금/해제는 차를 깨우므로, 콤마가 켜져 있는 동안엔 바뀌면 바로 보인다.
     for key, value in door_state.items():
@@ -710,6 +872,8 @@ def main() -> None:
             f"odo={vehicle.get('odometer_km')} charging={vehicle.get('charging')} "
             f"kind={vehicle.get('charge_kind')} power={vehicle.get('charge_power_w')} "
             f"bms_mode={vehicle.get('bms_mode')} hv={vehicle.get('hv_voltage')} "
+            f"range={vehicle.get('range_km')}km@{vehicle.get('range_kpl')} "
+            f"eta80={vehicle.get('charge_eta_80_min')} eta100={vehicle.get('charge_eta_100_min')} "
             f"locked={vehicle.get('door_locked')} open={vehicle.get('doors_open')} "
             f"stale={vehicle.get('stale', False)}", flush=True)
 
