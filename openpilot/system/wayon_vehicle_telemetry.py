@@ -26,8 +26,8 @@ from openpilot.common.params import Params
 CONFIG_PATH = Path(os.getenv("WAYON_CLOUD_CONFIG", "/data/wayon_cloud/config.json"))
 STATE_PATH = Path(os.getenv("WAYON_VEHICLE_STATE", "/data/wayon_cloud/vehicle_state.json"))
 
-# 주행 중엔 앱이 속도·위치를 실시간처럼 보여주므로 짧게 둔다. 예전엔 배터리 환산 버그로
-# 사실상 매 7초쯤 올라갔는데, 그걸 고쳐 30초가 되자 주행 중 앱에 속도가 안 보였다(2026-10-28).
+# 주행 중엔 앱이 속도·위치를 실시간처럼 보여주므로 짧게 둔다. (예전엔 배터리 환산 버그로
+# 사실상 매 7초쯤 올라갔고, 그걸 고친 뒤 30초가 됐다)
 TELEMETRY_ONROAD_S = 10.0
 TELEMETRY_OFFROAD_S = 600.0
 # 주차 중 배터리량이 이만큼(Wh) 변하면 즉시 업로드 -> 충전 시작/종료를 빨리 반영
@@ -853,6 +853,14 @@ def main() -> None:
       "vehicle": vehicle,
       "gps": {},
     }
+
+    # 주행 속도: 바퀴 속도(carState.vEgo). Worker 는 vehicleSpeedMps 를 GPS 속도보다 먼저 쓰므로
+    # GPS 가 비어도(터널·수신 불량) 앱에 속도가 나온다(carrot-ha collector 와 같은 방식).
+    # CAN 샘플링에 몇 초 걸리므로 10초 이내에 받은 carState 면 쓴다.
+    if onroad and sm.seen.get("carState") and time.monotonic() - sm.recv_time["carState"] < 10:
+      cs = sm["carState"]
+      if cs.canValid:
+        payload["vehicleSpeedMps"] = round(float(cs.vEgo), 2)
 
     for gps_service in ("gpsLocationExternal", "gpsLocation"):
       if sm.valid.get(gps_service) and sm.seen.get(gps_service):
