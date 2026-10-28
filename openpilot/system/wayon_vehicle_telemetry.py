@@ -26,7 +26,9 @@ from openpilot.common.params import Params
 CONFIG_PATH = Path(os.getenv("WAYON_CLOUD_CONFIG", "/data/wayon_cloud/config.json"))
 STATE_PATH = Path(os.getenv("WAYON_VEHICLE_STATE", "/data/wayon_cloud/vehicle_state.json"))
 
-TELEMETRY_ONROAD_S = 30.0
+# 주행 중엔 앱이 속도·위치를 실시간처럼 보여주므로 짧게 둔다. 예전엔 배터리 환산 버그로
+# 사실상 매 7초쯤 올라갔는데, 그걸 고쳐 30초가 되자 주행 중 앱에 속도가 안 보였다(2026-10-28).
+TELEMETRY_ONROAD_S = 10.0
 TELEMETRY_OFFROAD_S = 600.0
 # 주차 중 배터리량이 이만큼(Wh) 변하면 즉시 업로드 -> 충전 시작/종료를 빨리 반영
 BATTERY_DELTA_TRIGGER_WH = 300.0
@@ -861,6 +863,9 @@ def main() -> None:
           payload["gps"]["speedMps"] = float(gps.speed)
           payload["gps"]["bearingDeg"] = float(gps.bearingDeg)
           payload["gps"]["accuracyM"] = float(gps.horizontalAccuracy)
+          # 클라우드는 이 시각으로 위치가 최신인지(fresh) 판정한다
+          if gps.unixTimestampMillis > 0:
+            payload["gps"]["timestampMillis"] = int(gps.unixTimestampMillis)
           break
 
     if post_state(config, payload):
