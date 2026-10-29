@@ -527,6 +527,43 @@ def _lead(radar_state, name):
   }
 
 
+TMAP_SIGNAL_LAMPS = ("red", "green", "left", "right", "uturn")
+# 내비가 1초마다 다시 넣는다. 당근 UI(hud_renderer)와 같이 2.5초 지나면 버린다.
+TMAP_SIGNAL_STALE_S = 2.5
+
+
+def _tmap_signal(params_memory, now=None):
+  """TMAP 안내의 신호등. 없거나 낡았으면 None.
+
+  carrot_man(nMirror/당근 내비)이 /dev/shm 의 TrafficLight 에 켜진 등 하나와
+  남은 초, 교차로까지 거리를 JSON 으로 남긴다. 당근 화면의 신호등과 같은 값이다.
+  남은 초는 넣은 시각 기준이라, 다음 갱신까지 흐른 만큼 빼서 매 프레임 줄어들게 한다.
+  """
+  try:
+    raw = params_memory.get("TrafficLight")
+  except Exception:
+    return None
+  if isinstance(raw, bytes):
+    raw = raw.decode("utf-8", "replace")
+  try:
+    d = raw if isinstance(raw, dict) else json.loads(raw) if raw else None
+  except ValueError:
+    return None
+  if not isinstance(d, dict):
+    return None
+  lamp = str(d.get("lamp", "")).strip()
+  if lamp not in TMAP_SIGNAL_LAMPS:
+    return None
+  now = time.monotonic() if now is None else now
+  age = now - _finite(d.get("ts"), now)
+  if age > TMAP_SIGNAL_STALE_S:
+    return None
+  remain = int(_finite(d.get("remain"), 0)) - int(max(0.0, age))
+  if remain <= 0:
+    return None
+  return {"l": lamp, "s": remain, "d": max(0, int(_finite(d.get("distance"), 0)))}
+
+
 def _limit_or_zero(value, no_limit):
   """감속 제한값. no_limit 이상이면 제한이 없다는 뜻이라 0 으로 접는다."""
   v = int(_finite(value, 0))
@@ -1323,6 +1360,7 @@ def _packet(sm, noo_enabled, path_offset=0.0):
 
 def main():
   params = Params()
+  params_memory = Params("/dev/shm/params")
   nav_selection = NavSelectionSync(params)
   remote_commands = RemoteCommandSync(params)
   running = [True]
@@ -1380,6 +1418,7 @@ def main():
       packet = _packet(sm, noo_enabled, path_offset)
       packet.update(nav_selection.telemetry())
       packet.update(remote_commands.telemetry())
+      packet["tmapSignal"] = _tmap_signal(params_memory)
       blob = json.dumps(packet, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
       sock.sendto(blob, ("255.255.255.255", PORT))
       # Navdy 는 WiFi 유저스페이스가 없어 UDP 로 닿지 않는다. 같은 패킷을
