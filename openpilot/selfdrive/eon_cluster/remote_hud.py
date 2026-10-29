@@ -533,12 +533,14 @@ def _limit_or_zero(value, no_limit):
   return v if 0 < v < no_limit else 0
 
 
-def _others(radar_state, limit=4):
-  """자차선 앞차를 뺀 나머지 검출 차량.
+def _others(radar_state, limit=8):
+  """자차선 앞차를 뺀 나머지 검출 차량 전부. 가까운 차부터 limit 대.
 
   leadOne/leadTwo 는 자차선만 보므로 HUD 가 옆 차선 차를 그릴 수 없다.
-  radarState 의 leadLeft/leadRight/leadsCenter 를 같이 실어 보낸다.
-  중복이 있을 수 있어 거리와 횡위치가 비슷하면 하나로 본다.
+  radarState 의 차선별 목록(leadsLeft/leadsCenter/leadsRight)과 끼어드는 차
+  (leadsCutIn)를 모두 싣는다. leadLeft/leadRight 는 이 목록에서 한 대씩 고른
+  것이라, 그것만 보내면 옆 차선에 차가 여러 대여도 한 대씩만 그려졌다.
+  같은 차가 여러 목록에 있을 수 있어 거리와 횡위치가 비슷하면 하나로 본다.
   """
   taken = []
   for name in ("leadOne", "leadTwo"):
@@ -546,27 +548,29 @@ def _others(radar_state, limit=4):
     if lead:
       taken.append((lead["d"], lead["y"]))
 
-  out = []
   candidates = []
   for name in ("leadLeft", "leadRight"):
     candidates.append(_field(radar_state, name, None))
-  candidates.extend(list(_field(radar_state, "leadsCenter", []) or []))
+  for name in ("leadsLeft", "leadsCenter", "leadsRight", "leadsCutIn"):
+    candidates.extend(list(_field(radar_state, name, []) or []))
 
+  found = []
   for lead in candidates:
-    if len(out) >= limit or not bool(_field(lead, "status", False)):
+    if not bool(_field(lead, "status", False)):
       continue
     d = round(max(0.0, _finite(_field(lead, "dRel", 0.0))), 1)
     y = round(_finite(_field(lead, "yRel", 0.0)), 2)
     if any(abs(d - td) < 2.0 and abs(y - ty) < 1.0 for td, ty in taken):
       continue
     taken.append((d, y))
-    out.append({
+    found.append({
       "d": d,
       "y": y,
       "v": round(_finite(_field(lead, "vRel", 0.0)) * 3.6, 1),
       "a": round(_finite(_field(lead, "aLeadK", 0.0)), 2),
     })
-  return out
+  found.sort(key=lambda v: v["d"])
+  return found[:limit]
 
 
 def _gear_step(car_state):

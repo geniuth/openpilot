@@ -270,11 +270,12 @@ def test_slim_frame_is_much_smaller():
     "lanes": [{"p": _lane(y), "c": 0.9} for y in (-5.4, -1.8, 1.8, 5.4)],
     "edges": [{"p": _lane(y), "c": 0.4} for y in (-7.2, 7.2)],
     "path": [[round(25 * t, 2), 0.0, 0.0] for t in (10.0 * (i / 32) ** 2 for i in range(33))],
-    "lead": car, "lead2": car, "others": [car] * 4,
+    "lead": car, "lead2": car, "others": [car] * 8, "trafficState": 1, "stopDist": 42.5,
   }
   size = len(bt_link.json.dumps(bt_link.slim_packet(packet), separators=(",", ":")))
   # 10/27 실측 평균 프레임이 1.6KB 였고 그 크기에서 9.5% 를 버렸다.
-  assert size < 1200, size
+  # 주변 차량을 8대까지 늘려도 그보다 한참 작아야 한다.
+  assert size < 1350, size
 
 
 if __name__ == "__main__":

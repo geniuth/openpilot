@@ -106,6 +106,8 @@ KEEP_KEYS = (
   "camera", "cameraDist", "cameraSection", "bumpDist",
   # turnInfo/turnDist(경로 안내 화살표)는 HUD 에서 뺐다. 안 그리는 것은 안 보낸다.
   "vTurnSpeed", "desiredSpeed", "goTime",
+  # openpilot 이 모델로 읽은 신호(0 없음/1 정지/2 출발)와 정지 지점까지 거리.
+  "trafficState", "stopDist",
 )
 # 검출 차량에서 앱이 쓰는 필드와 소수 자릿수. src/p 는 앱이 읽지 않는다.
 VEHICLE_FIELDS = (("d", 1), ("y", 1), ("v", 0), ("a", 1))
