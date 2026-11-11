@@ -577,7 +577,9 @@ def _others(radar_state, limit=8):
   radarState 의 차선별 목록(leadsLeft/leadsCenter/leadsRight)과 끼어드는 차
   (leadsCutIn)를 모두 싣는다. leadLeft/leadRight 는 이 목록에서 한 대씩 고른
   것이라, 그것만 보내면 옆 차선에 차가 여러 대여도 한 대씩만 그려졌다.
-  같은 차가 여러 목록에 있을 수 있어 거리와 횡위치가 비슷하면 하나로 본다.
+  같은 차가 여러 목록에 있을 수 있고 한 차에서 레이더 점이 여러 개 잡히기도
+  한다. 차 한 대 크기(길이 4.5m, 폭 1.4m) 안이면 하나로 본다. 2m/1m 로 좁게
+  봤을 때는 정체 구간에서 한 차 자리에 두세 대가 겹쳐 그려졌다.
   """
   taken = []
   for name in ("leadOne", "leadTwo"):
@@ -597,7 +599,7 @@ def _others(radar_state, limit=8):
       continue
     d = round(max(0.0, _finite(_field(lead, "dRel", 0.0))), 1)
     y = round(_finite(_field(lead, "yRel", 0.0)), 2)
-    if any(abs(d - td) < 2.0 and abs(y - ty) < 1.0 for td, ty in taken):
+    if any(abs(d - td) < 4.5 and abs(y - ty) < 1.4 for td, ty in taken):
       continue
     taken.append((d, y))
     found.append({
