@@ -26,9 +26,13 @@ from openpilot.common.params import Params
 CONFIG_PATH = Path(os.getenv("WAYON_CLOUD_CONFIG", "/data/wayon_cloud/config.json"))
 STATE_PATH = Path(os.getenv("WAYON_VEHICLE_STATE", "/data/wayon_cloud/vehicle_state.json"))
 
-# 주행 중엔 앱이 속도·위치를 실시간처럼 보여주므로 짧게 둔다. (예전엔 배터리 환산 버그로
-# 사실상 매 7초쯤 올라갔고, 그걸 고친 뒤 30초가 됐다)
-TELEMETRY_ONROAD_S = 10.0
+# 주행 중엔 앱이 속도·위치를 실시간처럼 보여주므로 짧게 둔다. 앱은 주행 중 2초마다 가져간다.
+# 3초 업로드는 속도·위치·도어만 싣는 가벼운 업로드다(CAN 을 따로 읽지 않음, 직전 값 재사용).
+# 배터리·충전·외기온 등 CAN 전체 샘플링(1~2초 걸림)은 TELEMETRY_ONROAD_FULL_S 마다만 한다.
+TELEMETRY_ONROAD_S = 3.0
+TELEMETRY_ONROAD_FULL_S = 30.0
+# 가벼운 업로드는 응답을 오래 기다리지 않는다(터널 등에서 루프가 수십 초 멈추지 않게)
+LIGHT_POST_TIMEOUT = (3, 3)
 TELEMETRY_OFFROAD_S = 600.0
 # 주차 중 배터리량이 이만큼(Wh) 변하면 즉시 업로드 -> 충전 시작/종료를 빨리 반영
 BATTERY_DELTA_TRIGGER_WH = 300.0
@@ -114,6 +118,8 @@ CHARGE_ETA_TARGETS = (80, 100)
 
 # can 구독 소켓 (재사용)
 _CAN_SOCK = None
+# CAN 해석기 [bus0, bus1] (재사용)
+_CAN_PARSERS = None
 
 
 def valid_battery_wh(value) -> float | None:
@@ -315,12 +321,16 @@ def sample_vehicle_can(timeout_s: float = 6.0) -> dict:
   MSGS = [("Motor_16", 2), ("HVEM_02", 10),
           ("BMS_04", 2), ("Diagnose_01", 1), ("Klima_Sensor_02", 1),
           ("Klima_11", 5), ("Klima_12", 5)]
-  try:
-    from opendbc.can import CANParser
-    parsers = [CANParser("vw_meb", MSGS, bus) for bus in (0, 1)]
-  except Exception as exc:
-    print(f"Wayon telemetry: CAN parser unavailable: {exc}", flush=True)
-    return result
+  # 해석기는 DBC 를 읽어 만드는 데 비용이 커서 한 번만 만들고 재사용한다
+  global _CAN_PARSERS
+  if _CAN_PARSERS is None:
+    try:
+      from opendbc.can import CANParser
+      _CAN_PARSERS = [CANParser("vw_meb", MSGS, bus) for bus in (0, 1)]
+    except Exception as exc:
+      print(f"Wayon telemetry: CAN parser unavailable: {exc}", flush=True)
+      return result
+  parsers = _CAN_PARSERS
 
   sock = get_can_sock()
   deadline = time.monotonic() + max(0.5, timeout_s)
@@ -627,7 +637,7 @@ def post_json(config: dict, path: str, payload: dict) -> bool:
     return False
 
 
-def post_state(config: dict, payload: dict) -> bool:
+def post_state(config: dict, payload: dict, timeout=(10, 30)) -> bool:
   endpoint = str(config.get("endpoint") or "").rstrip("/")
   token = str(config.get("token") or "")
   if not endpoint or not token:
@@ -637,7 +647,7 @@ def post_state(config: dict, payload: dict) -> bool:
       f"{endpoint}/api/telemetry",
       json=payload,
       headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-      timeout=(10, 30),
+      timeout=timeout,
     )
     return 200 <= response.status_code < 300
   except requests.RequestException as exc:
@@ -655,6 +665,8 @@ def main() -> None:
   last_battery_wh = last.get("battery_wh")
   last_battery_at = None  # monotonic, 이번 실행에서만 사용
   last_upload_at = None   # None = 아직 한 번도 안 올림 -> 즉시 업로드
+  last_full_at = None     # 마지막 CAN 전체 샘플링(monotonic)
+  cached_sampled: dict = {}
   charge_power_w = None
   trip = TripRecorder()
   onroad_prev = None
@@ -743,7 +755,17 @@ def main() -> None:
 
     # 배터리/오도미터/외기온·용량은 CAN에서 직접 샘플링 (업로드 직전에만).
     # 차가 완전히 잠들면 CAN이 없어 빈 dict가 온다.
-    sampled = sample_vehicle_can()
+    # 주행 중 가벼운 업로드(3초)는 CAN 을 다시 읽지 않고 직전 샘플을 재사용한다.
+    # 배터리는 carState 값이 더 최신이므로 재사용 샘플에서는 뺀다.
+    full = (not onroad or last_full_at is None or battery_moved
+            or now - last_full_at >= TELEMETRY_ONROAD_FULL_S)
+    if full:
+      sampled = sample_vehicle_can()
+      cached_sampled = dict(sampled)
+      last_full_at = now
+    else:
+      sampled = {k: v for k, v in cached_sampled.items()
+                 if k not in ("battery_wh", "battery_power_w", "battery_current_a")}
 
     # 주차 중엔 carState가 없으므로 CAN 샘플값이 배터리의 유일한 소스가 된다.
     if sampled.get("battery_wh"):
@@ -779,7 +801,8 @@ def main() -> None:
     # 자거나 매니저가 재시작될 때마다 날아가서, 그 사이에 들어간 전력을 통째로
     # 놓친다(실측: 배터리는 42.1kWh 늘었는데 30.0kWh 만 집계됨).
     # 주행 중 회생제동도 배터리를 늘리므로 주차 중(offroad)에만 센다.
-    if battery_wh is not None:
+    # 주행 중 3초 업로드마다 파일을 쓰지 않도록 전체 샘플링 때만 갱신한다.
+    if battery_wh is not None and full:
       prev_wh = charge_ledger.get("last_wh")
       prev_at = charge_ledger.get("last_at")
       if not onroad and prev_wh is not None and prev_at is not None and battery_wh > prev_wh:
@@ -876,10 +899,13 @@ def main() -> None:
             payload["gps"]["timestampMillis"] = int(gps.unixTimestampMillis)
           break
 
-    if post_state(config, payload):
+    if post_state(config, payload, timeout=(10, 30) if full else LIGHT_POST_TIMEOUT):
       last_upload_at = now
       door_pending = False
       last["updated_at"] = payload["updatedAt"]
+      # 가벼운 업로드(주행 중 3초)마다 파일을 쓰거나 로그를 남기지 않는다
+      if not full:
+        continue
       save_last_state(last)   # 마지막 측정값 유지 (주차 후에도 표시하기 위함)
       print(f"Wayon telemetry: uploaded soc={vehicle.get('soc_percent')}% "
             f"odo={vehicle.get('odometer_km')} charging={vehicle.get('charging')} "
