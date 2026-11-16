@@ -82,6 +82,8 @@ import collections
 COUNTDOWN_NEW_TARGET_MIN_JUMP_M = 20.0
 SCHOOL_ZONE_GAS_OVERRIDE_TIMEOUT_S = 3.0
 NMIRROR_ACTIVE_TICKS = 120  # update_navi 20Hz 기준 6초
+# 후면 단속 카메라 SDI 코드. 75/76 은 TMAP EDC, 86~89 는 nmirror2 road-limit v2 가 쓰는 후면 코드.
+REAR_CAMERA_TYPES = (75, 76, 86, 87, 88, 89)
 
 
 class CarrotServ:
@@ -164,6 +166,9 @@ class CarrotServ:
     self.xSpdDist = 0
     self.xSpdType = -1
     self.rear_camera_events = []
+    self.rear_camera_pending = []  # nmirror v2 가 "지났다" 고 알려준 후면 카메라 (target, hold, speed)
+    self.nmirror_rear_sample = None
+    self.v_ego = 0.
 
     self.xTurnInfo = -1
     self.xDistToTurn = 0
@@ -375,6 +380,9 @@ class CarrotServ:
     self.external_navigation_active = external_active
     if changed:
       self.rear_camera_events = []
+      if not external_active:
+        self.rear_camera_pending = []
+        self.nmirror_rear_sample = None
       self.speed_countdown_distance_last = self.turn_countdown_distance_last = 0.0
       self.left_spd_sec = self.left_tbt_sec = 100
       self.gas_override_speed = 0
@@ -382,32 +390,42 @@ class CarrotServ:
       self.school_zone_suppressed = False
     return changed
 
+  def _add_rear_camera_event(self, target, speed, hold=None):
+    matching = next((event for event in self.rear_camera_events if abs(event["target"] - target) <= 40), None)
+    if matching is None:
+      self.rear_camera_events.append({"target": target, "speed": speed, "hold": hold})
+      return
+    # Repeated zero/near-zero reports must not move the hold endpoint.
+    matching["speed"] = min(matching["speed"], speed)
+    if hold is not None:
+      matching["hold"] = hold  # 앱(road-limit v2)이 알려준 카메라별 유지 거리가 설정값보다 우선
+
   def _rear_camera_speed(self, CS, delta_dist):
-    # TMAP EDC SDI 75/76: rear speed / rear signal-and-speed camera.
+    # Rear speed / rear signal-and-speed camera (REAR_CAMERA_TYPES).
     # Arm only on the final approach. Keep the wheel-distance endpoint even
     # when the app removes the SDI at the camera or announces the next item.
     hold_distance = self.autoNaviRearCameraHoldDistance
+    pending, self.rear_camera_pending = self.rear_camera_pending, []
     if (CS is None or delta_dist < 0 or not self.external_navigation_active or
         self.autoNaviSpeedCtrlMode <= 0 or hold_distance <= 0 or self.carrot_navi_off_route):
       self.rear_camera_events = []
       return 250.0, 0.0
 
+    def event_hold(event):
+      return hold_distance if event.get("hold") is None else event["hold"]
+
+    for event in pending:
+      self._add_rear_camera_event(**event)
     self.rear_camera_events = [event for event in self.rear_camera_events
-                               if event["target"] + hold_distance > self.totalDistance]
-    if (self.active_carrot > 1 and self.xSpdType in (75, 76) and
+                               if event["target"] + event_hold(event) > self.totalDistance]
+    if (self.active_carrot > 1 and self.xSpdType in REAR_CAMERA_TYPES and
         0 < self.xSpdDist <= 50 and self.xSpdLimit > 0):
-      target = self.totalDistance + self.xSpdDist
-      matching = next((event for event in self.rear_camera_events if abs(event["target"] - target) <= 40), None)
-      if matching is None:
-        self.rear_camera_events.append({"target": target, "speed": self.xSpdLimit})
-      else:
-        # Repeated zero/near-zero reports must not move the hold endpoint.
-        matching["speed"] = min(matching["speed"], self.xSpdLimit)
+      self._add_rear_camera_event(self.totalDistance + self.xSpdDist, self.xSpdLimit)
 
     if not self.rear_camera_events:
       return 250.0, 0.0
     event = min(self.rear_camera_events, key=lambda event: event["speed"])
-    return event["speed"], max(0.0, event["target"] + hold_distance - self.totalDistance)
+    return event["speed"], max(0.0, event["target"] + event_hold(event) - self.totalDistance)
 
   def _vehicle_speed_camera_enabled(self, CS):
     return (not self.external_navigation_active and
@@ -648,6 +666,10 @@ class CarrotServ:
     sdi_ko = {
         75: "후면 과속 단속",
         76: "후면 신호·과속 단속",
+        86: "후면 단속",
+        87: "후면 단속",
+        88: "후면 단속",
+        89: "후면 단속",
         0: "신호과속",
         1: "과속 (고정식)",
         2: "구간단속 시작",
@@ -720,6 +742,10 @@ class CarrotServ:
     sdi_en = {
         75: "Rear speed camera",
         76: "Rear signal and speed camera",
+        86: "Rear camera",
+        87: "Rear camera",
+        88: "Rear camera",
+        89: "Rear camera",
         0: "Signal speed enforcement",
         1: "Speed camera (fixed)",
         2: "Section control start",
@@ -792,6 +818,10 @@ class CarrotServ:
     sdi_zh = {
         75: "后向测速摄像头",
         76: "后向闯红灯及测速摄像头",
+        86: "后向摄像头",
+        87: "后向摄像头",
+        88: "后向摄像头",
+        89: "后向摄像头",
         0: "信号测速/闯灯拍照",
         1: "固定测速摄像头",
         2: "区间测速开始",
@@ -875,7 +905,7 @@ class CarrotServ:
     # 2: inOSEPS: 구간단속중
     # 3: endOSEPS: 구간단속종료
     # 0:감속안함,1:과속카메라,2:+사고방지턱,3:+이동식카메라
-    if self.nSdiType in [0,1,2,3,4,7,8, 75, 76] and self.nSdiSpeedLimit > 0 and self.autoNaviSpeedCtrlMode > 0:
+    if (self.nSdiType in [0,1,2,3,4,7,8] or self.nSdiType in REAR_CAMERA_TYPES) and self.nSdiSpeedLimit > 0 and self.autoNaviSpeedCtrlMode > 0:
       self.xSpdLimit = self.nSdiSpeedLimit * self.autoNaviSpeedSafetyFactor
       self.xSpdDist = self.nSdiDist
       self.xSpdType = self.nSdiType
@@ -1353,7 +1383,9 @@ class CarrotServ:
     # cam_type 은 TMAP SDI 코드 (22: 과속방지턱, 2: 구간단속 시작 ...)
     cam_type = _i("cam_type", -1)
     cam_speed = _i("cam_limit_speed")
-    cam_dist = _i("cam_limit_speed_left_dist")
+    cam_dist = self._nmirror_rear_camera_distance(road_limit, cam_type, cam_speed)
+    if cam_dist is None:
+      cam_dist = _i("cam_limit_speed_left_dist")
     cam_present = cam_type >= 0 and cam_dist > 0
     section_speed = _i("section_limit_speed")
     section_dist = _i("section_left_dist")
@@ -1389,6 +1421,49 @@ class CarrotServ:
     self._update_sdi()
     return True
 
+  def _nmirror_rear_camera_distance(self, road_limit, cam_type, cam_speed):
+    """road-limit v2 후면 카메라의 남은 거리 (npilot d11d78cb 와 같은 규칙).
+
+    v2 앱은 후면 카메라에 부호 있는 거리(+: 카메라 앞, -: 지남), 카메라별 유지 거리
+    (cam_rear_hold_dist), 표본 id(cam_distance_id), 표본 나이(cam_distance_age, 초)를 보낸다.
+    같은 표본은 하트비트로 되풀이되므로 이동거리를 처음부터 다시 빼지 않고 주행 거리계로 이어 센다.
+    돌려주는 값은 카메라까지 남은 거리(지났으면 0)이고, 지난 카메라는 유지 이벤트로 넘긴다.
+    v1 형식(유지 거리 없음)이거나 후면 카메라가 아니면 None.
+    """
+    hold = road_limit.get("cam_rear_hold_dist")
+    if cam_type not in REAR_CAMERA_TYPES or hold is None:
+      self.nmirror_rear_sample = None
+      return None
+    try:
+      distance = float(road_limit.get("cam_limit_speed_left_dist", 0))
+      hold = float(hold)
+      age = float(road_limit.get("cam_distance_age") or 0.)
+      if not all(math.isfinite(v) for v in (distance, hold, age)) or hold <= 0 or age < 0:
+        raise ValueError("invalid rear camera sample")
+    except (TypeError, ValueError, OverflowError):
+      self.nmirror_rear_sample = None
+      return 0
+
+    source_id = road_limit.get("cam_distance_id")
+    key = (source_id, cam_type, distance, hold)
+    sample = self.nmirror_rear_sample
+    # id 가 없는 옛 v2 앱은 패킷마다 새 표본으로 본다 (패킷 나이만 뺀다).
+    # 거리계가 줄었으면(새 주행) 이어 셀 수 없으니 새로 잡는다.
+    if sample is None or source_id is None or sample["key"] != key or self.totalDistance < sample["total"]:
+      sample = {"key": key, "origin": self.totalDistance - age * max(self.v_ego, 0.)}
+      self.nmirror_rear_sample = sample
+    sample["total"] = self.totalDistance
+
+    current = distance - max(self.totalDistance - sample["origin"], 0.)
+    if current < -hold:
+      return 0  # 유지 구간까지 지났다
+    if current <= 0:
+      if cam_speed > 0:
+        self.rear_camera_pending.append({"target": self.totalDistance + current,
+                                         "speed": cam_speed * self.autoNaviSpeedSafetyFactor, "hold": hold})
+      return 0
+    return min(math.ceil(current), 32767)
+
   def update_navi(self, remote_ip, sm, pm, vturn_speed, coords, distances, route_speed, gps_service):
 
     self.debugText = ""
@@ -1405,6 +1480,7 @@ class CarrotServ:
       v_ego = v_ego_kph = 0
       delta_dist = 0
       CS = None
+    self.v_ego = v_ego
 
     #self.bearing = self.nPosAngle #self._update_gps(v_ego, sm)
     self.bearing = self._update_gps(v_ego, sm, gps_service)

@@ -1,7 +1,7 @@
 """nmirror2 앱 수신기 (neokii ROAD_LIMIT_SERVICE 프로토콜).
 
 npilot 의 selfdrive/controls/neokii/navi_controller.py 와 같은 방식으로 앱과 붙는다.
-  1. 연결 전에는 5초마다 wlan 서브넷의 모든 호스트 UDP 2899 로 SDP 문자열을 보낸다.
+  1. 연결 전에는 5초마다 wlan 서브넷의 모든 호스트 UDP 2899 로 SDP 문자열(v2)을 보낸다.
   2. 앱은 UDP 3843 으로 {"active", "road_limit", "traffic_signal", ...} JSON 을 보낸다.
   3. 받을 때마다, 그리고 1초마다 앱의 2899 로 SDP 를 돌려줘 연결을 유지한다.
   4. 앱이 request_gps=1 을 보내면 기기 GPS 를 3Hz 로 앱의 2899 에 보낸다.
@@ -26,7 +26,9 @@ import psutil
 
 from openpilot.common.swaglog import cloudlog
 
-SDP_MESSAGE = b"EON:ROAD_LIMIT_SERVICE:v1"
+# v2: 앱이 후면 카메라(75/76/86~89)를 부호 있는 거리 + cam_rear_hold_dist/cam_distance_id/
+# cam_distance_age 로 보낸다. 해석은 CarrotServ._nmirror_rear_camera_distance.
+SDP_MESSAGE = b"EON:ROAD_LIMIT_SERVICE:v2"
 BROADCAST_PORT = 2899  # 기기 -> 앱: SDP, echo, GPS
 RECEIVE_PORT = 3843    # 앱 -> 기기: JSON
 

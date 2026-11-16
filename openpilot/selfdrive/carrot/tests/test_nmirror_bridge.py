@@ -1,4 +1,5 @@
 import json
+import math
 import socket
 from types import SimpleNamespace
 
@@ -196,6 +197,71 @@ def test_idle_app_does_not_take_over(navigation_update):  # noqa: F811
   result = update()
   assert result.activeCarrot == 0
   assert result.nRoadLimitSpeed == 60
+
+
+def test_sdp_announces_road_limit_v2():
+  assert SDP_MESSAGE == b"EON:ROAD_LIMIT_SERVICE:v2"
+
+
+def _rear(dist, sample_id=7, age=0., cam_type=86, hold=60):
+  return {"road_limit_speed": 80, "cam_type": cam_type, "cam_limit_speed": 50, "cam_limit_speed_left_dist": dist,
+          "cam_rear_hold_dist": hold, "cam_distance_id": sample_id, "cam_distance_age": age}
+
+
+def test_v2_rear_camera_ahead_subtracts_sample_age_and_keeps_heartbeat_travel(navigation_update):  # noqa: F811
+  serv, _CS, update = navigation_update
+  update(1000.)  # v_ego 22 km/h 를 기억시킨다
+  serv.update_nmirror(_rear(300, age=1.))
+  assert (serv.xSpdType, serv.xSpdLimit, serv.xSpdDist) == (86, 50, math.ceil(300 - 22 / 3.6))
+  update(1100.)
+  serv.update_nmirror(_rear(300, age=2.))  # 같은 표본의 하트비트: 이동거리를 다시 세지 않는다
+  assert serv.xSpdDist == math.ceil(300 - 22 / 3.6 - 100)
+  serv.update_nmirror(_rear(150, sample_id=8))  # 새 표본
+  assert serv.xSpdDist == 150
+
+
+def test_v2_rear_camera_passed_holds_for_app_distance(navigation_update):  # noqa: F811
+  serv, _CS, update = navigation_update
+  update(1000.)
+  serv.update_nmirror(_rear(-10))
+  assert serv.xSpdType == -1  # 지난 카메라는 접근 감속 대상이 아니다
+  result = update(1000.)
+  assert (result.desiredSource, result.desiredSpeed) == ("cam", 50)
+  assert result.szSdiDescr.endswith(" 50m")  # 앱 유지거리 60m - 지난 10m
+  serv.update_nmirror(_rear(-10))  # 하트비트가 끝점을 밀지 않는다
+  assert update(1049.).desiredSpeed == 50
+  result = update(1050.)
+  assert (result.desiredSource, result.desiredSpeed) == ("road", 200)
+  serv.update_nmirror(_rear(-10))  # 유지 구간을 지난 표본은 다시 잡지 않는다
+  assert update(1051.).desiredSource == "road"
+
+
+def test_v2_rear_camera_approach_uses_app_hold_after_pass(navigation_update):  # noqa: F811
+  serv, _CS, update = navigation_update
+  update(1000.)
+  serv.update_nmirror(_rear(30, cam_type=75, hold=150))
+  update(1000.)
+  assert serv.rear_camera_events and serv.rear_camera_events[0]["hold"] is None  # 설정값(100m)으로 먼저 잡힌다
+  update(1030.)
+  serv.update_nmirror(_rear(30, cam_type=75, hold=150))  # 같은 표본: 이제 지남 -> 앱 유지거리
+  assert update(1129.).desiredSpeed == 50  # 설정값 100m 를 넘어도
+  assert update(1180.).desiredSource == "road"
+
+
+def test_v1_rear_camera_keeps_legacy_distance(navigation_update):  # noqa: F811
+  serv, _CS, _update = navigation_update
+  serv.update_nmirror({"road_limit_speed": 80, "cam_type": 76, "cam_limit_speed": 50, "cam_limit_speed_left_dist": 300})
+  assert (serv.xSpdType, serv.xSpdDist) == (76, 300)
+  serv.update_nmirror({"road_limit_speed": 80, "cam_type": 76, "cam_limit_speed": 50, "cam_limit_speed_left_dist": -10})
+  assert serv.xSpdType == -1 and not serv.rear_camera_pending
+
+
+def test_v2_rear_camera_invalid_sample_is_dropped(navigation_update):  # noqa: F811
+  serv, _CS, _update = navigation_update
+  for bad in ({"cam_rear_hold_dist": 0}, {"cam_rear_hold_dist": "x"}, {"cam_distance_age": -1},
+              {"cam_limit_speed_left_dist": float("nan")}):
+    serv.update_nmirror({**_rear(100), **bad})
+    assert serv.xSpdType == -1 and not serv.rear_camera_pending
 
 
 def test_carrot_navi_has_priority(navigation_update):  # noqa: F811

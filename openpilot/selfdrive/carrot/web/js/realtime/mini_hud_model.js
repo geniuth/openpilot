@@ -3,7 +3,7 @@
 (function () {
   const WAZE_TYPES = new Set([100, 101]);
   const SECTION_TYPES = new Set([2, 3, 4]);
-  const CAMERA_TYPES = new Set([0, 1, 7, 8, 75, 76, 101]);
+  const CAMERA_TYPES = new Set([0, 1, 7, 8, 75, 76, 86, 87, 88, 89, 101]);
 
   function finite(value) {
     const number = Number(value);

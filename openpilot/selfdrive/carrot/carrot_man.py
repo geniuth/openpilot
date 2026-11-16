@@ -1977,7 +1977,7 @@ class CarrotMan:
       rgdata = self._normalize_rgdata(obj["rgdata"])
       sdi_type = rgdata.get("nSdiType")
       sdi_plus_type = rgdata.get("nSdiPlusType")
-      if sdi_type in (0, 1, 2, 3, 4, 7, 8, 75, 76):
+      if sdi_type in (0, 1, 2, 3, 4, 7, 8, 75, 76, 86, 87, 88, 89):
         severity = "warning"
       if sdi_type == 22 or sdi_plus_type == 22:
         severity = "caution"
